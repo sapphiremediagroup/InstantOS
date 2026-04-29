@@ -1,3 +1,5 @@
 build
 builddir
 *.o
+*.log
+.vscode
