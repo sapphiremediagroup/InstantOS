@@ -1,23 +1,95 @@
-#include "syscall.hpp"
+#include <cpu/syscall/syscall.hpp>
 #include <cpu/gdt/gdt.hpp>
+#include <cpu/percpu.hpp>
+#include <cpu/process/process.hpp>
 #include <cpu/process/scheduler.hpp>
-#include <cpu/process/exec.hpp>
-#include <fs/vfs/vfs.hpp>
-#include <graphics/console.hpp>
-#include <interrupts/keyboard.hpp>
-#include <interrupts/timer.hpp>
-#include <x86_64/requests.hpp>
-#include <x86_64/ports.hpp>
-#include <string.h>
+#include <debug/diag.hpp>
+#include <memory/vmm.hpp>
+#include <common/ports.hpp>
 #include <cpuid.h>
-#include <string.h>
-
-extern Console* console;
-extern Keyboard* globalKeyboard;
-extern Timer* globalTimer;
-extern "C" uint64_t kernelStackTop;
+extern "C" void atexit(){
+    return;
+}
+constexpr uint32_t MSR_STAR   = 0xC0000081;
+constexpr uint32_t MSR_EFER   = 0xC0000080;
+constexpr uint32_t MSR_LSTAR  = 0xC0000082;
+constexpr uint32_t MSR_SFMASK = 0xC0000084;
 
 Syscall syscallInstance;
+
+extern "C" uint64_t userRSP = 0;
+extern "C" uint64_t kernelStackTop = 0;
+
+extern "C" void saveSyscallState(uint64_t* stack);
+
+extern "C" __attribute__((naked)) void syscallEntry()
+{
+    asm volatile (
+        ".intel_syntax noprefix\n\t"
+
+        "swapgs\n\t"
+        "mov gs:[8], rsp\n\t"
+        "mov rsp, gs:[0]\n\t"
+
+        "push rax\n\t"
+        "push rbx\n\t"
+        "push rcx\n\t"
+        "push rdx\n\t"
+        "push rsi\n\t"
+        "push rdi\n\t"
+        "push rbp\n\t"
+        "push r8\n\t"
+        "push r9\n\t"
+        "push r10\n\t"
+        "push r11\n\t"
+        "push r12\n\t"
+        "push r13\n\t"
+        "push r14\n\t"
+        "push r15\n\t"
+
+        "mov rbp, rsp\n\t"
+        "mov rcx, rbp\n\t"
+        "sub rsp, 0x28\n\t"
+        "call saveSyscallState\n\t"
+        "add rsp, 0x28\n\t"
+
+        "mov rcx, [rbp + 14*8]\n\t"
+        "mov rdx, [rbp + 13*8]\n\t"
+        "mov r8,  [rbp + 5*8]\n\t"
+        "mov r9,  [rbp + 11*8]\n\t"
+        "sub rsp, 0x38\n\t"
+        "mov rax, [rbp + 7*8]\n\t"
+        "mov [rsp + 0x20], rax\n\t"
+        "mov rax, [rbp + 6*8]\n\t"
+        "mov [rsp + 0x28], rax\n\t"
+        "call syscallHandler\n\t"
+        "add rsp, 0x38\n\t"
+
+        "mov [rbp + 14*8], rax\n\t"
+        "mov rsp, rbp\n\t"
+
+        "pop r15\n\t"
+        "pop r14\n\t"
+        "pop r13\n\t"
+        "pop r12\n\t"
+        "pop r11\n\t"
+        "pop r10\n\t"
+        "pop r9\n\t"
+        "pop r8\n\t"
+        "pop rbp\n\t"
+        "pop rdi\n\t"
+        "pop rsi\n\t"
+        "pop rdx\n\t"
+        "pop rcx\n\t"
+        "pop rbx\n\t"
+        "pop rax\n\t"
+
+        "mov rsp, gs:[8]\n\t"
+        "swapgs\n\t"
+        "sysretq\n\t"
+        ".att_syntax prefix\n\t"
+    );
+}
 
 bool hasSyscall(){
     uint32_t eax = 0x80000001, ebx = 0, ecx = 0, edx = 0;
@@ -34,14 +106,28 @@ void Syscall::initialize() {
     initialized = true;
 
     if(!hasSyscall()){
-        console->drawText("No 'syscall' instruction support. halting...");
         asm volatile("cli");
         while(1);
-    }    
+    }
+
+    uint64_t efer = rdmsr(MSR_EFER);
+    wrmsr(MSR_EFER, efer | 0x1);
+
+    uint64_t star = (static_cast<uint64_t>(0x08) << 32) |
+                    (static_cast<uint64_t>(0x10) << 48);
+    wrmsr(MSR_STAR, star);
+
+    wrmsr(MSR_LSTAR, reinterpret_cast<uint64_t>(&syscallEntry));
+
+    wrmsr(MSR_SFMASK, 0x200);
+
+    initPerCPU(kernelStackTop);
 }
 
 void Syscall::setKernelStack(uint64_t stack) {
     kernelStackTop = stack;
+    getPerCPU()->kernelStack = stack;
+    GDT::get().setKernelStack(stack);
 }
 
 uint64_t Syscall::handle(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t arg4, uint64_t arg5) {
@@ -50,7 +136,8 @@ uint64_t Syscall::handle(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
         case OSInfo:
             return sys_osinfo(arg1);
         case ProcInfo:
-            return 0;        case Exit:
+            return 0;
+        case Exit:
             return sys_exit(arg1);
         case Write:
             return sys_write(arg1, arg2, arg3);
@@ -90,24 +177,111 @@ uint64_t Syscall::handle(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
             return sys_signal(arg1, arg2);
         case SigReturn:
             return sys_sigreturn();
+        case Login:
+            return sys_login(arg1);
+        case Logout:
+            return sys_logout(arg1);
+        case GetUID:
+            return sys_getuid();
+        case GetGID:
+            return sys_getgid();
+        case SetUID:
+            return sys_setuid(arg1);
+        case SetGID:
+            return sys_setgid(arg1);
+        case GetSessionID:
+            return sys_getsessionid();
+        case GetSessionInfo:
+            return sys_getsessioninfo(arg1, arg2);
+        case Chdir:
+            return sys_chdir(arg1);
+        case Getcwd:
+            return sys_getcwd(arg1, arg2);
+        case Mkdir:
+            return sys_mkdir(arg1, arg2);
+        case Rmdir:
+            return sys_rmdir(arg1);
+        case Unlink:
+            return sys_unlink(arg1);
+        case Stat:
+            return sys_stat(arg1, arg2);
+        case Dup:
+            return sys_dup(arg1);
+        case Dup2:
+            return sys_dup2(arg1, arg2);
+        case Pipe:
+            return sys_pipe(arg1);
+        case Getppid:
+            return sys_getppid();
+        case Spawn:
+            return sys_spawn(arg1, arg2, arg3);
+        case GetUserInfo:
+            return sys_getuserinfo(arg1, arg2);
+        case Readdir:
+            return sys_readdir(arg1, arg2, arg3);
+        case FBFlush:
+            return sys_fb_flush(arg1, arg2, arg3, arg4);
+        case SharedAlloc:
+            return sys_shared_alloc(arg1);
+        case SharedMap:
+            return sys_shared_map(arg1);
+        case SharedFree:
+            return sys_shared_free(arg1);
+        case SurfaceCreate:
+            return sys_surface_create(arg1, arg2, arg3);
+        case SurfaceMap:
+            return sys_surface_map(arg1);
+        case SurfaceCommit:
+            return sys_surface_commit(arg1, arg2, arg3, arg4);
+        case SurfacePoll:
+            return sys_surface_poll(arg1);
+        case CompositorCreateWindow:
+            return sys_compositor_create_window(arg1, arg2, arg3, arg4);
+        case WindowEventQueue:
+            return sys_window_event_queue(arg1);
+        case WindowSetTitle:
+            return sys_window_set_title(arg1, arg2);
+        case WindowAttachSurface:
+            return sys_window_attach_surface(arg1, arg2);
+        case WindowList:
+            return sys_window_list(arg1, arg2);
+        case WindowFocus:
+            return sys_window_focus(arg1);
+        case WindowMove:
+            return sys_window_move(arg1, arg2, arg3);
+        case WindowResize:
+            return sys_window_resize(arg1, arg2, arg3);
+        case WindowControl:
+            return sys_window_control(arg1, arg2);
+        case QueueCreate:
+            return sys_queue_create();
+        case QueueSend:
+            return sys_queue_send(arg1, arg2, arg3);
+        case QueueReceive:
+            return sys_queue_receive(arg1, arg2, arg3);
+        case QueueReply:
+            return sys_queue_reply(arg1, arg2, arg3, arg4);
+        case QueueRequest:
+            return sys_queue_request(arg1, arg2, arg3, arg4, arg5);
+        case ServiceRegister:
+            return sys_service_register(arg1, arg2);
+        case ServiceConnect:
+            return sys_service_connect(arg1);
+        case ThreadCreate:
+            return sys_thread_create(arg1, arg2, arg3);
+        case ThreadExit:
+            return sys_thread_exit(arg1);
+        case ThreadJoin:
+            return sys_thread_join(arg1, arg2);
         default:
             return (uint64_t)-1;
     }
 }
 
-uint64_t Syscall::sys_exit(uint64_t code) {
-    Process* current = Scheduler::get().getCurrentProcess();
-    if (!current) {
-        return (uint64_t)-1;
+bool Syscall::isValidUserPointer(uint64_t ptr, size_t size) {
+    if (size == 0) {
+        return ptr < 0x0000800000000000ULL;
     }
-
-    current->setExitCode((int)code);
-    current->setState(ProcessState::Terminated);
-    
-    return 0;
-}
-
-static bool isValidUserPointer(uint64_t ptr, size_t size) {
     if (ptr >= 0xFFFF800000000000) {
         return false;
     }
@@ -121,511 +295,83 @@ static bool isValidUserPointer(uint64_t ptr, size_t size) {
     if (ptr + size >= 0x0000800000000000) {
         return false;
     }
+
+    uint64_t firstPage = ptr & ~0xFFFULL;
+    uint64_t lastPage = (ptr + size - 1) & ~0xFFFULL;
+    for (uint64_t page = firstPage;; page += PAGE_SIZE) {
+        if (!VMM::IsUserMapped(page)) {
+            return false;
+        }
+        if (page == lastPage) {
+            break;
+        }
+    }
+
     return true;
 }
 
-uint64_t Syscall::sys_write(uint64_t fd, uint64_t buf, uint64_t count) {
-    if (fd == 1 || fd == 2) {
-        if (!console || count == 0) {
-            return count;
-        }
-        
-        if (!isValidUserPointer(buf, count)) return -1;
-        
-        const char* str = reinterpret_cast<const char*>(buf);
-        
-        for (size_t i = 0; i < count; i++) {
-            char temp[2] = { str[i], '\0' };
-            console->drawText(temp);
-        }
-        
-        return count;
+bool Syscall::copyFromUser(void* dest, uint64_t src, size_t size) {
+    if (size == 0) {
+        return true;
     }
-    
-    return -1;
-}
-
-uint64_t Syscall::sys_read(uint64_t fd, uint64_t buf, uint64_t count) {
-    if (fd == 0) {        
-        if (!globalKeyboard) {
-            if (console) console->drawText("No keyboard!\nPress F2 to continue...\n");
-            return -1;
-        }
-        
-        if (!isValidUserPointer(buf, count)) {
-            return -1;
-        }
-        
-        for (int i = 0; i < 100; i++) {
-            if (globalKeyboard->poll() == 0) break;
-        }
-        
-        char* buffer = reinterpret_cast<char*>(buf);
-        size_t bytesRead = 0;
-        
-        asm volatile("sti");
-        
-        while (bytesRead < count) {
-            char c = globalKeyboard->poll();
-            
-            if (c == 0) {
-                asm volatile("pause");
-                continue;
-            }
-            
-            if (c == '\b') {
-                if (bytesRead > 0) {
-                    bytesRead--;
-                    if (console) {
-                        console->drawText("\b");
-                        console->drawText(" ");
-                        console->drawText("\b");
-                    }
-                }
-                continue;
-            }
-            
-            buffer[bytesRead++] = c;
-            
-            if (console && (c == '\n' || (c >= 32 && c < 127))) {
-                char text[2] = {c, '\0'};
-                console->drawText(text);
-            }
-            
-            if (c == '\n') {
-                break;
-            }
-        }
-        
-        asm volatile("cli");
-        
-        return bytesRead;
+    if (!dest || !isValidUserPointer(src, size)) {
+        return false;
     }
-    
-    return -1;
-}
 
-uint64_t Syscall::sys_open(uint64_t path, uint64_t flags, uint64_t mode) {
-    return -1;
-}
-
-uint64_t Syscall::sys_close(uint64_t fd) {
-    return -1;
-}
-
-uint64_t Syscall::sys_getpid() {
-    Process* current = Scheduler::get().getCurrentProcess();
-    return current ? current->getPID() : 0;
-}
-
-uint64_t Syscall::sys_fork() {
-    return -1;
-}
-
-uint64_t Syscall::sys_exec(uint64_t path, uint64_t argv, uint64_t envp __attribute__((unused))) {
-    if (!isValidUserPointer(path, 1)) {
-        return -1;
+    auto* out = reinterpret_cast<uint8_t*>(dest);
+    const auto* in = reinterpret_cast<const uint8_t*>(src);
+    for (size_t i = 0; i < size; i++) {
+        out[i] = in[i];
     }
-    
-    const char* userPathname = reinterpret_cast<const char*>(path);
-    size_t pathLen = 0;
-    while (userPathname[pathLen] && pathLen < 256) pathLen++;
-    
-    char* pathname = new char[pathLen + 1];
-    memcpy(pathname, userPathname, pathLen);
-    pathname[pathLen] = '\0';
-    
-    if (argv != 0 && !isValidUserPointer(argv, sizeof(char*))) {
-        delete[] pathname;
-        return -1;
+    return true;
+}
+
+bool Syscall::copyToUser(uint64_t dest, const void* src, size_t size) {
+    if (size == 0) {
+        return true;
     }
-    
-    const char** userArgv = reinterpret_cast<const char**>(argv);
-    int argc = 0;
-    
-    if (userArgv) {
-        while (userArgv[argc] != nullptr && argc < 64) {
-            argc++;
+    if (!src || !isValidUserPointer(dest, size)) {
+        return false;
+    }
+
+    auto* out = reinterpret_cast<uint8_t*>(dest);
+    const auto* in = reinterpret_cast<const uint8_t*>(src);
+    for (size_t i = 0; i < size; i++) {
+        out[i] = in[i];
+    }
+    return true;
+}
+
+bool Syscall::copyStringFromUser(uint64_t ptr, char* dest, size_t destSize) {
+    if (!dest || destSize == 0) {
+        return false;
+    }
+
+    for (size_t i = 0; i < destSize; i++) {
+        char c = 0;
+        if (!copyFromUser(&c, ptr + i, 1)) {
+            dest[0] = '\0';
+            return false;
+        }
+
+        dest[i] = c;
+        if (c == '\0') {
+            return i > 0;
         }
     }
-    
-    const char** kernelArgv = new const char*[argc + 1];
-    for (int i = 0; i < argc; i++) {
-        const char* userArg = userArgv[i];
-        size_t argLen = 0;
-        while (userArg[argLen] && argLen < 256) argLen++;
-        
-        char* kernelArg = new char[argLen + 1];
-        memcpy(kernelArg, userArg, argLen);
-        kernelArg[argLen] = '\0';
-        kernelArgv[i] = kernelArg;
-    }
-    kernelArgv[argc] = nullptr;
-    
-    uint64_t userCR3;
-    asm volatile("mov %%cr3, %0" : "=r"(userCR3));
-    
-    extern VMM vmm;
-    vmm.load();
-    
-    Process* newProc = ProcessExecutor::loadUserBinaryWithArgs(pathname, argc, kernelArgv);
-    
-    asm volatile("mov %0, %%cr3" :: "r"(userCR3) : "memory");
-    
-    for (int i = 0; i < argc; i++) {
-        delete[] kernelArgv[i];
-    }
-    delete[] kernelArgv;
-    delete[] pathname;
-    
-    if (!newProc) {
-        return -1;
-    }
-    
-    Process* current = Scheduler::get().getCurrentProcess();
-    if (current) {
-        newProc->setParentPID(current->getPID());
-    }
-    
-    Scheduler::get().addProcess(newProc);
-    Scheduler::get().scheduleFromSyscall();
-    
-    return 0;
+
+    dest[destSize - 1] = '\0';
+    return false;
 }
 
-uint64_t Syscall::sys_wait(uint64_t pid, uint64_t statusPtr) {
-    Process* current = Scheduler::get().getCurrentProcess();
-    if (!current) {
-        return (uint64_t)-1;
-    }
-        
-    Process* child = Scheduler::get().getProcessByPID((uint32_t)pid);
-    if (!child) {
-        return (uint64_t)-1;
-    }
-    
-    if (child->getParentPID() != current->getPID()) {
-        return (uint64_t)-1;
-    }
-    
-    if (statusPtr) {
-        int* status = reinterpret_cast<int*>(statusPtr);
-        *status = 0;
-    }
-    
-    return 0;
-}
-
-uint64_t Syscall::sys_kill(uint64_t pid, uint64_t sig) {
-    Process* target = Scheduler::get().getProcessByPID((uint32_t)pid);
-    if (!target) return -1;
-    
-    target->sendSignal((int)sig);
-    return 0;
-}
-
-uint64_t Syscall::sys_mmap(uint64_t addr, uint64_t length, uint64_t prot) {
-    return -1;
-}
-
-uint64_t Syscall::sys_munmap(uint64_t addr, uint64_t length) {
-    return -1;
-}
-
-uint64_t Syscall::sys_yield() {
-    Scheduler::get().yield();
-    return 0;
-}
-
-uint64_t Syscall::sys_sleep(uint64_t ms) {
-    if (!globalTimer) return -1;
-    
-    uint64_t start = globalTimer->getMilliseconds();
-    uint64_t target = start + ms;
-    
-    asm volatile("sti");
-    
-    if (ms < 10) {
-        while (globalTimer->getMilliseconds() < target) {
-            asm volatile("pause");
-        }
-        asm volatile("cli");
-        return 0;
-    }
-    
-    uint64_t yieldCounter = 0;
-    while (globalTimer->getMilliseconds() < target) {
-        if (yieldCounter++ % 1000 == 0) {
-            Scheduler::get().yield();
-        }
-        
-        asm volatile("pause");
-    }
-    asm volatile("cli");
-    return 0;
-}
-
-uint64_t Syscall::sys_gettime() {
-    if (!globalTimer) {
-        return 0;
-    }
-    return globalTimer->getMilliseconds();
-}
-
-uint64_t Syscall::sys_clear() {
-    if (console) {
-        console->drawText("\033[2J");
-    }
-    return 0;
-}
-
-struct FBInfo {
-    uint64_t addr;
-    uint32_t width;
-    uint32_t height;
-    uint32_t pitch;
-    uint16_t bpp;
-    uint8_t redMaskSize;
-    uint8_t redMaskShift;
-    uint8_t greenMaskSize;
-    uint8_t greenMaskShift;
-    uint8_t blueMaskSize;
-    uint8_t blueMaskShift;
-};
-
-uint64_t Syscall::sys_fb_info(uint64_t info_ptr) {
-    if (!console) return (uint64_t)-1;
-    
-    extern Framebuffer* fb;
-    if (!fb) return (uint64_t)-1;
-    
-    if (!isValidUserPointer(info_ptr, sizeof(FBInfo))) {
-        return (uint64_t)-1;
-    }
-    
-    uint64_t fb_kernel_virt = reinterpret_cast<uint64_t>(fb->getRaw());
-    uint64_t fb_phys = fb_kernel_virt - hhdm_request.response->offset;
-    
-    constexpr uint64_t USER_FB_BASE = 0x0000700000000000;
-    
-    Process* current = Scheduler::get().getCurrentProcess();
-    if (!current) return (uint64_t)-1;
-    
-    size_t fb_size_bytes = fb->getPitch() * fb->getHeight() * sizeof(uint32_t);
-    size_t pages = (fb_size_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
-    
-    current->getVMM()->mapRange(
-        reinterpret_cast<void*>(USER_FB_BASE),
-        reinterpret_cast<void*>(fb_phys),
-        pages,
-        PTE_PRESENT | PTE_WRITABLE | PTE_USER | PTE_CACHE_DISABLE
-    );
-
-    
-    FBInfo kernel_info;
-    kernel_info.addr = USER_FB_BASE;
-    kernel_info.width = fb->getWidth();
-    kernel_info.height = fb->getHeight();
-    kernel_info.pitch = fb->getPitch();
-    
-    kernel_info.redMaskSize = fb->getRedMaskSize();
-    kernel_info.redMaskShift = fb->getRedMaskShift();
-    kernel_info.greenMaskSize = fb->getGreenMaskSize();
-    kernel_info.greenMaskShift = fb->getGreenMaskShift();
-    kernel_info.blueMaskSize = fb->getBlueMaskSize();
-    kernel_info.blueMaskShift = fb->getBlueMaskShift();
-    
-    kernel_info.bpp = sizeof(uint32_t);
-    
-    char* user_ptr = reinterpret_cast<char*>(info_ptr);
-    memcpy(user_ptr, &kernel_info, sizeof(FBInfo));
-    return 0;
-}
-
-uint64_t Syscall::sys_fb_map() {
-    if (!console) return (uint64_t)-1;
-    
-    extern Framebuffer* fb;
-    if (!fb) return (uint64_t)-1;
-    
-    return reinterpret_cast<uint64_t>(fb->getRaw());
-}
-
-extern "C" void saveSyscallState(uint64_t* stack) {
-    Process* current = Scheduler::get().getCurrentProcess();
-    if (!current) return;
-    
-    uint64_t* regs = stack;
-    uint64_t* cpuFrame = stack + 15;
-    
-    uint64_t user_rip = cpuFrame[0];
-    uint64_t user_cs = cpuFrame[1];
-    uint64_t user_rflags = cpuFrame[2];
-    uint64_t user_rsp = cpuFrame[3];
-    
-    if (user_cs == 0x1B) {
-        current->getContext()->rip = user_rip;
-        current->getContext()->rsp = user_rsp;
-        current->getContext()->rflags = user_rflags;
-        
-        current->getContext()->rax = regs[0];
-        current->getContext()->rbx = regs[1];
-        current->getContext()->rcx = regs[2];
-        current->getContext()->rdx = regs[3];
-        current->getContext()->rsi = regs[4];
-        current->getContext()->rdi = regs[5];
-        current->getContext()->rbp = regs[6];
-        current->getContext()->r8 = regs[7];
-        current->getContext()->r9 = regs[8];
-        current->getContext()->r10 = regs[9];
-        current->getContext()->r11 = regs[10];
-        current->getContext()->r12 = regs[11];
-        current->getContext()->r13 = regs[12];
-        current->getContext()->r14 = regs[13];
-        current->getContext()->r15 = regs[14];
-        
-        current->setValidUserState(true);
-    }
+bool Syscall::copyUserString(uint64_t ptr, char* dest, size_t destSize) {
+    return copyStringFromUser(ptr, dest, destSize);
 }
 
 extern "C" uint64_t syscallHandler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t arg4, uint64_t arg5) {
-    return Syscall::get().handle(syscall_num, arg1, arg2, arg3, arg4, arg5);
-}
-
-uint64_t Syscall::sys_signal(uint64_t sig, uint64_t handler) {
     Process* current = Scheduler::get().getCurrentProcess();
-    if (!current) return (uint64_t)-1;
-    
-    if (sig >= NSIG) return (uint64_t)-1;
-    
-    SignalHandler* sh = current->getSignalHandler();
-    uint64_t old = reinterpret_cast<uint64_t>(sh->handlers[sig]);
-    sh->handlers[sig] = reinterpret_cast<sighandler_t>(handler);
-    
-    return old;
-}
-
-uint64_t Syscall::sys_sigreturn() {
-    Process* current = Scheduler::get().getCurrentProcess();
-    if (!current) return (uint64_t)-1;
-    
-    uint64_t* stack = reinterpret_cast<uint64_t*>(current->getContext()->rsp);
-    current->getContext()->rip = stack[0];
-    current->getContext()->rsp += 128;
-    
-    return 0;
-}
-
-size_t strncpyToUser(char* user_dest, const char* kernel_src, size_t max_len) {
-    if (!isValidUserPointer((uint64_t)user_dest, max_len)) {
-        return (size_t)-1;
-    }
-
-    if (max_len == 0) return 0;
-
-    while (*kernel_src && (*kernel_src == ' ' || *kernel_src == '\t')) {
-        kernel_src++;
-    }
-
-    size_t i = 0;
-    size_t src_len = 0;
-    
-    const char* src_start = kernel_src;
-    const char* src_end = kernel_src;
-    while (*src_end) src_end++;
-    
-    while (src_end > src_start && (src_end[-1] == ' ' || src_end[-1] == '\t')) {
-        src_end--;
-    }
-    
-    src_len = src_end - src_start;
-    
-    for (i = 0; i < max_len - 1 && i < src_len; i++) {
-        user_dest[i] = src_start[i];
-    }
-    
-    user_dest[i] = '\0';
-    return i;
-}
-
-size_t uitoa(uint64_t value, char* buffer, size_t buffer_size) {
-    if (buffer_size == 0) return 0;
-
-    char temp[20];    size_t i = 0;
-
-    if (value == 0) {
-        if (buffer_size > 1) {
-            buffer[0] = '0';
-            buffer[1] = '\0';
-            return 1;
-        } else {
-            buffer[0] = '\0';
-            return 0;
-        }
-    }
-
-    while (value && i < sizeof(temp)) {
-        temp[i++] = '0' + (value % 10);
-        value /= 10;
-    }
-
-    size_t j = 0;
-    while (i > 0 && j < buffer_size - 1) {
-        buffer[j++] = temp[--i];
-    }
-
-    buffer[j] = '\0';
-    return j;
-}
-
-
-uint64_t Syscall::sys_osinfo(uint64_t info_ptr) {
-    if (!isValidUserPointer(info_ptr, sizeof(OSInfo))) {
-        return (uint64_t)-1;
-    }
-    
-    OSInfo* info = reinterpret_cast<OSInfo*>(info_ptr);
-
-    memset(info, 0, sizeof(OSInfo));
-
-    unsigned int eax, ebx, ecx, edx;
-    char vendor[13];
-    __get_cpuid(0, &eax, &ebx, &ecx, &edx);
-
-    *((unsigned int*)&vendor[0]) = ebx;
-    *((unsigned int*)&vendor[4]) = edx;
-    *((unsigned int*)&vendor[8]) = ecx;
-    vendor[12] = '\0';
-
-    char brand[49];    memset(brand, 0, sizeof(brand));    
-    __get_cpuid(0x80000000, &eax, &ebx, &ecx, &edx);
-    if (eax >= 0x80000004) {
-        char* brand_ptr = brand;
-        for (unsigned int i = 0; i < 3; i++) {
-            unsigned int regs[4];
-            __get_cpuid(0x80000002 + i, &regs[0], &regs[1], &regs[2], &regs[3]);
-            memcpy(brand_ptr + i*16, regs, 16);
-        }
-        brand[48] = '\0';
-    } else {
-        char* strncpy(char* dest, const char* src, size_t n);
-        strncpy(brand, vendor, sizeof(brand)-1);
-        brand[sizeof(brand)-1] = '\0';
-    }
-
-    strncpyToUser(info->osname, "InstantOS", sizeof(info->osname));
-    strncpyToUser(info->loggedOnUser, "user", sizeof(info->loggedOnUser));
-    strncpyToUser(info->cpuname, brand, sizeof(info->cpuname));
-
-    char buf[16];
-    memset(buf, 0, sizeof(buf));
-    uitoa(pmm.getTotalMemory() / (1024 * 1024), buf, sizeof(buf));    strncpyToUser(info->maxRamGB, buf, sizeof(info->maxRamGB));
-    
-    uint64_t usedBytes = pmm.getTotalMemory() - pmm.getFreeMemory();
-    uint64_t usedMB = usedBytes / (1024 * 1024);    char buf2[16];
-    memset(buf2, 0, sizeof(buf2));
-    uitoa(usedMB, buf2, sizeof(buf2));
-    strncpyToUser(info->usedRamGB, buf2, sizeof(info->usedRamGB));
-    
-    return 0;
+    Debug::beginSyscallTrace(current, syscall_num, arg1, arg2, arg3, arg4, arg5);
+    uint64_t result = Syscall::get().handle(syscall_num, arg1, arg2, arg3, arg4, arg5);
+    Debug::endSyscallTrace(current);
+    return result;
 }

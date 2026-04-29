@@ -1,15 +1,28 @@
-#include "exec.hpp"
-#include "../mm/pmm.hpp"
-#include "../gdt/gdt.hpp"
-#include "../syscall/syscall.hpp"
-#include <x86_64/requests.hpp>
-#include <string.h>
+#include <cpu/process/exec.hpp>
+#include <cpu/process/pe.hpp>
+#include <memory/pmm.hpp>
+#include <memory/vmm.hpp>
+#include <cpu/gdt/gdt.hpp>
+#include <common/string.hpp>
 #include <fs/vfs/vfs.hpp>
-#include <fs/elf/elf.hpp>
+#include <graphics/console.hpp>
+
+namespace {
+void assignUserProcessPriority(Process* proc, const char* path) {
+    if (!proc || !path) {
+        return;
+    }
+
+    if (strcmp(path, "/bin/graphics-compositor.exe") == 0) {
+        proc->setPriority(ProcessPriority::High);
+    }
+}
+}
 
 Process* ProcessExecutor::createKernelProcess(void (*entry)()) {
     uint32_t pid = Scheduler::get().allocatePID();
     Process* proc = new Process(pid);
+    proc->setName("<kernel>");
     
     uint64_t stack = proc->getKernelStack();
     stack &= ~0xFULL;
@@ -26,6 +39,7 @@ Process* ProcessExecutor::createKernelProcess(void (*entry)()) {
 Process* ProcessExecutor::createUserProcess(uint64_t entry) {
     uint32_t pid = Scheduler::get().allocatePID();
     Process* proc = new Process(pid);
+    proc->setName("<user>");
     
     uint64_t stack = proc->getUserStack();
     stack &= ~0xFULL;
@@ -42,25 +56,147 @@ void ProcessExecutor::executeUserProcess(Process* proc, GDT* gdt) {
     proc->jumpToUsermode(proc->getContext()->rip, gdt);
 }
 
-constexpr uint64_t USER_CODE_BASE = 0x400000;
+constexpr uint64_t USER_CODE_BASE = 0x00007FFFFFE00000ULL;
 
 extern "C" void processTrampoline();
 
 Process* ProcessExecutor::createUserProcessWithCode(void* code, size_t codeSize) {
+    if (codeSize >= sizeof(IMAGE_DOS_HEADER)) {
+        auto* dosHeader = reinterpret_cast<IMAGE_DOS_HEADER*>(code);
+        if (dosHeader->e_magic == 0x5A4D) {
+            auto* ntHeaders = reinterpret_cast<IMAGE_NT_HEADERS64*>(
+                reinterpret_cast<uint8_t*>(code) + dosHeader->e_lfanew);
+            
+            if (ntHeaders->Signature == 0x00004550) {
+                uint32_t pid = Scheduler::get().allocatePID();
+                Process* proc = new Process(pid);
+                if (!proc) {
+                    Console::get().drawText("[PROC] Failed to allocate process object\n");
+                    return nullptr;
+                }
+                proc->setName("<image>");
+
+                // Validate process creation succeeded
+                if (!proc->getPageTable()) {
+                    Console::get().drawText("[PROC] Failed to allocate process page table\n");
+                    delete proc;
+                    return nullptr;
+                }
+                
+                uint64_t imageBase = ntHeaders->OptionalHeader.ImageBase;
+                if (!imageBase) imageBase = USER_CODE_BASE;
+                
+                PageTable* procPT = proc->getPageTable();
+                
+                Console::get().drawText("[PROC] Loading PE at base: ");
+                Console::get().drawHex(imageBase);
+                Console::get().drawText("\n");
+
+                uint64_t headerPages = (ntHeaders->OptionalHeader.SizeOfHeaders + 0xFFF) / 0x1000;
+                if (headerPages == 0) headerPages = 1;
+                uint64_t headerPhys = PMM::AllocFrames(headerPages);
+                if (headerPhys) {
+                    memset(reinterpret_cast<void*>(headerPhys), 0, headerPages * 0x1000);
+                    size_t copyLen = codeSize > ntHeaders->OptionalHeader.SizeOfHeaders ? ntHeaders->OptionalHeader.SizeOfHeaders : codeSize;
+                    memcpy(reinterpret_cast<void*>(headerPhys), code, copyLen);
+                    VMM::MapRangeInto(procPT, imageBase, headerPhys, headerPages, PageFlags::Present | PageFlags::UserSuper | PageFlags::ReadWrite);
+                }
+                
+                auto* section = reinterpret_cast<IMAGE_SECTION_HEADER*>(
+                    reinterpret_cast<uint8_t*>(&ntHeaders->OptionalHeader) + ntHeaders->FileHeader.SizeOfOptionalHeader);
+                
+                for (int i = 0; i < ntHeaders->FileHeader.NumberOfSections; i++) {
+                    if (section[i].SizeOfRawData == 0 && section[i].Misc.VirtualSize == 0) continue;
+                    
+                    uint64_t virtAddr = imageBase + section[i].VirtualAddress;
+                    uint64_t memSize = section[i].Misc.VirtualSize > section[i].SizeOfRawData ? section[i].Misc.VirtualSize : section[i].SizeOfRawData;
+                    
+                    uint64_t alignedVirt = virtAddr & ~0xFFFULL;
+                    uint64_t offset = virtAddr - alignedVirt;
+                    uint64_t alignedSize = (memSize + offset + 0xFFF) & ~0xFFFULL;
+                    size_t pages = alignedSize / 0x1000;
+                    
+                    uint64_t physAddr = PMM::AllocFrames(pages);
+                    if (!physAddr) {
+                        Console::get().drawText("[PROC] Failed to allocate section frames: ");
+                        Console::get().drawNumber(i);
+                        Console::get().drawText("\n");
+                        delete proc;
+                        return nullptr;
+                    }
+
+                    memset(reinterpret_cast<void*>(physAddr), 0, pages * 0x1000);
+                    
+                    if (section[i].SizeOfRawData > 0) {
+                        size_t copySize = section[i].SizeOfRawData > codeSize - section[i].PointerToRawData ? codeSize - section[i].PointerToRawData : section[i].SizeOfRawData;
+                        memcpy(reinterpret_cast<void*>(physAddr + offset), reinterpret_cast<uint8_t*>(code) + section[i].PointerToRawData, copySize);
+                    }
+                    
+                    uint64_t flags = PageFlags::Present | PageFlags::UserSuper;
+                    if (section[i].Characteristics & 0x80000000) flags |= PageFlags::ReadWrite;
+                    if ((section[i].Characteristics & 0x20000000) == 0) flags |= PageFlags::NoExecute;
+                    
+                    VMM::MapRangeInto(procPT, alignedVirt, physAddr, pages, flags);
+                }
+
+                uint64_t entry = imageBase + ntHeaders->OptionalHeader.AddressOfEntryPoint;
+                Console::get().drawText("[PROC] Entry point: ");
+                Console::get().drawHex(entry);
+                Console::get().drawText("\n");
+                
+                uint64_t trampolineAddr = reinterpret_cast<uint64_t>(&processTrampoline);
+
+                uint64_t userStack = proc->getUserStack();
+                userStack &= ~0xFULL;
+
+                uint64_t kernelStack = proc->getKernelStack();
+                kernelStack -= 8;
+                *reinterpret_cast<uint64_t*>(kernelStack) = userStack;
+                kernelStack -= 8;
+                *reinterpret_cast<uint64_t*>(kernelStack) = entry;
+
+                proc->getContext()->rip = trampolineAddr;
+                proc->getContext()->rsp = kernelStack;
+
+
+
+                return proc;
+            }
+        }
+    }
+
     uint32_t pid = Scheduler::get().allocatePID();
     
     Process* proc = new Process(pid);
-    size_t pages = (codeSize + PAGE_SIZE - 1) / PAGE_SIZE;
-    void* codePhys = pmm.allocatePages(pages);
-    
-    if (codePhys) {
-        uint64_t codeVirt = reinterpret_cast<uint64_t>(codePhys) + hhdm_request.response->offset;
-        
-        memset(reinterpret_cast<void*>(codeVirt), 0, pages * PAGE_SIZE);
-        memcpy(reinterpret_cast<void*>(codeVirt), code, codeSize);
-        
-        proc->getVMM()->mapRange(reinterpret_cast<void*>(USER_CODE_BASE), codePhys, pages, PTE_PRESENT | PTE_WRITABLE | PTE_USER);
+
+    if (!proc) {
+        Console::get().drawText("[PROC] Failed to allocate raw process object\n");
+        return nullptr;
     }
+    proc->setName("<raw>");
+    
+    // Validate process creation succeeded
+    if (!proc->getPageTable()) {
+        Console::get().drawText("[PROC] Failed to allocate raw process page table\n");
+        delete proc;
+        return nullptr;
+    }
+    
+    size_t pages = (codeSize + PAGE_SIZE - 1) / PAGE_SIZE;
+    uint64_t codePhys = PMM::AllocFrames(pages);
+    
+    if (!codePhys) {
+        Console::get().drawText("[PROC] Failed to allocate raw code pages\n");
+        delete proc;
+        return nullptr;
+    }
+
+    uint64_t codeVirt = codePhys;
+    
+    memset(reinterpret_cast<void*>(codeVirt), 0, pages * PAGE_SIZE);
+    memcpy(reinterpret_cast<void*>(codeVirt), code, codeSize);
+    
+    VMM::MapRangeInto(proc->getPageTable(), USER_CODE_BASE, codePhys, pages, PageFlags::Present | PageFlags::ReadWrite | PageFlags::UserSuper);
     
     uint64_t userStack = proc->getUserStack();
     userStack &= ~0xFULL;
@@ -107,11 +243,10 @@ Process* ProcessExecutor::loadUserBinary(const char* path) {
     
     VFS::get().close(fd);
     
-    Process* proc = nullptr;
-    if (ELFLoader::isValidELF(buffer, size)) {
-        proc = ELFLoader::loadELF(buffer, size);
-    } else {
-        proc = createUserProcessWithCode(buffer, size);
+    Process* proc = createUserProcessWithCode(buffer, size);
+    if (proc) {
+        proc->setName(path);
+        assignUserProcessPriority(proc, path);
     }
     
     delete[] static_cast<uint8_t*>(buffer);
@@ -162,14 +297,10 @@ void ProcessExecutor::setupArguments(Process* proc, int argc, const char** argv)
     uint64_t* argcPtr = reinterpret_cast<uint64_t*>(buffer);
     *argcPtr = argc;
     
-    uint64_t savedCR3;
-    asm volatile("mov %%cr3, %0" : "=r"(savedCR3));
-    
-    proc->getVMM()->load();
-    
-    memcpy(reinterpret_cast<void*>(userStack), buffer, totalSize);
-    
-    asm volatile("mov %0, %%cr3" :: "r"(savedCR3) : "memory");
+    uint64_t physUserStack = VMM::VirtualToPhysicalIn(proc->getPageTable(), userStack);
+    if (physUserStack) {
+        memcpy(reinterpret_cast<void*>(physUserStack), buffer, totalSize);
+    }
     
     delete[] buffer;
     
@@ -183,7 +314,7 @@ void ProcessExecutor::setupArguments(Process* proc, int argc, const char** argv)
 Process* ProcessExecutor::createUserProcessWithArgs(void* code, size_t codeSize, int argc, const char** argv) {
     Process* proc = createUserProcessWithCode(code, codeSize);
     
-    if (proc) {
+    if (proc && argc > 0) {
         setupArguments(proc, argc, argv);
     }
     return proc;
@@ -214,11 +345,10 @@ Process* ProcessExecutor::loadUserBinaryWithArgs(const char* path, int argc, con
     
     VFS::get().close(fd);
     
-    Process* proc = nullptr;
-    if (ELFLoader::isValidELF(buffer, size)) {
-        proc = ELFLoader::loadELFWithArgs(buffer, size, argc, argv);
-    } else {
-        proc = createUserProcessWithArgs(buffer, size, argc, argv);
+    Process* proc = createUserProcessWithArgs(buffer, size, argc, argv);
+    if (proc) {
+        proc->setName(path);
+        assignUserProcessPriority(proc, path);
     }
     
     delete[] static_cast<uint8_t*>(buffer);

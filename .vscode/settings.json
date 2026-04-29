@@ -1,7 +1,14 @@
 {
-    "files.associations": {
-        "cstdint": "cpp"
-    },
-    "C_Cpp.default.configurationProvider": "mesonbuild.mesonbuild",
-    "C_Cpp.default.compileCommands": "/home/sky/projects/Instant/builddir/compile_commands.json"
+    "clangd.fallbackFlags": [
+        "-ffreestanding",
+        "-fno-exceptions",
+        "-fno-rtti",
+        "-mno-red-zone",
+        "-target",
+        "x86_64-pc-windows-msvc",
+        "-I${workspaceFolder}\\include",
+        "-I${workspaceFolder}\\include\\UEFI",
+        "-I${workspaceFolder}\\include\\UEFI\\x64",
+        "-I${workspaceFolder}\\InstantOS\\include",
+    ]
 }

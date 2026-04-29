@@ -1,5 +1,5 @@
-#include "ramfs.hpp"
-#include <cpu/mm/heap.hpp>
+#include <fs/ramfs/ramfs.hpp>
+#include <memory/heap.hpp>
 
 RamFS::RamFS() : FileSystem("ramfs"), rootNode(nullptr), rootData(nullptr), nextInode(1) {
     ops.open = nodeOpen;
@@ -44,7 +44,7 @@ VNode* RamFS::getRoot() {
 }
 
 RamFSNode* RamFS::createNode(const char* name, FileType type, uint32_t mode) {
-    RamFSNode* node = (RamFSNode*)kheap.allocate(sizeof(RamFSNode));
+    RamFSNode* node = (RamFSNode*)kmalloc(sizeof(RamFSNode));
     if (!node) return nullptr;
     
     int i = 0;
@@ -80,10 +80,10 @@ void RamFS::destroyNode(RamFSNode* node) {
     }
     
     if (node->data) {
-        kheap.free(node->data);
+        kfree(node->data);
     }
     
-    kheap.free(node);
+    kfree(node);
 }
 
 int RamFS::nodeOpen(VNode* node, int flags) {
@@ -126,7 +126,7 @@ int64_t RamFS::nodeWrite(VNode* node, const void* buffer, uint64_t size, uint64_
     
     uint64_t newSize = offset + size;
     if (newSize > ramNode->size) {
-        void* newData = kheap.allocate(newSize);
+        void* newData = kmalloc(newSize);
         if (!newData) return -1;
         
         if (ramNode->data) {
@@ -135,7 +135,7 @@ int64_t RamFS::nodeWrite(VNode* node, const void* buffer, uint64_t size, uint64_
             for (uint64_t i = 0; i < ramNode->size; i++) {
                 dst[i] = src[i];
             }
-            kheap.free(ramNode->data);
+            kfree(ramNode->data);
         }
         
         ramNode->data = newData;

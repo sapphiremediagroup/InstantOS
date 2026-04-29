@@ -1,5 +1,5 @@
-#include "cereal.hpp"
-#include <x86_64/ports.hpp>
+#include <cpu/cereal/cereal.hpp>
+#include <common/ports.hpp>
 
 Cereal& Cereal::get() {
     static Cereal instance;
@@ -21,6 +21,18 @@ void Cereal::initialize() {
 bool Cereal::isTransmitEmpty() {
     uint8_t status = inb(COM1 + 5);
     return status & 0x20;
+}
+
+bool Cereal::hasInput() {
+    if (!initialized) return false;
+
+    uint8_t status = inb(COM1 + 5);
+    return (status & 0x01) != 0;
+}
+
+char Cereal::read() {
+    if (!hasInput()) return 0;
+    return static_cast<char>(inb(COM1));
 }
 
 void Cereal::write(char c) {

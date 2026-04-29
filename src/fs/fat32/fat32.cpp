@@ -1,5 +1,7 @@
-#include "fat32.hpp"
-#include <cpu/mm/heap.hpp>
+#include <fs/fat32/fat32.hpp>
+#include <fs/ahci/ahci.hpp>
+#include <graphics/console.hpp>
+#include <memory/heap.hpp>
 
 FAT32FS::FAT32FS(BlockDevice* device) : FileSystem("fat32"), device(device), rootNode(nullptr), fatStart(0), dataStart(0), clusterSize(0), rootDirCluster(0) {
     ops.open = nodeOpen;
@@ -18,31 +20,54 @@ FAT32FS::FAT32FS(BlockDevice* device) : FileSystem("fat32"), device(device), roo
 FAT32FS::~FAT32FS() {
     if (rootNode) {
         FAT32Node* node = (FAT32Node*)rootNode->getData();
-        if (node) kheap.free(node);
+        if (node) kfree(node);
         delete rootNode;
     }
 }
 
 int FAT32FS::mount(const char* path) {
-    if (!device) return -1;
+    if (!device) {
+        Console::get().drawText("[FAT32] No block device\n");
+        return -1;
+    }
     
     uint8_t buffer[512];
-    if (!device->read(0, buffer, 512)) return -1;
+    if (!device->read(0, buffer, 512)) {
+        Console::get().drawText("[FAT32] Failed to read boot sector\n");
+        return -1;
+    }
     
     for (size_t i = 0; i < sizeof(FAT32BPB) && i < 512; i++) {
         ((uint8_t*)&bpb)[i] = buffer[i];
     }
     
-    if (bpb.bytesPerSector == 0 || bpb.sectorsPerCluster == 0) return -1;
-    if (bpb.fatSize32 == 0) return -1;
+    if (bpb.bytesPerSector == 0 || bpb.sectorsPerCluster == 0) {
+        Console::get().drawText("[FAT32] Invalid BPB geometry\n");
+        return -1;
+    }
+    if (bpb.fatSize32 == 0) {
+        Console::get().drawText("[FAT32] Not a FAT32 volume\n");
+        return -1;
+    }
     
     fatStart = bpb.reservedSectors;
     dataStart = bpb.reservedSectors + (bpb.numFATs * bpb.fatSize32);
     clusterSize = bpb.bytesPerSector * bpb.sectorsPerCluster;
     rootDirCluster = bpb.rootCluster;
+
+    Console::get().drawText("[FAT32] bytes/sector: ");
+    Console::get().drawNumber(bpb.bytesPerSector);
+    Console::get().drawText(", sectors/cluster: ");
+    Console::get().drawNumber(bpb.sectorsPerCluster);
+    Console::get().drawText(", root cluster: ");
+    Console::get().drawNumber(rootDirCluster);
+    Console::get().drawText("\n");
     
-    FAT32Node* rootData = (FAT32Node*)kheap.allocate(sizeof(FAT32Node));
-    if (!rootData) return -1;
+    FAT32Node* rootData = (FAT32Node*)kmalloc(sizeof(FAT32Node));
+    if (!rootData) {
+        Console::get().drawText("[FAT32] Failed to allocate root node data\n");
+        return -1;
+    }
     
     rootData->name[0] = '/';
     rootData->name[1] = '\0';
@@ -53,6 +78,11 @@ int FAT32FS::mount(const char* path) {
     rootData->parentCluster = 0;
     
     rootNode = new VNode(this, rootDirCluster, FileType::Directory);
+    if (!rootNode) {
+        Console::get().drawText("[FAT32] Failed to allocate root vnode\n");
+        kfree(rootData);
+        return -1;
+    }
     rootNode->setData(rootData);
     rootNode->ops = &ops;
     
@@ -116,16 +146,16 @@ bool FAT32FS::readFATEntry(uint32_t cluster, uint32_t* value) {
     uint32_t fatSector = fatStart + (fatOffset / bpb.bytesPerSector);
     uint32_t entryOffset = fatOffset % bpb.bytesPerSector;
     
-    uint8_t* buffer = (uint8_t*)kheap.allocate(bpb.bytesPerSector);
+    uint8_t* buffer = (uint8_t*)kmalloc(bpb.bytesPerSector);
     if (!buffer) return false;
     
     if (!readSector(fatSector, buffer)) {
-        kheap.free(buffer);
+        kfree(buffer);
         return false;
     }
     
     *value = *(uint32_t*)(buffer + entryOffset) & 0x0FFFFFFF;
-    kheap.free(buffer);
+    kfree(buffer);
     return true;
 }
 
@@ -134,11 +164,11 @@ bool FAT32FS::writeFATEntry(uint32_t cluster, uint32_t value) {
     uint32_t fatSector = fatStart + (fatOffset / bpb.bytesPerSector);
     uint32_t entryOffset = fatOffset % bpb.bytesPerSector;
     
-    uint8_t* buffer = (uint8_t*)kheap.allocate(bpb.bytesPerSector);
+    uint8_t* buffer = (uint8_t*)kmalloc(bpb.bytesPerSector);
     if (!buffer) return false;
     
     if (!readSector(fatSector, buffer)) {
-        kheap.free(buffer);
+        kfree(buffer);
         return false;
     }
     
@@ -146,18 +176,18 @@ bool FAT32FS::writeFATEntry(uint32_t cluster, uint32_t value) {
     *entry = (*entry & 0xF0000000) | (value & 0x0FFFFFFF);
     
     bool result = writeSector(fatSector, buffer);
-    kheap.free(buffer);
+    kfree(buffer);
     
     if (result && bpb.numFATs > 1) {
         uint32_t fat2Sector = fatSector + bpb.fatSize32;
-        buffer = (uint8_t*)kheap.allocate(bpb.bytesPerSector);
+        buffer = (uint8_t*)kmalloc(bpb.bytesPerSector);
         if (buffer) {
             if (readSector(fat2Sector, buffer)) {
                 entry = (uint32_t*)(buffer + entryOffset);
                 *entry = (*entry & 0xF0000000) | (value & 0x0FFFFFFF);
                 writeSector(fat2Sector, buffer);
             }
-            kheap.free(buffer);
+            kfree(buffer);
         }
     }
     
@@ -243,7 +273,7 @@ uint8_t FAT32FS::lfnChecksum(const char* shortName) {
 }
 
 FAT32Node* FAT32FS::createNodeFromEntry(FAT32DirEntry* entry, const char* longName) {
-    FAT32Node* node = (FAT32Node*)kheap.allocate(sizeof(FAT32Node));
+    FAT32Node* node = (FAT32Node*)kmalloc(sizeof(FAT32Node));
     if (!node) return nullptr;
     
     if (longName && longName[0]) {
@@ -287,11 +317,11 @@ bool FAT32FS::findEntry(uint32_t dirCluster, const char* name, FAT32DirEntry* en
     int lfnIndex = 0;
     
     while (cluster >= 2 && cluster < FAT32_EOC) {
-        void* buffer = kheap.allocate(clusterSize);
+        void* buffer = kmalloc(clusterSize);
         if (!buffer) return false;
         
         if (!readCluster(cluster, buffer)) {
-            kheap.free(buffer);
+            kfree(buffer);
             return false;
         }
         
@@ -300,7 +330,7 @@ bool FAT32FS::findEntry(uint32_t dirCluster, const char* name, FAT32DirEntry* en
         
         for (uint32_t i = 0; i < entriesPerCluster; i++) {
             if (entries[i].name[0] == 0x00) {
-                kheap.free(buffer);
+                kfree(buffer);
                 return false;
             }
             
@@ -370,14 +400,14 @@ bool FAT32FS::findEntry(uint32_t dirCluster, const char* name, FAT32DirEntry* en
                 }
                 if (entryCluster) *entryCluster = cluster;
                 if (entryOffset) *entryOffset = i * sizeof(FAT32DirEntry);
-                kheap.free(buffer);
+                kfree(buffer);
                 return true;
             }
             
             longName[0] = '\0';
         }
         
-        kheap.free(buffer);
+        kfree(buffer);
         cluster = getNextCluster(cluster);
     }
     
@@ -392,11 +422,11 @@ bool FAT32FS::createEntry(uint32_t dirCluster, const char* name, uint8_t attr, u
     uint32_t lastCluster = dirCluster;
     
     while (currentCluster >= 2 && currentCluster < FAT32_EOC) {
-        void* buffer = kheap.allocate(clusterSize);
+        void* buffer = kmalloc(clusterSize);
         if (!buffer) return false;
         
         if (!readCluster(currentCluster, buffer)) {
-            kheap.free(buffer);
+            kfree(buffer);
             return false;
         }
         
@@ -427,12 +457,12 @@ bool FAT32FS::createEntry(uint32_t dirCluster, const char* name, uint8_t attr, u
                 }
                 
                 bool result = writeCluster(currentCluster, buffer);
-                kheap.free(buffer);
+                kfree(buffer);
                 return result;
             }
         }
         
-        kheap.free(buffer);
+        kfree(buffer);
         lastCluster = currentCluster;
         currentCluster = getNextCluster(currentCluster);
     }
@@ -442,7 +472,7 @@ bool FAT32FS::createEntry(uint32_t dirCluster, const char* name, uint8_t attr, u
     
     setNextCluster(lastCluster, newCluster);
     
-    void* buffer = kheap.allocate(clusterSize);
+    void* buffer = kmalloc(clusterSize);
     if (!buffer) return false;
     
     for (uint32_t i = 0; i < clusterSize; i++) {
@@ -472,7 +502,7 @@ bool FAT32FS::createEntry(uint32_t dirCluster, const char* name, uint8_t attr, u
     }
     
     bool result = writeCluster(newCluster, buffer);
-    kheap.free(buffer);
+    kfree(buffer);
     return result;
 }
 
@@ -480,11 +510,11 @@ bool FAT32FS::deleteEntry(uint32_t dirCluster, const char* name) {
     uint32_t cluster = dirCluster;
     
     while (cluster >= 2 && cluster < FAT32_EOC) {
-        void* buffer = kheap.allocate(clusterSize);
+        void* buffer = kmalloc(clusterSize);
         if (!buffer) return false;
         
         if (!readCluster(cluster, buffer)) {
-            kheap.free(buffer);
+            kfree(buffer);
             return false;
         }
         
@@ -493,7 +523,7 @@ bool FAT32FS::deleteEntry(uint32_t dirCluster, const char* name) {
         
         for (uint32_t i = 0; i < entriesPerCluster; i++) {
             if (entries[i].name[0] == 0x00) {
-                kheap.free(buffer);
+                kfree(buffer);
                 return false;
             }
             
@@ -524,12 +554,12 @@ bool FAT32FS::deleteEntry(uint32_t dirCluster, const char* name) {
             if (name[j] == '\0' && shortName[j] == '\0') {
                 entries[i].name[0] = 0xE5;
                 bool result = writeCluster(cluster, buffer);
-                kheap.free(buffer);
+                kfree(buffer);
                 return result;
             }
         }
         
-        kheap.free(buffer);
+        kfree(buffer);
         cluster = getNextCluster(cluster);
     }
     
@@ -570,11 +600,11 @@ int64_t FAT32FS::nodeRead(VNode* node, void* buffer, uint64_t size, uint64_t off
     uint64_t offsetInCluster = offset % fs->clusterSize;
     
     while (bytesRead < size && cluster >= 2 && cluster < FAT32_EOC) {
-        void* clusterBuffer = kheap.allocate(fs->clusterSize);
+        void* clusterBuffer = kmalloc(fs->clusterSize);
         if (!clusterBuffer) return bytesRead;
         
         if (!fs->readCluster(cluster, clusterBuffer)) {
-            kheap.free(clusterBuffer);
+            kfree(clusterBuffer);
             return bytesRead;
         }
         
@@ -588,7 +618,7 @@ int64_t FAT32FS::nodeRead(VNode* node, void* buffer, uint64_t size, uint64_t off
             dest[bytesRead + i] = src[i];
         }
         
-        kheap.free(clusterBuffer);
+        kfree(clusterBuffer);
         bytesRead += toRead;
         offsetInCluster = 0;
         cluster = fs->getNextCluster(cluster);
@@ -630,7 +660,7 @@ int64_t FAT32FS::nodeWrite(VNode* node, const void* buffer, uint64_t size, uint6
     uint64_t offsetInCluster = offset % fs->clusterSize;
     
     while (bytesWritten < size) {
-        void* clusterBuffer = kheap.allocate(fs->clusterSize);
+        void* clusterBuffer = kmalloc(fs->clusterSize);
         if (!clusterBuffer) return bytesWritten;
         
         if (offsetInCluster > 0 || (size - bytesWritten) < fs->clusterSize) {
@@ -652,11 +682,11 @@ int64_t FAT32FS::nodeWrite(VNode* node, const void* buffer, uint64_t size, uint6
         }
         
         if (!fs->writeCluster(cluster, clusterBuffer)) {
-            kheap.free(clusterBuffer);
+            kfree(clusterBuffer);
             return bytesWritten;
         }
         
-        kheap.free(clusterBuffer);
+        kfree(clusterBuffer);
         bytesWritten += toWrite;
         offsetInCluster = 0;
         
@@ -714,11 +744,11 @@ int FAT32FS::nodeReaddir(VNode* node, DirEntry* entries, uint64_t count, uint64_
     char longName[256] = {0};
     
     while (cluster >= 2 && cluster < FAT32_EOC && entryCount < count) {
-        void* buffer = kheap.allocate(fs->clusterSize);
+        void* buffer = kmalloc(fs->clusterSize);
         if (!buffer) break;
         
         if (!fs->readCluster(cluster, buffer)) {
-            kheap.free(buffer);
+            kfree(buffer);
             break;
         }
         
@@ -727,7 +757,7 @@ int FAT32FS::nodeReaddir(VNode* node, DirEntry* entries, uint64_t count, uint64_
         
         for (uint32_t i = 0; i < entriesPerCluster && entryCount < count; i++) {
             if (dirEntries[i].name[0] == 0x00) {
-                kheap.free(buffer);
+                kfree(buffer);
                 *read = entryCount;
                 return 0;
             }
@@ -795,7 +825,7 @@ int FAT32FS::nodeReaddir(VNode* node, DirEntry* entries, uint64_t count, uint64_
             longName[0] = '\0';
         }
         
-        kheap.free(buffer);
+        kfree(buffer);
         cluster = fs->getNextCluster(cluster);
     }
     
@@ -872,7 +902,7 @@ int FAT32FS::nodeMkdir(VNode* parent, const char* name, uint32_t mode, VNode** r
     uint32_t newCluster = fs->allocateCluster();
     if (newCluster == 0) return -1;
     
-    void* buffer = kheap.allocate(fs->clusterSize);
+    void* buffer = kmalloc(fs->clusterSize);
     if (!buffer) {
         fs->freeClusterChain(newCluster);
         return -1;
@@ -899,12 +929,12 @@ int FAT32FS::nodeMkdir(VNode* parent, const char* name, uint32_t mode, VNode** r
     entries[1].fstClusLO = parentNode->cluster & 0xFFFF;
     
     if (!fs->writeCluster(newCluster, buffer)) {
-        kheap.free(buffer);
+        kfree(buffer);
         fs->freeClusterChain(newCluster);
         return -1;
     }
     
-    kheap.free(buffer);
+    kfree(buffer);
     
     FAT32DirEntry entry;
     if (!fs->createEntry(parentNode->cluster, name, FAT32_ATTR_DIRECTORY, newCluster, &entry)) {
@@ -977,11 +1007,11 @@ int FAT32FS::nodeRmdir(VNode* parent, const char* name) {
     
     uint32_t cluster = ((uint32_t)entry.fstClusHI << 16) | entry.fstClusLO;
     
-    void* buffer = kheap.allocate(fs->clusterSize);
+    void* buffer = kmalloc(fs->clusterSize);
     if (!buffer) return -1;
     
     if (!fs->readCluster(cluster, buffer)) {
-        kheap.free(buffer);
+        kfree(buffer);
         return -1;
     }
     
@@ -990,13 +1020,13 @@ int FAT32FS::nodeRmdir(VNode* parent, const char* name) {
     
     for (uint32_t i = 2; i < entriesPerCluster; i++) {
         if (entries[i].name[0] == 0x00) break;
-        if (entries[i].name[0] != 0xE5 && entries[i].attr != FAT32_ATTR_LONG_NAME) {
-            kheap.free(buffer);
+        if ((unsigned char)entries[i].name[0] != 0xE5 && entries[i].attr != FAT32_ATTR_LONG_NAME) {
+            kfree(buffer);
             return -1;
         }
     }
     
-    kheap.free(buffer);
+    kfree(buffer);
     
     if (!fs->deleteEntry(parentNode->cluster, name)) {
         return -1;

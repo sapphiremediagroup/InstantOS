@@ -1,1 +1,0 @@
-option('build_iso', type: 'boolean', value: false, description: 'Build bootable ISO image')

@@ -1,7 +1,17 @@
-#include "gdt.hpp"
-#include <cstddef>
+#include <cpu/gdt/gdt.hpp>
+#include <memory/vmm.hpp>
+// #include <cstddef>
 
-GDT::GDT(){
+namespace {
+alignas(16) uint8_t doubleFaultStack[PAGE_SIZE * 4];
+}
+
+GDT& GDT::get(){
+    static GDT instance;
+    return instance;
+}
+
+void GDT::initialize(){
     gdtp.limit = (sizeof(GDTEntry) * 8) - 1;
     gdtp.base = (uint64_t)&gdt;
     
@@ -10,14 +20,15 @@ GDT::GDT(){
     setGate64(1, 0x9A, 0x20);
     setGate64(2, 0x92, 0x00);
     
-    setGate64(3, 0xFA, 0x20);
-    setGate64(4, 0xF2, 0x00);
+    setGate64(3, 0xF2, 0x00);
+    setGate64(4, 0xFA, 0x20);
     
     for (size_t i = 0; i < sizeof(TSS); i++) {
         ((uint8_t*)&tss)[i] = 0;
     }
     
     tss.iopb = sizeof(TSS);
+    tss.ist1 = reinterpret_cast<uint64_t>(doubleFaultStack + sizeof(doubleFaultStack));
     
     uint64_t tssBase = (uint64_t)&tss;
     uint32_t tssLimit = sizeof(TSS) - 1;
@@ -26,7 +37,24 @@ GDT::GDT(){
     
     asm volatile("lgdt %0" : : "m"(gdtp));
     
-    reloadSegments((uint16_t)SegmentSelectors::KernelData, (uint16_t)SegmentSelectors::KernelCode);
+    uint16_t data = (uint16_t)SegmentSelectors::KernelData;
+    uint64_t code = (uint16_t)SegmentSelectors::KernelCode;
+
+    asm volatile (
+        "mov %w0, %%ds\n"
+        "mov %w0, %%es\n"
+        "mov %w0, %%fs\n"
+        "mov %w0, %%gs\n"
+        "mov %w0, %%ss\n"
+        "push %q1\n"
+        "leaq 1f(%%rip), %%rax\n"
+        "push %%rax\n"
+        "lretq\n"
+        "1:\n"
+        : 
+        : "r"(data), "r"(code)
+        : "rax", "memory"
+    );
 
     asm volatile("ltr %0" : : "r"((uint16_t)SegmentSelectors::TaskState));
 }

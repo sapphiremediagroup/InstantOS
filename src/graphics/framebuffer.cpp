@@ -1,46 +1,54 @@
-#include "framebuffer.hpp"
-#include <x86_64/requests.hpp>
-#include <new>
+#include <graphics/framebuffer.hpp>
+#include <iboot/memory.hpp>
 
-Framebuffer::Framebuffer() {
-    auto count = framebuffer_request.response->framebuffer_count;
+iFramebuffer::iFramebuffer(Framebuffer* fb) : buffer(fb) {}
 
-    buffer = nullptr;
-    for(auto i = 0; i < count; i++){
-        auto fb = framebuffer_request.response->framebuffers[i];
-        if(fb->memory_model == LIMINE_FRAMEBUFFER_RGB){
-            buffer = new Buffer(fb);
-            break;
+iFramebuffer::~iFramebuffer() {}
+
+void iFramebuffer::putPixel(uint64_t x, uint64_t y, Color color) {
+    buffer.putPixel(x, y, color);
+}
+
+void iFramebuffer::clear(Color color) {
+    buffer.clear(color);
+}
+
+void iFramebuffer::clearGradient(Color c1, Color c2) {
+    uint64_t w = getWidth();
+    uint64_t h = getHeight();
+    if (h <= 1) return;
+
+    for (uint64_t y = 0; y < h; ++y) {
+        uint8_t r = c1.r + (static_cast<int32_t>(c2.r) - c1.r) * static_cast<int64_t>(y) / (h - 1);
+        uint8_t g = c1.g + (static_cast<int32_t>(c2.g) - c1.g) * static_cast<int64_t>(y) / (h - 1);
+        uint8_t b = c1.b + (static_cast<int32_t>(c2.b) - c1.b) * static_cast<int64_t>(y) / (h - 1);
+        Color rowCol(r, g, b);
+        for (uint64_t x = 0; x < w; ++x) {
+            putPixel(x, y, rowCol);
         }
     }
 }
 
-Framebuffer::~Framebuffer() {}
-
-void Framebuffer::putPixel(uint64_t x, uint64_t y, Color color) {
-    buffer->putPixel(x, y, color);
+uint64_t iFramebuffer::getWidth() {
+    return buffer.getWidth();
 }
 
-void Framebuffer::clear(Color color) {
-    buffer->clear(color);
+uint64_t iFramebuffer::getHeight() {
+    return buffer.getHeight();
 }
 
-uint64_t Framebuffer::getWidth() {
-    return buffer->getWidth();
+Color iFramebuffer::getPixel(uint64_t x, uint64_t y) {
+    return buffer.getPixel(x, y);
 }
 
-uint64_t Framebuffer::getHeight() {
-    return buffer->getHeight();
+void* iFramebuffer::getRaw(){
+    return buffer.getRaw();
 }
 
-Color Framebuffer::getPixel(uint64_t x, uint64_t y) {
-    return buffer->getPixel(x, y);
+uint64_t iFramebuffer::getPitch(){
+    return buffer.getPitch();
 }
 
-void* Framebuffer::getRaw(){
-    return buffer->getRaw();
-}
-
-uint64_t Framebuffer::getPitch(){
-    return buffer->getPitch();
+void iFramebuffer::switchToVirtIO(void* addr, uint32_t width, uint32_t height, uint32_t pitch) {
+    buffer = Buffer(addr, width, height, pitch);
 }

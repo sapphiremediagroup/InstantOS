@@ -1,3 +1,4 @@
+section .text
 extern exceptionHandler
 extern irqHandler
 
@@ -32,11 +33,11 @@ extern irqHandler
 handleISR:
     pushad
     
-    mov rdi, rsp
+    mov rcx, rsp
 
     mov rbp, rsp
     and rsp, ~0xF
-    sub rsp, 8
+    sub rsp, 32
     
     cld 
     call exceptionHandler
@@ -48,12 +49,14 @@ handleISR:
     iretq
 
 %macro isrYErr 1
+global isr%+%1
 isr%+%1:
     push %1
     jmp handleISR
 %endmacro
 
 %macro isrNErr 1
+global isr%+%1
 isr%+%1:
     push 0
     push %1
@@ -96,11 +99,11 @@ isrNErr 31
 handleIRQ:
     pushad
     
-    mov rdi, rsp
+    mov rcx, rsp
     
     mov rbp, rsp
     and rsp, ~0xF
-    sub rsp, 8
+    sub rsp, 32
     
     cld
     call irqHandler

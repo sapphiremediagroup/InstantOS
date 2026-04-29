@@ -1,5 +1,5 @@
-#include "pci.hpp"
-#include <x86_64/ports.hpp>
+#include <cpu/acpi/pci.hpp>
+#include <common/ports.hpp>
 
 PCI& PCI::get() {
     static PCI instance;

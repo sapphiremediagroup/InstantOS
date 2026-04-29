@@ -1,5 +1,5 @@
-#include "vfs.hpp"
-#include <cpu/mm/heap.hpp>
+#include <fs/vfs/vfs.hpp>
+#include <memory/heap.hpp>
 
 VFS vfsInstance;
 
@@ -31,7 +31,7 @@ FileSystem::~FileSystem() {
 }
 
 FileDescriptor::FileDescriptor(VNode* node, int flags) 
-    : node(node), flags(flags), offset(0) {
+    : node(node), flags(flags), offset(0), refCount(1) {
     if (node) {
         node->refCount++;
     }
@@ -54,7 +54,7 @@ int VFS::mount(FileSystem* fs, const char* path) {
         return fs->mount(path);
     }
     
-    MountPoint* mp = (MountPoint*)kheap.allocate(sizeof(MountPoint));
+    MountPoint* mp = (MountPoint*)kmalloc(sizeof(MountPoint));
     if (!mp) return -1;
     
     int i = 0;
@@ -171,7 +171,7 @@ FileSystem* VFS::findMount(const char* path, char* relativePath) {
 }
 
 VNode* VFS::resolvePath(const char* path, char* lastComponent) {
-    if (!initialized || !rootFS) return nullptr;
+    if (!initialized) return nullptr;
     
     if (!path || path[0] != '/') return nullptr;
     
@@ -250,8 +250,18 @@ int VFS::open(const char* path, int flags, FileDescriptor** fd) {
     return 0;
 }
 
+void VFS::retain(FileDescriptor* fd) {
+    if (fd) {
+        fd->retain();
+    }
+}
+
 int VFS::close(FileDescriptor* fd) {
     if (!initialized || !fd) return -1;
+
+    if (!fd->release()) {
+        return 0;
+    }
     
     VNode* node = fd->getNode();
     if (node && node->ops && node->ops->close) {

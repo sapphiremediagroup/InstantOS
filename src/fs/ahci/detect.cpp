@@ -1,26 +1,24 @@
-#include "detect.hpp"
-#include <x86_64/ports.hpp>
+#include "graphics/console.hpp"
+#include "graphics/framebuffer.hpp"
+#include <fs/ahci/detect.hpp>
+#include <fs/ahci/ahci.hpp>
+#include <common/ports.hpp>
+#include <cpu/acpi/pci.hpp>
 
 uint32_t AHCIDetector::pciConfigReadDword(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset) {
-    uint32_t address = (uint32_t)((bus << 16) | (slot << 11) | (func << 8) | (offset & 0xFC) | 0x80000000);
-    outl(0xCF8, address);
-    return inl(0xCFC);
+    return PCI::get().readConfig32(0, bus, slot, func, offset);
 }
 
 void AHCIDetector::pciConfigWriteDword(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset, uint32_t value) {
-    uint32_t address = (uint32_t)((bus << 16) | (slot << 11) | (func << 8) | (offset & 0xFC) | 0x80000000);
-    outl(0xCF8, address);
-    outl(0xCFC, value);
+    PCI::get().writeConfig32(0, bus, slot, func, offset, value);
 }
 
 uint16_t AHCIDetector::pciConfigReadWord(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset) {
-    uint32_t dword = pciConfigReadDword(bus, slot, func, offset & 0xFC);
-    return (uint16_t)((dword >> ((offset & 2) * 8)) & 0xFFFF);
+    return PCI::get().readConfig16(0, bus, slot, func, offset);
 }
 
 uint8_t AHCIDetector::pciConfigReadByte(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset) {
-    uint32_t dword = pciConfigReadDword(bus, slot, func, offset & 0xFC);
-    return (uint8_t)((dword >> ((offset & 3) * 8)) & 0xFF);
+    return PCI::get().readConfig8(0, bus, slot, func, offset);
 }
 
 bool AHCIDetector::checkDevice(uint8_t bus, uint8_t slot, uint8_t func, uint64_t* abar) {
@@ -33,11 +31,22 @@ bool AHCIDetector::checkDevice(uint8_t bus, uint8_t slot, uint8_t func, uint64_t
     
     if (classCode == PCI_CLASS_MASS_STORAGE && subclass == PCI_SUBCLASS_SATA && progIF == PCI_PROG_IF_AHCI) {
         uint32_t bar5 = pciConfigReadDword(bus, slot, func, PCI_BAR5);
-        *abar = bar5 & 0xFFFFFFF0;
+        Console::get().drawText("[AHCI] BAR5 raw: 0x");
+        Console::get().drawHex(bar5);
+        Console::get().drawText("\n");
+        if ((bar5 & 0x6) == 0x4) {
+            uint32_t bar5_high = pciConfigReadDword(bus, slot, func, PCI_BAR5 + 4);
+            Console::get().drawText("[AHCI] BAR5 high: 0x");
+            Console::get().drawHex(bar5_high);
+            Console::get().drawText("\n");
+            *abar = ((uint64_t)bar5_high << 32) | (bar5 & 0xFFFFFFF0);
+        } else {
+            *abar = bar5 & 0xFFFFFFF0;
+        }
         
         uint16_t command = pciConfigReadWord(bus, slot, func, PCI_COMMAND);
         command |= 0x06;
-        pciConfigWriteDword(bus, slot, func, PCI_COMMAND, command);
+        PCI::get().writeConfig16(0, bus, slot, func, PCI_COMMAND, command);
         
         return true;
     }
@@ -51,6 +60,18 @@ AHCIController* AHCIDetector::detectAndInitialize() {
             for (uint8_t func = 0; func < 8; func++) {
                 uint64_t abar;
                 if (checkDevice(bus, slot, func, &abar)) {
+                    Console::get().drawText("AHCI: [ ");
+                    Console::get().setTextColor(0x49ceee);
+                    Console::get().drawText("...");
+                    Console::get().setTextColor(0xFFFFFF);
+                    Console::get().drawText(" ] ");
+                    Console::get().drawHex(abar);
+                    Console::get().drawText(" ");
+                    Console::get().drawNumber(slot);
+                    Console::get().drawText(":");
+                    Console::get().drawNumber(func);
+                    Console::get().drawText("\n");
+                    
                     AHCIController* controller = new AHCIController(abar);
                     if (controller->initialize()) {
                         return controller;

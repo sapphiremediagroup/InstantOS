@@ -1,5 +1,5 @@
-#include "initrd.hpp"
-#include <string.h>
+#include <fs/initrd/initrd.hpp>
+#include <common/string.hpp>
 
 constexpr uint32_t INITRD_MAGIC = 0x44524E49;
 

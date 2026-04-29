@@ -1,0 +1,2687 @@
+[2J[001;001H[=3h[2J[001;001H[2J[001;001H[8;056;240t[2J[001;001H[2J[001;001H[=3h[2J[001;001H[2J[001;001H[8;042;160t[2J[001;001HBdsDxe: loading Boot0002 "UEFI QEMU DVD-ROM QM00001 " from PciRoot(0x0)/Pci(0x1,0x1)/Ata(Primary,Master,0x0)
+BdsDxe: starting Boot0002 "UEFI QEMU DVD-ROM QM00001 " from PciRoot(0x0)/Pci(0x1,0x1)/Ata(Primary,Master,0x0)
+[2J[001;001H[iBoot] iBoot starting...
+[iBoot] Loading INSTANTOS.EFI...
+[iBoot] Kernel loaded. Preparing initrd and memory map...
+[iBoot] INITRD loaded.
+[iBoot] Framebuffer acquired.
+CPU: [ OK ] MMX: yes [enabled], TSC: yes [enabled], WP: yes [enabled], NX: yes [enabled], SSE: yes [enabled], SSE2: yes [enabled], SSE3: yes [enabled], SSSE3: yes [enabled], SSE4.1: yes [enabled], SSE4.2: yes [enabled], XSAVE: yes [enabled], XSAVEOPT: yes [enabled], AVX: yes [enabled], AVX2: yes [enabled], AVX512: no, PKU: no, UMIP: yes [enabled], FSGSBASE: yes [enabled], SMEP: yes [enabled]
+[PMM] 0x0000000000000000 - 0x0000000000020FFF  (reserved)
+[PMM] 0x00000000000A0000 - 0x00000000000FFFFF  (reserved)
+[PMM] 0x0000000000800000 - 0x0000000000807FFF  (reserved)
+[PMM] 0x000000000080B000 - 0x000000000080BFFF  (reserved)
+[PMM] 0x0000000000812000 - 0x0000000000812FFF  (reserved)
+[PMM] 0x0000000000814000 - 0x00000000008FFFFF  (reserved)
+[PMM] 0x000000003DA4F000 - 0x000000003DB4BFFF  kernel
+[PMM] 0x000000003DB7D000 - 0x000000003DBD4FFF  (reserved)
+[PMM] 0x000000003DBD7000 - 0x000000003DBD9FFF  (reserved)
+[PMM] 0x000000003EA67000 - 0x000000003EA68FFF  (reserved)
+[PMM] 0x000000003EA6F000 - 0x000000003EA6FFFF  (reserved)
+[PMM] 0x000000003EA71000 - 0x000000003EA71FFF  (reserved)
+[PMM] 0x000000003ED3F000 - 0x000000003EDFFFFF  (reserved)
+[PMM] 0x000000003F8ED000 - 0x000000003FBFEFFF  (reserved)
+[PMM] 0x000000003FEEC000 - 0x00000000FFFFFFFF  (reserved)
+PMM: reserved initrd frames: 80
+[apic] ioapic id=0 addr=0x00000000fec00000 gsi_base=0
+[apic] iso source=0 gsi=2 flags=0x0000000000000000
+[apic] iso source=5 gsi=5 flags=0x000000000000000d
+[apic] iso source=9 gsi=9 flags=0x000000000000000d
+[apic] iso source=10 gsi=10 flags=0x000000000000000d
+[apic] iso source=11 gsi=11 flags=0x000000000000000d
+[BOOT] before mapIRQ timer
+[apic] mapIRQ irq=0 gsi=2 index=2 vector=0x0000000000000040 dest=0 flags=0x0000000000000000
+[BOOT] after mapIRQ timer
+[kbd:init] begin
+[kbd:init] flush=0x2a
+[kbd:init] flush=0xe0
+[kbd:init] flush=0x5b
+[kbd:init] flush=0xaa
+[kbd:init] flush=0xe0
+[kbd:init] flush=0xdb
+[kbd:init] cfg-old=0x77
+[kbd:init] cfg-init=0x44
+[kbd:init] reset-ack=0xfa
+[kbd:init] reset-bat=0xaa
+[kbd:init] scan-set-cmd=0xfa
+[kbd:init] scan-set-2=0xfa
+[kbd:init] scan-ack=0xfa
+[kbd:init] mouse-defaults=0xfa
+[kbd:init] mouse-stream=0xfa
+[kbd:init] cfg-new=0x47
+[kbd:init] ready
+[BOOT] before mapIRQ keyboard
+[apic] mapIRQ irq=1 gsi=1 index=1 vector=0x0000000000000021 dest=0 flags=0x0000000000000000
+[BOOT] after mapIRQ keyboard
+[BOOT] before mapIRQ mouse
+[apic] mapIRQ irq=12 gsi=12 index=12 vector=0x000000000000002c dest=0 flags=0x0000000000000000
+[BOOT] after mapIRQ mouse
+[BOOT] VirtIO GPU: [ OK ]
+[BOOT] LAPIC ID=0
+[BOOT] IRQ target APIC ID=0
+[BOOT] GDTR base=3dad05c0
+[BOOT] IDTR base=3dad4680
+[2Jdetecting ahci
+[AHCI] BAR5 raw: 0x81060000
+AHCI: [ ... ] 81060000 5:0
+[AHCI] Initializing controller at ABAR: 0x2164654080
+[AHCI] Aligned ABAR: 0x2164654080, Pages needed: 2
+[AHCI] HBA Memory mapped at: 0x2164654080
+[AHCI] HBA Version: 0x65536
+[AHCI] HBA Capabilities: 0x3222544133
+[AHCI] Number of ports: 6
+[AHCI] Port Implemented register: 0x63
+[AHCI] Checking port 0...
+[AHCI] Port 0 type: SATA
+[AHCI] Initializing SATA port 0...
+[AHCI Port 0] Stopping command engine...
+[AHCI Port 0] Allocating command list buffer...
+[AHCI Port 0] Allocating FIS buffer...
+[AHCI Port 0] Command list at: 0x9454592, FIS at: 0x9444608
+[AHCI Port 0] Allocating command tables...
+[AHCI Port 0] Starting command engine...
+[AHCI Port 0] Sending IDENTIFY command...
+[AHCI Port 0] IDENTIFY successful, sector count: 131072
+[AHCI Port 0] Port is now active
+[AHCI] Port 0 initialized successfully
+[AHCI] Port 0 sector count: 131072
+[AHCI] Port 0 capacity: 64 MB
+[AHCI] Port 0 initialized
+[AHCI] Checking port 1...
+[AHCI] Port 1 type: NULL/Unknown
+[AHCI] Checking port 2...
+[AHCI] Port 2 type: NULL/Unknown
+[AHCI] Checking port 3...
+[AHCI] Port 3 type: NULL/Unknown
+[AHCI] Checking port 4...
+[AHCI] Port 4 type: NULL/Unknown
+[AHCI] Checking port 5...
+[AHCI] Port 5 type: NULL/Unknown
+[AHCI] Total active ports: 1
+[AHCI] Active ports: 1
+[FAT32] bytes/sector: 512, sectors/cluster: 1, root cluster: 2
+testing new
+Hello World
+Mounting initrdfs...
+InitrdFS at /bin: [ OK ]
+[PROC] Loading PE at base: 7fffffe00000
+[PROC] Entry point: 7fffffe04580
+/bin/input-manager.exe: [ OK ]
+[PROC] Loading PE at base: 7fffffe00000
+[PROC] Entry point: 7fffffe04600
+/bin/storage-manager.exe: [ OK ]
+[PROC] Loading PE at base: 7fffffe00000
+[PROC] Entry point: 7fffffe04600
+/bin/process-manager.exe: [ OK ]
+[PROC] Loading PE at base: 7fffffe00000
+[PROC] Entry point: 7fffffe04600
+/bin/font-manager.exe: [ OK ]
+[PROC] Loading PE at base: 7fffffe00000
+[PROC] Entry point: 7fffffe04600
+/bin/session-manager.exe: [ OK ]
+[PROC] Loading PE at base: 7fffffe00000
+[PROC] Entry point: 7fffffe04940
+/bin/login.exe: [ OK ]
+[input.manager] service queue handle=0x0006000000000003
+[ipc:service] sys_register name=input.manager pid=1 name=/bin/input-manager.exe queue_handle=0x0006000000000003
+[ipc:service] register request name=input.manager owner=1 queue=0x0000000000998030 pending=0
+[ipc:service] registered name=input.manager slot=0 owner=1
+[ipc:service] sys_register result name=input.manager pid=1 name=/bin/input-manager.exe result=0x0000000000000000
+[ipc:input] input.manager registered; publishing buffered keyboard input
+[kbd] publish buffered to input.manager count=0
+[input.manager] ready
+[input.manager] idle queue handle=0x0006000000000004
+[ipc:service] sys_register name=font.manager pid=4 name=/bin/font-manager.exe queue_handle=0x0006000000000003
+[ipc:service] register request name=font.manager owner=4 queue=0x0000000000a08030 pending=0
+[ipc:service] registered name=font.manager slot=1 owner=4
+[ipc:service] sys_register result name=font.manager pid=4 name=/bin/font-manager.exe result=0x0000000000000000
+[font.manager] ready
+[ipc:service] connect found name=input.manager slot=0 owner=1 pending=0
+[ipc:service] sys_connect ok name=input.manager pid=6 name=/bin/login.exe handle=0x0007000000000003 pending=0
+login: [ipc:input] receive blocking handle=0x0007000000000003 pid=6 name=/bin/login.exe pending=0
+[ipc:service] sys_register name=session.manager pid=5 name=/bin/session-manager.exe queue_handle=0x0006000000000003
+[ipc:service] register request name=session.manager owner=5 queue=0x0000000000a10030 pending=0
+[ipc:service] registered name=session.manager slot=2 owner=5
+[ipc:service] sys_register result name=session.manager pid=5 name=/bin/session-manager.exe result=0x0000000000000000
+[session.manager] ready
+[ipc:service] sys_register name=storage.manager pid=2 name=/bin/storage-manager.exe queue_handle=0x0006000000000003
+[ipc:service] register request name=storage.manager owner=2 queue=0x0000000000a18030 pending=0
+[ipc:service] registered name=storage.manager slot=3 owner=2
+[ipc:service] sys_register result name=storage.manager pid=2 name=/bin/storage-manager.exe result=0x0000000000000000
+[storage.manager] ready
+[ipc:service] sys_register name=process.manager pid=3 name=/bin/process-manager.exe queue_handle=0x0006000000000003
+[ipc:service] register request name=process.manager owner=3 queue=0x0000000000a20030 pending=0
+[ipc:service] registered name=process.manager slot=4 owner=3
+[ipc:service] sys_register result name=process.manager pid=3 name=/bin/process-manager.exe result=0x0000000000000000
+[process.manager] ready
+[kbd:irq] status=0x1d
+[kbd:irq] scancode=0x13
+[ipc:service] connect found name=input.manager slot=0 owner=1 pending=0
+[ipc:input] post queued service=input.manager size=56 pending=0->1 event_type=1 key_action=0 keycode=114 modifiers=0x0000000000000000 text0=0x0000000000000072
+[kbd:irq] dispatch char=r window=fail input=ok modifiers=0x00
+[kbd:irq] char=r pending=1
+[ipc:input] receive woke handle=0x0007000000000003 pid=6 name=/bin/login.exe pending=1
+[ipc:input] receive dequeued handle=0x0007000000000003 pid=6 name=/bin/login.exe flags=0x0000000000000002 size=56 pending=0 event_type=1 key_action=0 keycode=114 modifiers=0x0000000000000000 text0=0x0000000000000072
+r[ipc:input] receive blocking handle=0x0007000000000003 pid=6 name=/bin/login.exe pending=0
+[kbd:poll] scancode=0x13
+[ipc:service] connect found name=input.manager slot=0 owner=1 pending=0
+[ipc:input] post queued service=input.manager size=56 pending=0->1 event_type=1 key_action=0 keycode=114 modifiers=0x0000000[kbd:irq] status=0x1d
+[kbd:irq] scancode=0x93
+000000000 text0=0x0000000000000072
+[k[ipc:input] receive woke handle=0x0007000000000003 pid=6 name=/bin/login.exe pending=1
+[ipc:input] receive dequeued handle=0x0007000000000003 pid=6 name=/bin/login.exe flags=0x0000000000000002 size=56 pending=0 event_type=1 key_action=0 keycode=114 modifiers=0x0000000000000000 text0=0x0000000000000072
+r[ipc:input] receive blocking handle=0x0007000000000003 pid=6 name=/bin/login.exe pending=0
+bd:poll] dispatch char=r window=fail input=ok modifiers=0x00
+[kbd:poll] char=r pending=2
+[ipc:input] receive woke handle=0x0007000000000003 pid=6 name=/bin/login.exe pending=0
+[ipc:input] receive blocking handle=0x0007000000000003 pid=6 name=/bin/login.exe pending=0
+[kbd:irq] status=0x1d
+[kbd:irq] scancode=0x18
+[ipc:service] connect found name=input.manager slot=0 owner=1 pending=0
+[ipc:input] post queued service=input.manager size=56 pending=0->1 event_type=1 key_action=0 keycode=111 modifiers=0x0000000000000000 text0=0x000000000000006f
+[kbd:irq] dispatch char=o window=fail input=ok modifiers=0x00
+[kbd:irq] char=o pending=3
+[ipc:input] receive woke handle=0x0007000000000003 pid=6 name=/bin/login.exe pending=1
+[ipc:input] receive dequeued handle=0x0007000000000003 pid=6 name=/bin/login.exe flags=0x0000000000000002 size=56 pending=0 event_type=1 key_action=0 keycode=111 modifiers=0x0000000000000000 text0=0x000000000000006f
+o[ipc:input] receive blocking handle=0x0007000000000003 pid=6 name=/bin/login.exe pending=0
+[kbd:poll] scancode=0x18
+[ipc:service] connect found name=input.manager slot=0 owner=1 pending=0
+[ipc:input] post queued service=input.manager size=56 pending=0->1 event_type=1 key_action=0 keycode=111 modifiers=0x0000000000000000 text0=0x000000000000006f
+[kbd:[ipc:input] receive woke handle=0x0007000000000003 pid=6 name=/bin/login.exe pending=1
+[ipc:input] receive dequeued handle=0x0007000000000003 pid=6 name=/bin/login.exe flags=0x0000000000000002 size=56 pending=0 event_type=1 key_action=0 keycode=111 modifiers=0x0000000000000000 text0=0x000000000000006f
+[kbd:poll] scancode=0x98
+[kbd:irq] status=0x1d
+[kbd:irq] scancode=0x0e
+[ipc:service] connect found name=input.manager slot=0 owner=1 pending=0
+[ipc:input] post queued service=input.manager size=56 pending=0->1 event_type=1 key_action=0 keycode=8 modifiers=0x0000000000000000 text0=0x0000000000000000
+[kbd:irq] dispatch char=\b window=fail input=ok modifiers=0x00
+[kbd:irq] char=\b pending=4
+[kbd:irq] status=0x1d
+[kbd:irq] scancode=0x8e
+[kbd:irq] status=0x1d
+[kbd:irq] scancode=0x0e
+[ipc:service] connect found name=input.manager slot=0 owner=1 pending=1
+[ipc:input] post queued service=input.manager size=56 pending=1->2 event_type=1 key_action=0 keycode=8 modifiers=0x0000000000000000 text0=0x0000000000000000
+[kbd:irq] dispatch char=\b window=fail input=ok modifiers=0x00
+[kbd:irq] char=\b pending=5
+[kbd:irq] status=0x1d
+[kbd:irq] scancode=0x8e
+[kbd:irq] status=0x1c
+o[ipc:input] receive dequeued handle=0x0007000000000003 pid=6 name=/bin/login.exe flags=0x0000000000000002 size=56 pending=1 event_type=1 key_action=0 keycode=8 modifiers=0x0000000000000000 text0=0x0000000000000000
+ [ipc:input] receive dequeued handle=0x0007000000000003 pid=6 name=/bin/login.exe flags=0x0000000000000002 size=56 pending=0 event_type=1 key_action=0 keycode=8 modifiers=0x0000000000000000 text0=0x0000000000000000
+ [ipc:input] receive blocking handle=0x0007000000000003 pid=6 name=/bin/login.exe pending=0
+poll] dispatch char=o window=fail input=ok modifiers=0x00
+[kbd:poll] char=o pending=6
+[ipc:input] receive woke handle=0x0007000000000003 pid=6 name=/bin/login.exe pending=0
+[ipc:input] receive blocking handle=0x0007000000000003 pid=6 name=/bin/login.exe pending=0
+[kbd:irq] status=0x1d
+[kbd:irq] scancode=0x0e
+[ipc:service] connect found name=input.manager slot=0 owner=1 pending=0
+[ipc:input] post queued service=input.manager size=56 pending=0->1 event_type=1 key_action=0 keycode=8 modifiers=0x0000000000000000 text0=0x0000000000000000
+[kbd:irq] dispatch char=\b window=fail input=ok modifiers=0x00
+[kbd:irq] char=\b pending=7
+[ipc:input] receive woke handle=0x0007000000000003 pid=6 name=/bin/login.exe pending=1
+[ipc:input] receive dequeued handle=0x0007000000000003 pid=6 name=/bin/login.exe flags=0x0000000000000002 size=56 pending=0 event_type=1 key_action=0 keycode=8 modifiers=0x0000000000000000 text0=0x0000000000000000
+ [ipc:input] receive blocking handle=0x0007000000000003 pid=6 name=/bin/login.exe pending=0
+[kbd:poll] scancode=0x0e
+[ipc:service] connect found name=input.manager slot=0 owner=1 pending=0
+[ipc:input] post queued service=input.manager size=56 pending=0->1 event_type=1 key_action=0 keycode=8 modifiers=0x0000000000000000 text0=0x0000000000000000
+[ipc:input] receive woke handle=0x0007000000000003 pid=6 name=/bin/login.exe pending=1
+[ipc:input] receive dequeued handle=0x0007000000000003 pid=6 name=/bin/login.exe flags=0x0000000000000002 size=56 pending=0 event_type=1 key_action=0 keycode=8 modifiers=0x0000000000000000 text0=0x0000000000000000
+ [ipc:input] receive blocking handle=0x0007000000000003 pid=6 name=/bin/login.exe pending=0
+[kb[kbd:irq] status=0x1d
+[kbd:irq] scancode=0x8e
+d:poll] dispatch char=\b window=fail input=ok modifiers=0x00
+[kbd:poll] char=\b pending=8
+[ipc:input] receive woke handle=0x0007000000000003 pid=6 name=/bin/login.exe pending=0
+[ipc:input] receive blocking handle=0x0007000000000003 pid=6 name=/bin/login.exe pending=0
+[kbd:irq] status=0x1d
+[kbd:irq] scancode=0x13
+[ipc:service] connect found name=input.manager slot=0 owner=1 pending=0
+[ipc:input] post queued service=input.manager size=56 pending=0->1 event_type=1 key_action=0 keycode=114 modifiers=0x0000000000000000 text0=0x0000000000000072
+[kbd:irq] dispatch char=r window=fail input=ok modifiers=0x00
+[kbd:irq] char=r pending=9
+[ipc:input] receive woke handle=0x0007000000000003 pid=6 name=/bin/login.exe pending=1
+[ipc:input] receive dequeued handle=0x0007000000000003 pid=6 name=/bin/login.exe flags=0x0000000000000002 size=56 pending=0 event_type=1 key_action=0 keycode=114 modifiers=0x0000000000000000 text0=0x0000000000000072
+r[ipc:input] receive blocking handle=0x0007000000000003 pid=6 name=/bin/login.exe pending=0
+[kbd:poll] scancode=0x93
+[kbd:irq] status=0x1d
+[kbd:irq] scancode=0x18
+[ipc:service] connect found name=input.manager slot=0 owner=1 pending=0
+[ipc:input] post queued service=input.manager size=56 pending=0->1 event_type=1 key_action=0 keycode=111 modifiers=0x0000000000000000 text0=0x000000000000006f
+[kbd:irq] dispatch char=o window=fail input=ok modifiers=0x00
+[kbd:irq] char=o pending=10
+[ipc:input] receive woke handle=0x0007000000000003 pid=6 name=/bin/login.exe pending=1
+[ipc:input] receive dequeued handle=0x0007000000000003 pid=6 name=/bin/login.exe flags=0x0000000000000002 size=56 pending=0 event_type=1 key_action=0 keycode=111 modifiers=0x0000000000000000 text0=0x000000000000006f
+[kbd:irq] status=0x1d
+[kbd:irq] scancode=0x98
+[kbd:irq] status=0x1c
+o[ipc:input] receive blocking handle=0x0007000000000003 pid=6 name=/bin/login.exe pending=0
+[kbd:poll] scancode=0x98
+[kbd:irq] status=0x1d
+[kbd:irq] scancode=0x18
+[ipc:service] connect found name=input.manager slot=0 owner=1 pending=0
+[ipc:input] post queued service=input.manager size=56 pending=0->1 event_type=1 key_action=0 keycode=111 modifiers=0x0000000000000000 text0=0x000000000000006f
+[kbd:irq] dispatch char=o window=fail input=ok modifiers=0x00
+[kbd:irq] char=o pending=11
+[ipc:input] receive woke handle=0x0007000000000003 pid=6 name=/bin/login.exe pending=1
+[ipc:input] receive dequeued handle=0x0007000000000003 pid=6 name=/bin/login.exe flags=0x0000000000000002 size=56 pending=0 event_type=1 key_action=0 keycode=111 modifiers=0x0000000000000000 text0=0x000000000000006f
+o[ipc:input] receive blocking handle=0x0007000000000003 pid=6 name=/bin/login.exe pending=0
+[kbd:irq] status=0x1d
+[kbd:irq] scancode=0x98
+[kbd:poll] scancode=0x98
+[kbd:irq] status=0x1d
+[kbd:irq] scancode=0x14
+[ipc:service] connect found name=input.manager slot=0 owner=1 pending=0
+[ipc:input] post queued service=input.manager size=56 pending=0->1 event_type=1 key_action=0 keycode=116 modifiers=0x0000000000000000 text0=0x0000000000000074
+[kbd:irq] dispatch char=t window=fail input=ok modifiers=0x00
+[kbd:irq] char=t pending=12
+[ipc:input] receive woke handle=0x0007000000000003 pid=6 name=/bin/login.exe pending=1
+[ipc:input] receive dequeued handle=0x0007000000000003 pid=6 name=/bin/login.exe flags=0x0000000000000002 size=56 pending=0 event_type=1 key_action=0 keycode=116 modifiers=0x0000000000000000 text0=0x0000000000000074
+t[ipc:input] receive blocking handle=0x0007000000000003 pid=6 name=/bin/login.exe pending=0
+[kbd:irq] status=0x1d
+[kbd:irq] scancode=0x94
+[kbd:irq] status=0x1d
+[kbd:irq] scancode=0x1c
+[ipc:service] connect found name=input.manager slot=0 owner=1 pending=0
+[ipc:input] post queued service=input.manager size=56 pending=0->1 event_type=1 key_action=0 keycode=10 modifiers=0x0000000000000000 text0=0x0000000000000000
+[kbd:irq] dispatch char=\n window=fail input=ok modifiers=0x00
+[kbd:irq] char=\n pending=13
+[ipc:input] receive woke handle=0x0007000000000003 pid=6 name=/bin/login.exe pending=1
+[ipc:input] receive dequeued handle=0x0007000000000003 pid=6 name=/bin/login.exe flags=0x0000000000000002 size=56 pending=0 event_type=1 key_action=0 keycode=10 modifiers=0x0000000000000000 text0=0x0000000000000000
+
+password: [ipc:input] receive blocking handle=0x0007000000000003 pid=6 name=/bin/login.exe pending=0
+[kbd:irq] status=0x1d
+[kbd:irq] scancode=0x9c
+[kbd:irq] status=0x1d
+[kbd:irq] scancode=0x13
+[ipc:service] connect found name=input.manager slot=0 owner=1 pending=0
+[ipc:input] post queued service=input.manager size=56 pending=0->1 event_type=1 key_action=0 keycode=114 modifiers=0x0000000000000000 text0=0x0000000000000072
+[kbd:irq] dispatch char=r window=fail input=ok modifiers=0x00
+[kbd:irq] char=r pending=14
+[ipc:input] receive woke handle=0x0007000000000003 pid=6 name=/bin/login.exe pending=1
+[ipc:input] receive dequeued handle=0x0007000000000003 pid=6 name=/bin/login.exe flags=0x0000000000000002 size=56 pending=0 event_type=1 key_action=0 keycode=114 modifiers=0x0000000000000000 text0=0x0000000000000072
+*[ipc:input] receive blocking handle=0x0007000000000003 pid=6 name=/bin/login.exe pending=0
+[kbd:poll] scancode=0x13
+[ipc:service] connect found name=input.manager slot=0 owner=1 pending=0
+[ipc:input] post queued service=input.manager size=56 pending=0->1 event_type=1 key_action=0 keycode=114 modifiers=0x0000000000000000 text0=0x0000000000000072
+[kbd:po[ipc:input] receive woke handle=0x0007000000000003 pid=6 name=/bin/login.exe pending=1
+[ipc:input] receive dequeued handle=0x0007000000000003 pid=6 name=/bin/login.exe flags=0x0000000000000002 size=56 pending=0 event_type=1 key_action=0 keycode=114 modifiers=0x0000000000000000 text0=0x0000000000000072
+[kbd:poll] scancode=0x93
+[kbd:irq] status=0x1d
+[kbd:irq] scancode=0x18
+[ipc:service] connect found name=input.manager slot=0 owner=1 pending=0
+[ipc:input] post queued service=input.manager size=56 pending=0->1 event_type=1 key_action=0 keycode=111 modifiers=0x0000000000000000 text0=0x000000000000006f
+[kbd:irq] dispatch char=o window=fail input=ok modifiers=0x00
+[kbd:irq] char=o pending=15
+[kbd:irq] status=0x1d
+[kbd:irq] scancode=0x98
+[kbd:irq] status=0x1c
+*[ipc:input] receive dequeued handle=0x0007000000000003 pid=6 name=/bin/login.exe flags=0x0000000000000002 size=56 pending=0 event_type=1 key_action=0 keycode=111 modifiers=0x0000000000000000 text0=0x000000000000006f
+*[ipc:input] receive blocking handle=0x0007000000000003 pid=6 name=/bin/login.exe pending=0
+ll] dispatch char=r window=fail input=ok modifiers=0x00
+[kbd:poll] char=r pending=16
+[ipc:input] receive woke handle=0x0007000000000003 pid=6 name=/bin/login.exe pending=0
+[ipc:input] receive blocking handle=0x0007000000000003 pid=6 name=/bin/login.exe pending=0
+[kbd:irq] status=0x1d
+[kbd:irq] scancode=0x14
+[ipc:service] connect found name=input.manager slot=0 owner=1 pending=0
+[ipc:input] post queued service=input.manager size=56 pending=0->1 event_type=1 key_action=0 keycode=116 modifiers=0x0000000000000000 text0=0x0000000000000074
+[kbd:irq] dispatch char=t window=fail input=ok modifiers=0x00
+[kbd:irq] char=t pending=17
+[ipc:input] receive woke handle=0x0007000000000003 pid=6 name=/bin/login.exe pending=1
+[ipc:input] receive dequeued handle=0x0007000000000003 pid=6 name=/bin/login.exe flags=0x0000000000000002 size=56 pending=0 event_type=1 key_action=0 keycode=116 modifiers=0x0000000000000000 text0=0x0000000000000074
+*[ipc:input] receive blocking handle=0x0007000000000003 pid=6 name=/bin/login.exe pending=0
+[kbd:irq] status=0x1d
+[kbd:irq] scancode=0x94
+[kbd:poll] scancode=0x94
+[kbd:irq] status=0x1d
+[kbd:irq] scancode=0x1c
+[ipc:service] connect found name=input.manager slot=0 owner=1 pending=0
+[ipc:input] post queued service=input.manager size=56 pending=0->1 event_type=1 key_action=0 keycode=10 modifiers=0x0000000000000000 text0=0x0000000000000000
+[kbd:irq] dispatch char=\n window=fail input=ok modifiers=0x00
+[kbd:irq] char=\n pending=18
+[ipc:input] receive woke handle=0x0007000000000003 pid=6 name=/bin/login.exe pending=1
+[ipc:input] receive dequeued handle=0x0007000000000003 pid=6 name=/bin/login.exe flags=0x0000000000000002 size=56 pending=0 event_type=1 key_action=0 keycode=10 modifiers=0x0000000000000000 text0=0x0000000000000000
+
+Login failed.
+login: [ipc:input] receive blocking handle=0x0007000000000003 pid=6 name=/bin/login.exe pending=0
+[kbd:poll] scancode=0x9c
+[kbd:irq] status=0x1d
+[kbd:irq] scancode=0x13
+[ipc:service] connect found name=input.manager slot=0 owner=1 pending=0
+[ipc:input] post queued service=input.manager size=56 pending=0->1 event_type=1 key_action=0 keycode=114 modifiers=0x0000000000000000 text0=0x0000000000000072
+[kbd:irq] dispatch char=r window=fail input=ok modifiers=0x00
+[kbd:irq] char=r pending=19
+[ipc:input] receive woke handle=0x0007000000000003 pid=6 name=/bin/login.exe pending=1
+[ipc:input] receive dequeued handle=0x0007000000000003 pid=6 name=/bin/login.exe flags=0x0000000000000002 size=56 pending=0 event_type=1 key_action=0 keycode=114 modifiers=0x0000000000000000 text0=0x0000000000000072
+[kbd:irq] status=0x1d
+[kbd:irq] scancode=0x93
+[kbd:irq] status=0x1c
+r[ipc:input] receive blocking handle=0x0007000000000003 pid=6 name=/bin/login.exe pending=0
+[kbd:irq] status=0x1d
+[kbd:irq] scancode=0x18
+[ipc:service] connect found name=input.manager slot=0 owner=1 pending=0
+[ipc:input] post queued service=input.manager size=56 pending=0->1 event_type=1 key_action=0 keycode=111 modifiers=0x0000000000000000 text0=0x000000000000006f
+[kbd:irq] dispatch char=o window=fail input=ok modifiers=0x00
+[kbd:irq] char=o pending=20
+[ipc:input] receive woke handle=0x0007000000000003 pid=6 name=/bin/login.exe pending=1
+[ipc:input] receive dequeued handle=0x0007000000000003 pid=6 name=/bin/login.exe flags=0x0000000000000002 size=56 pending=0 event_type=1 key_action=0 keycode=111 modifiers=0x0000000000000000 text0=0x000000000000006f
+o[ipc:input] receive blocking handle=0x0007000000000003 pid=6 name=/bin/login.exe pending=0
+[kbd:irq] status=0x1d
+[kbd:irq] scancode=0x98
+[kbd:irq] status=0x1d
+[kbd:irq] scancode=0x18
+[ipc:service] connect found name=input.manager slot=0 owner=1 pending=0
+[ipc:input] post queued service=input.manager size=56 pending=0->1 event_type=1 key_action=0 keycode=111 modifiers=0x0000000000000000 text0=0x000000000000006f
+[kbd:irq] dispatch char=o window=fail input=ok modifiers=0x00
+[kbd:irq] char=o pending=21
+[ipc:input] receive woke handle=0x0007000000000003 pid=6 name=/bin/login.exe pending=1
+[ipc:input] receive dequeued handle=0x0007000000000003 pid=6 name=/bin/login.exe flags=0x0000000000000002 size=56 pending=0 event_type=1 key_action=0 keycode=111 modifiers=0x0000000000000000 text0=0x000000000000006f
+o[ipc:input] receive blocking handle=0x0007000000000003 pid=6 name=/bin/login.exe pending=0
+[kbd:irq] status=0x1d
+[kbd:irq] scancode=0x98
+[kbd:poll] scancode=0x98
+[kbd:irq] status=0x1d
+[kbd:irq] scancode=0x14
+[ipc:service] connect found name=input.manager slot=0 owner=1 pending=0
+[ipc:input] post queued service=input.manager size=56 pending=0->1 event_type=1 key_action=0 keycode=116 modifiers=0x0000000000000000 text0=0x0000000000000074
+[kbd:irq] dispatch char=t window=fail input=ok modifiers=0x00
+[kbd:irq] char=t pending=22
+[ipc:input] receive woke handle=0x0007000000000003 pid=6 name=/bin/login.exe pending=1
+[ipc:input] receive dequeued handle=0x0007000000000003 pid=6 name=/bin/login.exe flags=0x0000000000000002 size=56 pending=0 event_type=1 key_action=0 keycode=116 modifiers=0x0000000000000000 text0=0x0000000000000074
+t[ipc:input] receive blocking handle=0x0007000000000003 pid=6 name=/bin/login.exe pending=0
+[kbd:irq] status=0x1d
+[kbd:irq] scancode=0x94
+[kbd:poll] scancode=0x94
+[kbd:poll] scancode=0x1c
+[ipc:service] connect found name=input.manager slot=0 owner=1 pending=0
+[ipc:input] post queued service=input.manager size=56 pending=0->1 event_type=1 key_action=0 keycode=10 modifiers=0x0000000000000000 text0=0x0000000000000000
+[kbd:poll] dispatch char=\n window=fail input=ok modifiers=0x00
+[kbd:poll] char=\n pending=23
+[ipc:input] receive woke handle=0x0007000000000003 pid=6 name=/bin/login.exe pending=1
+[ipc:input] receive dequeued handle=0x0007000000000003 pid=6 name=/bin/login.exe flags=0x0000000000000002 size=56 pending=0 event_type=1 key_action=0 keycode=10 modifiers=0x0000000000000000 text0=0x0000000000000000
+[kbd:irq] status=0x1d
+[kbd:irq] scancode=0x9c
+[kbd:irq] status=0x1c
+
+password: [ipc:input] receive blocking handle=0x0007000000000003 pid=6 name=/bin/login.exe pending=0
+[kbd:irq] status=0x1d
+[kbd:irq] scancode=0x13
+[ipc:service] connect found name=input.manager slot=0 owner=1 pending=0
+[ipc:input] post queued service=input.manager size=56 pending=0->1 event_type=1 key_action=0 keycode=114 modifiers=0x0000000000000000 text0=0x0000000000000072
+[kbd:irq] dispatch char=r window=fail input=ok modifiers=0x00
+[kbd:irq] char=r pending=24
+[ipc:input] receive woke handle=0x0007000000000003 pid=6 name=/bin/login.exe pending=1
+[ipc:input] receive dequeued handle=0x0007000000000003 pid=6 name=/bin/login.exe flags=0x0000000000000002 size=56 pending=0 event_type=1 key_action=0 keycode=114 modifiers=0x0000000000000000 text0=0x0000000000000072
+*[ipc:input] receive blocking handle=0x0007000000000003 pid=6 name=/bin/login.exe pending=0
+[kbd:irq] status=0x1d
+[kbd:irq] scancode=0x93
+[kbd:irq] status=0x1d
+[kbd:irq] scancode=0x18
+[ipc:service] connect found name=input.manager slot=0 owner=1 pending=0
+[ipc:input] post queued service=input.manager size=56 pending=0->1 event_type=1 key_action=0 keycode=111 modifiers=0x0000000000000000 text0=0x000000000000006f
+[kbd:irq] dispatch char=o window=fail input=ok modifiers=0x00
+[kbd:irq] char=o pending=25
+[ipc:input] receive woke handle=0x0007000000000003 pid=6 name=/bin/login.exe pending=1
+[ipc:input] receive dequeued handle=0x0007000000000003 pid=6 name=/bin/login.exe flags=0x0000000000000002 size=56 pending=0 event_type=1 key_action=0 keycode=111 modifiers=0x0000000000000000 text0=0x000000000000006f
+*[ipc:input] receive blocking handle=0x0007000000000003 pid=6 name=/bin/login.exe pending=0
+[kbd:irq] status=0x1d
+[kbd:irq] scancode=0x98
+[kbd:irq] status=0x1d
+[kbd:irq] scancode=0x18
+[ipc:service] connect found name=input.manager slot=0 owner=1 pending=0
+[ipc:input] post queued service=input.manager size=56 pending=0->1 event_type=1 key_action=0 keycode=111 modifiers=0x0000000000000000 text0=0x000000000000006f
+[kbd:irq] dispatch char=o window=fail input=ok modifiers=0x00
+[kbd:irq] char=o pending=26
+[ipc:input] receive woke handle=0x0007000000000003 pid=6 name=/bin/login.exe pending=1
+[ipc:input] receive dequeued handle=0x0007000000000003 pid=6 name=/bin/login.exe flags=0x0000000000000002 size=56 pending=0 event_type=1 key_action=0 keycode=111 modifiers=0x0000000000000000 text0=0x000000000000006f
+*[ipc:input] receive blocking handle=0x0007000000000003 pid=6 name=/bin/login.exe pending=0
+[kbd:irq] status=0x1d
+[kbd:irq] scancode=0x98
+[kbd:irq] status=0x1d
+[kbd:irq] scancode=0x14
+[ipc:service] connect found name=input.manager slot=0 owner=1 pending=0
+[ipc:input] post queued service=input.manager size=56 pending=0->1 event_type=1 key_action=0 keycode=116 modifiers=0x0000000000000000 text0=0x0000000000000074
+[kbd:irq] dispatch char=t window=fail input=ok modifiers=0x00
+[kbd:irq] char=t pending=27
+[ipc:input] receive woke handle=0x0007000000000003 pid=6 name=/bin/login.exe pending=1
+[ipc:input] receive dequeued handle=0x0007000000000003 pid=6 name=/bin/login.exe flags=0x0000000000000002 size=56 pending=0 event_type=1 key_action=0 keycode=116 modifiers=0x0000000000000000 text0=0x0000000000000074
+*[ipc:input] receive blocking handle=0x0007000000000003 pid=6 name=/bin/login.exe pending=0
+[kbd:irq] status=0x1d
+[kbd:irq] scancode=0x94
+[kbd:irq] status=0x1d
+[kbd:irq] scancode=0x1c
+[ipc:service] connect found name=input.manager slot=0 owner=1 pending=0
+[ipc:input] post queued service=input.manager size=56 pending=0->1 event_type=1 key_action=0 keycode=10 modifiers=0x0000000000000000 text0=0x0000000000000000
+[kbd:irq] dispatch char=\n window=fail input=ok modifiers=0x00
+[kbd:irq] char=\n pending=28
+[ipc:input] receive woke handle=0x0007000000000003 pid=6 name=/bin/login.exe pending=1
+[ipc:input] receive dequeued handle=0x0007000000000003 pid=6 name=/bin/login.exe flags=0x0000000000000002 size=56 pending=0 event_type=1 key_action=0 keycode=10 modifiers=0x0000000000000000 text0=0x0000000000000000
+
+Login successful.
+[spawn] path: /bin/graphics-compositor.exe
+[PROC] Loading PE at base: 7fffffe00000
+[PROC] Entry point: 7fffffe066b0
+[ipc:service] sys_register name=graphics.compositor pid=7 name=/bin/graphics-compositor.exe queue_handle=0x0006000000000003
+[ipc:service] register request name=graphics.compositor owner=7 queue=0x0000000000a28030 pending=0
+[ipc:service] registered name=graphics.compositor slot=5 owner=7
+[ipc:service] sys_register result name=graphics.compositor pid=7 name=/bin/graphics-compositor.exe result=0x0000000000000000
+[graphics.compositor] ready
+[spawn] path: /bin/desktop-shell.exe
+[PROC] Loading PE at base: 7fffffe00000
+[PROC] Entry point: 7fffffe05130
+[kbd:poll] scancode=0x9c
+[kbd:irq] status=0x1c
+[desktop-shell] connecting to graphics.compositor
+[desktop-shell] SUCCESS service_connect graphics.compositor
+[desktop-shell] SUCCESS surface_create
+[desktop-shell] SUCCESS shared_map(surface)
+[desktop-shell] SUCCESS compositor_create_window
+[desktop-shell] SUCCESS window_set_title
+[desktop-shell] SUCCESS window_attach_surface
+[desktop-shell] SUCCESS window_event_queue
+[desktop-shell] SUCCESS initial surface_commit
+[desktop-shell] ready
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x07
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x0b
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x0b
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x0a
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x07
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x0a
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x09
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x0c
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x09
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x0a
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x09
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x06
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x1b
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0xfd
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0xfd
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0xfc
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0xfb
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0xfc
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0xfa
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xfc
+[kbd:irq] mouse-byte=0xf9
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xf8
+[kbd:irq] mouse-byte=0xf5
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xfa
+[kbd:irq] mouse-byte=0xfa
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xfb
+[kbd:irq] mouse-byte=0xfb
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xfc
+[kbd:irq] mouse-byte=0xfb
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xfb
+[kbd:irq] mouse-byte=0xfc
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xfb
+[kbd:irq] mouse-byte=0xfc
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xfd
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xfc
+[kbd:irq] mouse-byte=0xfd
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xfc
+[kbd:irq] mouse-byte=0xfd
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xfc
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xfb
+[kbd:irq] mouse-byte=0xff
+[kbd:poll] mouse-byte=0x38
+[kbd:poll] mouse-byte=0xfc
+[kbd:poll] mouse-byte=0xff
+[kbd:poll] mouse-byte=0x18
+[kbd:poll] mouse-byte=0xfd
+[kbd:poll] mouse-byte=0x00
+[kbd:poll] mouse-byte=0x18
+[kbd:poll] mouse-byte=0xfd
+[kbd:poll] mouse-byte=0x00
+[kbd:poll] mouse-byte=0x18
+[kbd:poll] mouse-byte=0xfe
+[kbd:poll] mouse-byte=0x00
+[kbd:poll] mouse-byte=0x18
+[kbd:poll] mouse-byte=0xfd
+[kbd:poll] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xfd
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xfd
+[kbd:irq] mouse-byte=0x06
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xfb
+[kbd:irq] mouse-byte=0x0a
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xfd
+[kbd:irq] mouse-byte=0x0b
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xfb
+[kbd:irq] mouse-byte=0x10
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] mouse-byte=0x10
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x0e
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x10
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x0d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x0b
+[kbd:irq] mouse-byte=0x0f
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x12
+[kbd:irq] mouse-byte=0x10
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x10
+[kbd:irq] mouse-byte=0x0c
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0x0e
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0x0e
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0x0a
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x1a
+[kbd:irq] mouse-byte=0x0a
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x16
+[kbd:irq] mouse-byte=0x0a
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x16
+[kbd:irq] mouse-byte=0x04
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x1a
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x16
+[kbd:irq] mouse-byte=0x04
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x16
+[kbd:irq] mouse-byte=0x02
+[kbd:poll] mouse-byte=0x08
+[kbd:poll] mouse-byte=0x11
+[kbd:poll] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x10
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x0c
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x0a
+[kbd:irq] mouse-byte=0xfd
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x09
+[kbd:irq] mouse-byte=0xfd
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x09
+[kbd:irq] mouse-byte=0xfa
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x06
+[kbd:irq] mouse-byte=0xfa
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x07
+[kbd:irq] mouse-byte=0xf9
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x06
+[kbd:irq] mouse-byte=0xfa
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x03
+[kbd:irq] mouse-byte=0xf9
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0xfb
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x03
+[kbd:irq] mouse-byte=0xfa
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0xfb
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0xfb
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0xfb
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0xfd
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0xfd
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0xfc
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0xfb
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0xfd
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0xfd
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0xfd
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0xff
+[kbd:poll] mouse-byte=0x28
+[kbd:poll] mouse-byte=0x00
+[kbd:poll] mouse-byte=0xff
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0xfc
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] mouse-byte=0xfb
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xfb
+[kbd:irq] mouse-byte=0xfb
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xfd
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xfc
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xfd
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xfd
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xfb
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xfc
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xfd
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xfb
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xfb
+[kbd:irq] mouse-byte=0xfd
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xfa
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xfa
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xf6
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xf3
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xf5
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xf3
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xf1
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xf4
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xf1
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xf0
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xf2
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xf1
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xf4
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xf1
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xf2
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xee
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xf4
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xf3
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xf7
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xf2
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xf6
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xf8
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xf6
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xf9
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xfb
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xfc
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xfa
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xfb
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xfd
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xfd
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xfa
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xfc
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xfd
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xfb
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xfd
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xfc
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xfc
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xfa
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xfd
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xfd
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xfd
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xfd
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x01
+[kbd:poll] mouse-byte=0x08
+[kbd:poll] mouse-byte=0x01
+[kbd:poll] mouse-byte=0x03
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x03
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x04
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x04
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x03
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x06
+[kbd:irq] mouse-byte=0x04
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x05
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x04
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x05
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x05
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x05
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x04
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x06
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x04
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x04
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x04
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x05
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x04
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x04
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x07
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x06
+[kbd:irq] mouse-byte=0x03
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x05
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x07
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x09
+[kbd:irq] mouse-byte=0x03
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x07
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x07
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x06
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x09
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x06
+[kbd:irq] mouse-byte=0x03
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x0a
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x07
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x07
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x0a
+[kbd:irq] mouse-byte=0x03
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x05
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x05
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x06
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x06
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x05
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x05
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x05
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x06
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x06
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x05
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x06
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x03
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x09
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x09
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x06
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x07
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x06
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x05
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x06
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x04
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x03
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x05
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x03
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x03
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x03
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x04
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x03
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x03
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x03
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x03
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x03
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0xfe
+[kbd:poll] mouse-byte=0x08
+[kbd:poll] mouse-byte=0x01
+[kbd:poll] mouse-byte=0x00
+[kbd:poll] mouse-byte=0x28
+[kbd:poll] mouse-byte=0x02
+[kbd:poll] mouse-byte=0xff
+[kbd:poll] mouse-byte=0x08
+[kbd:poll] mouse-byte=0x02
+[kbd:poll] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x03
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x03
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x05
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x03
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x03
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x03
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x03
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x04
+[kbd:irq] mouse-byte=0x04
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x04
+[kbd:irq] mouse-byte=0x07
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x03
+[kbd:irq] mouse-byte=0x04
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x03
+[kbd:irq] mouse-byte=0x03
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0x03
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x05
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x05
+[kbd:irq] mouse-byte=0x03
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x04
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x03
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x03
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0x03
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0x03
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x03
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0x03
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x03
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x05
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0x03
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x03
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x03
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x03
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x03
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x04
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x04
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x04
+[kbd:poll] mouse-byte=0x08
+[kbd:poll] mouse-byte=0x00
+[kbd:poll] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x03
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x03
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x03
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x03
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x03
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x03
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x03
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x03
+[kbd:poll] mouse-byte=0x08
+[kbd:poll] mouse-byte=0x00
+[kbd:poll] mouse-byte=0x02
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x03
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x03
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] mouse-byte=0xfd
+[kbd:poll] mouse-byte=0x38
+[kbd:poll] mouse-byte=0xfe
+[kbd:poll] mouse-byte=0xfc
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xfc
+[kbd:irq] mouse-byte=0xf9
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xf8
+[kbd:irq] mouse-byte=0xf7
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xfd
+[kbd:irq] mouse-byte=0xfa
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xfc
+[kbd:irq] mouse-byte=0xf8
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xfc
+[kbd:irq] mouse-byte=0xf7
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xfc
+[kbd:irq] mouse-byte=0xf9
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xfa
+[kbd:irq] mouse-byte=0xf9
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xfd
+[kbd:irq] mouse-byte=0xf6
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xfb
+[kbd:irq] mouse-byte=0xf5
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] mouse-byte=0xf8
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xf8
+[kbd:irq] mouse-byte=0xef
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xfc
+[kbd:irq] mouse-byte=0xf6
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] mouse-byte=0xf7
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xfc
+[kbd:irq] mouse-byte=0xf3
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] mouse-byte=0xf5
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xfd
+[kbd:irq] mouse-byte=0xf3
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xfb
+[kbd:irq] mouse-byte=0xf2
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] mouse-byte=0xf7
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xfb
+[kbd:irq] mouse-byte=0xf1
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0xf2
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0xfa
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0xfb
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0xfa
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xfd
+[kbd:irq] mouse-byte=0xfb
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0xfa
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0xfd
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0xfa
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xfd
+[kbd:irq] mouse-byte=0xfb
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] mouse-byte=0xfd
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xfd
+[kbd:irq] mouse-byte=0xfa
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xfd
+[kbd:irq] mouse-byte=0xf8
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] mouse-byte=0xfd
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0xfc
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0xfd
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0xfd
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] mouse-byte=0xfd
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0xfd
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0xfd
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] mouse-byte=0xfd
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0xfd
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0x38
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x28
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] mouse-byte=0x03
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] mouse-byte=0x03
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0x05
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] mouse-byte=0x05
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x03
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] mouse-byte=0x06
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xfb
+[kbd:irq] mouse-byte=0x0b
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0x07
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] mouse-byte=0x0b
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xfb
+[kbd:irq] mouse-byte=0x0c
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xfd
+[kbd:irq] mouse-byte=0x0b
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xfd
+[kbd:irq] mouse-byte=0x0b
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0x07
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x07
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0x04
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x03
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0x03
+[kbd:irq] status=0x1d
+[kbd:irq] scancode=0x1d
+[kbd:irq] status=0x1d
+[kbd:irq] scancode=0x38
+[kbd:irq] status=0x1d
+[kbd:irq] scancode=0xb8
+[kbd:irq] status=0x1d
+[kbd:irq] scancode=0x9d
+[kbd:irq] status=0x1c
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x08
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xfb
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xf7
+[kbd:irq] mouse-byte=0x02
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xf4
+[kbd:irq] mouse-byte=0x01
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xf0
+[kbd:irq] mouse-byte=0x02
+[kbd:poll] mouse-byte=0x18
+[kbd:poll] mouse-byte=0xf0
+[kbd:poll] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xed
+[kbd:irq] mouse-byte=0x06
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xef
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xf0
+[kbd:irq] mouse-byte=0x03
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xf0
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xf2
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xf5
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xf3
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xf7
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xf6
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xf5
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xf7
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xf4
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xf7
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xf6
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xf3
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xf7
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xf6
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xf7
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xf8
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xf9
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xfa
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xfa
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xfb
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xfd
+[kbd:irq] mouse-byte=0x00
+[kbd:poll] mouse-byte=0x18
+[kbd:poll] mouse-byte=0xfc
+[kbd:poll] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xfb
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xfd
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xfc
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xfe
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x3d
+[kbd:irq] mouse-byte=0x18
+[kbd:irq] mouse-byte=0xff
+[kbd:irq] mouse-byte=0x00
+[kbd:irq] status=0x1d
+[kbd:irq] scancode=0xe0
+[kbd:irq] scancode=0x5b
+[kbd:irq] status=0x1d
+[kbd:irq] scancode=0xe0
+[kbd:irq] scancode=0xdb
+[kbd:irq] status=0x1d
+[kbd:irq] scancode=0x1d
+[kbd:irq] status=0x1d
+[kbd:irq] scancode=0x38
+[kbd:irq] status=0x1d
+[kbd:irq] scancode=0x9d
+[kbd:irq] scancode=0xb8
+[kbd:irq] status=0x1d
+[kbd:irq] scancode=0xe0
+[kbd:irq] scancode=0x5b
