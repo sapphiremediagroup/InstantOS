@@ -18,4 +18,5 @@ static constexpr uint8_t VECTOR_TIMER = 0x40;
 static constexpr uint8_t VECTOR_KEYBOARD = VECTOR_BASE + IRQ_KEYBOARD;
 static constexpr uint8_t VECTOR_RTC = VECTOR_BASE + IRQ_RTC;
 static constexpr uint8_t VECTOR_MOUSE = VECTOR_BASE + IRQ_MOUSE;
+static constexpr uint8_t VECTOR_PCI_BASE = 0x50;
 static constexpr uint8_t VECTOR_SPURIOUS = 0xFF;

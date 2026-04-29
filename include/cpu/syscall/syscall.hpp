@@ -260,6 +260,7 @@ enum class SyscallNumber : uint64_t {
     ThreadCreate,
     ThreadExit,
     ThreadJoin,
+    Seek,
 };
 
 struct SyscallFrame {
@@ -346,6 +347,7 @@ private:
     uint64_t sys_thread_create(uint64_t entry, uint64_t arg, uint64_t stackSize);
     uint64_t sys_thread_exit(uint64_t code);
     uint64_t sys_thread_join(uint64_t handle, uint64_t statusPtr);
+    uint64_t sys_seek(uint64_t handle, uint64_t offset, uint64_t whence);
     uint64_t sys_getuserinfo(uint64_t uid, uint64_t info_ptr);
     uint64_t sys_readdir(uint64_t path, uint64_t entries, uint64_t count);
     uint64_t sys_fb_flush(uint64_t x, uint64_t y, uint64_t w, uint64_t h);

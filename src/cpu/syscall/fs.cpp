@@ -360,29 +360,32 @@ uint64_t Syscall::sys_stat(uint64_t path, uint64_t statbuf) {
         return (uint64_t)-1;
     }
     
-    FileDescriptor* fd = nullptr;
-    int result = VFS::get().open(pathname, 0, &fd);
-    if (result != 0 || !fd) {
+    FileStats fileStats {};
+    if (VFS::get().stat(pathname, &fileStats) != 0) {
         return (uint64_t)-1;
     }
     
-    Stat stat;
-    memset(&stat, 0, sizeof(Stat));
+    Stat stat {};
     stat.st_dev = 0;
-    stat.st_ino = 0;
-    stat.st_mode = 0644;
-    stat.st_nlink = 1;
+    stat.st_ino = fileStats.inode;
+    stat.st_mode = fileStats.mode;
+    stat.st_nlink = fileStats.links;
     stat.st_uid = 0;
     stat.st_gid = 0;
     stat.st_rdev = 0;
-    stat.st_size = 0;
+    stat.st_size = fileStats.size;
     stat.st_blksize = 4096;
-    stat.st_blocks = 0;
-    stat.st_atime = 0;
-    stat.st_mtime = 0;
-    stat.st_ctime = 0;
-    
-    VFS::get().close(fd);
+    stat.st_blocks = (fileStats.size + 511) / 512;
+    stat.st_atime = fileStats.atime;
+    stat.st_mtime = fileStats.mtime;
+    stat.st_ctime = fileStats.ctime;
+
+    if (fileStats.type == FileType::Directory) {
+        stat.st_mode |= 0040000;
+    } else {
+        stat.st_mode |= 0100000;
+    }
+
     return copyToUser(statbuf, &stat, sizeof(Stat)) ? 0 : (uint64_t)-1;
 }
 
@@ -410,6 +413,40 @@ uint64_t Syscall::sys_pipe(uint64_t pipeHandles) {
     }
     
     return (uint64_t)-1;
+}
+
+uint64_t Syscall::sys_seek(uint64_t handle, uint64_t offset, uint64_t whence) {
+    Process* current = Scheduler::get().getCurrentProcess();
+    if (!current) {
+        return static_cast<uint64_t>(-1);
+    }
+
+    FileDescriptor* fileFd = current->getFD(handle, HandleRightRead);
+    if (!fileFd) {
+        fileFd = current->getFD(handle, HandleRightWrite);
+    }
+    if (!fileFd) {
+        return static_cast<uint64_t>(-1);
+    }
+
+    SeekMode mode = SeekMode::Set;
+    switch (whence) {
+        case 0:
+            mode = SeekMode::Set;
+            break;
+        case 1:
+            mode = SeekMode::Current;
+            break;
+        case 2:
+            mode = SeekMode::End;
+            break;
+        default:
+            return static_cast<uint64_t>(-1);
+    }
+
+    const int64_t signedOffset = static_cast<int64_t>(offset);
+    const int64_t result = VFS::get().seek(fileFd, signedOffset, mode);
+    return result < 0 ? static_cast<uint64_t>(-1) : static_cast<uint64_t>(result);
 }
 
 uint64_t Syscall::sys_readdir(uint64_t path, uint64_t entries, uint64_t count) {

@@ -128,6 +128,9 @@ private:
     VirtqDesc* desc;
     VirtqAvail* avail;
     VirtqUsed* used;
+    uint64_t descPages;
+    uint64_t availPages;
+    uint64_t usedPages;
     
     uint16_t* freeList;
 };

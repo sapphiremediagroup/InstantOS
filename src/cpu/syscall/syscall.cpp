@@ -273,6 +273,8 @@ uint64_t Syscall::handle(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
             return sys_thread_exit(arg1);
         case ThreadJoin:
             return sys_thread_join(arg1, arg2);
+        case Seek:
+            return sys_seek(arg1, arg2, arg3);
         default:
             return (uint64_t)-1;
     }

@@ -68,9 +68,16 @@ public:
         outb(kCommandPort, 0xA8);
         const uint8_t mouseDefaultAck = sendAuxDeviceCommand(0xF6);
         writeStatus("[kbd:init] mouse-defaults=", mouseDefaultAck);
+        const uint8_t mouseSampleAck = sendAuxDeviceCommandWithData(0xF3, kMouseSampleRate);
+        writeStatus("[kbd:init] mouse-sample=", mouseSampleAck);
+        const uint8_t mouseResolutionAck = sendAuxDeviceCommandWithData(0xE8, kMouseResolution);
+        writeStatus("[kbd:init] mouse-resolution=", mouseResolutionAck);
         const uint8_t mouseStreamAck = sendAuxDeviceCommand(0xF4);
         writeStatus("[kbd:init] mouse-stream=", mouseStreamAck);
-        mouseEnabled = mouseDefaultAck == kDeviceAck && mouseStreamAck == kDeviceAck;
+        mouseEnabled = mouseDefaultAck == kDeviceAck &&
+            mouseSampleAck == kDeviceAck &&
+            mouseResolutionAck == kDeviceAck &&
+            mouseStreamAck == kDeviceAck;
 
         uint8_t runtimeConfig = initConfig;
         runtimeConfig |= kConfigKeyboardIrq;
@@ -146,17 +153,7 @@ public:
         uint8_t status = inb(kStatusPort);
         bool handled = false;
 
-        if (traceIrq && (status & kStatusOutputFull) == 0) {
-            for (int i = 0; i < kIoWaitIterations; ++i) {
-                ioDelay();
-                status = inb(kStatusPort);
-                if (status & kStatusOutputFull) {
-                    break;
-                }
-            }
-        }
-
-        if (traceIrq) {
+        if (traceIrq && kTraceInputHotPath) {
             Cereal::get().write("[kbd:irq] status=");
             writeHex(status);
             Cereal::get().write("\n");
@@ -193,41 +190,49 @@ public:
         const bool windowPosted = IPCManager::get().postKeyEventToFocusedWindow(event);
         const bool inputPosted = postInputManagerEvent(event);
         const bool buffered = appendToBuffer(c, prefix);
-        Cereal::get().write(prefix);
-        Cereal::get().write(" inject dispatch window=");
-        Cereal::get().write(windowPosted ? "ok" : "fail");
-        Cereal::get().write(" input=");
-        Cereal::get().write(inputPosted ? "ok" : "fail");
-        Cereal::get().write(" buffered=");
-        Cereal::get().write(buffered ? "ok" : "full");
-        Cereal::get().write(" pending=");
-        writeDec(bufferCount());
-        Cereal::get().write("\n");
+        if (kTraceInputHotPath) {
+            Cereal::get().write(prefix);
+            Cereal::get().write(" inject dispatch window=");
+            Cereal::get().write(windowPosted ? "ok" : "fail");
+            Cereal::get().write(" input=");
+            Cereal::get().write(inputPosted ? "ok" : "fail");
+            Cereal::get().write(" buffered=");
+            Cereal::get().write(buffered ? "ok" : "full");
+            Cereal::get().write(" pending=");
+            writeDec(bufferCount());
+            Cereal::get().write("\n");
+        }
         Scheduler::get().wakeAllBlockedProcesses();
         return true;
     }
 
     void publishBufferedInputToInputManager() {
-        Cereal::get().write("[kbd] publish buffered to input.manager count=");
-        writeDec(bufferCount());
-        Cereal::get().write("\n");
+        if (kTraceInputHotPath) {
+            Cereal::get().write("[kbd] publish buffered to input.manager count=");
+            writeDec(bufferCount());
+            Cereal::get().write("\n");
+        }
         while (hasKey()) {
             const char c = buffer[bufferTail];
             const Event event = makeKeyEvent(c, KeyModifierNone);
             if (!postInputManagerEvent(event)) {
-                Cereal::get().write("[kbd] publish buffered failed char=");
+                if (kTraceInputHotPath) {
+                    Cereal::get().write("[kbd] publish buffered failed char=");
+                    writePrintableChar(c);
+                    Cereal::get().write(" remaining=");
+                    writeDec(bufferCount());
+                    Cereal::get().write("\n");
+                }
+                break;
+            }
+            bufferTail = (bufferTail + 1) % BUFFER_SIZE;
+            if (kTraceInputHotPath) {
+                Cereal::get().write("[kbd] publish buffered ok char=");
                 writePrintableChar(c);
                 Cereal::get().write(" remaining=");
                 writeDec(bufferCount());
                 Cereal::get().write("\n");
-                break;
             }
-            bufferTail = (bufferTail + 1) % BUFFER_SIZE;
-            Cereal::get().write("[kbd] publish buffered ok char=");
-            writePrintableChar(c);
-            Cereal::get().write(" remaining=");
-            writeDec(bufferCount());
-            Cereal::get().write("\n");
         }
     }
 
@@ -255,7 +260,21 @@ private:
     static constexpr uint8_t kDeviceAck = 0xFA;
     static constexpr uint8_t kDeviceResend = 0xFE;
     static constexpr uint8_t kKeyboardBatOk = 0xAA;
+    static constexpr uint8_t kMouseXOverflow = 1 << 6;
+    static constexpr uint8_t kMouseYOverflow = 1 << 7;
+    static constexpr uint8_t kMouseXSign = 1 << 4;
+    static constexpr uint8_t kMouseYSign = 1 << 5;
+    static constexpr uint8_t kMouseSampleRate = 200;
+    static constexpr uint8_t kMouseResolution = 3;
     static constexpr int kIoWaitIterations = 100000;
+    static constexpr bool kTraceInputHotPath = false;
+    static constexpr int32_t kMouseMaxRawDelta = 80;
+    static constexpr int32_t kMouseSensitivityNumerator = 2;
+    static constexpr int32_t kMouseSensitivityDenominator = 1;
+    static constexpr int32_t kMouseAccelerationThresholdLow = 4;
+    static constexpr int32_t kMouseAccelerationThresholdHigh = 10;
+    static constexpr int32_t kMouseAccelerationFactorLow = 2;
+    static constexpr int32_t kMouseAccelerationFactorHigh = 3;
 
     void ioDelay() {
         asm volatile("pause");
@@ -323,6 +342,28 @@ private:
         return kDeviceResend;
     }
 
+    uint8_t sendAuxDeviceCommandWithData(uint8_t command, uint8_t data) {
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            const uint8_t commandAck = sendAuxDeviceCommand(command);
+            if (commandAck == kDeviceResend) {
+                continue;
+            }
+            if (commandAck != kDeviceAck) {
+                return commandAck;
+            }
+
+            waitForInputReady();
+            outb(kCommandPort, 0xD4);
+            waitForInputReady();
+            outb(kDataPort, data);
+            const uint8_t dataAck = readDataWithTimeout();
+            if (dataAck != kDeviceResend) {
+                return dataAck;
+            }
+        }
+        return kDeviceResend;
+    }
+
     uint8_t readControllerConfig() {
         waitForInputReady();
         outb(kCommandPort, 0x20);
@@ -357,38 +398,46 @@ private:
     bool appendToBuffer(char c, const char* prefix) {
         int nextHead = (bufferHead + 1) % BUFFER_SIZE;
         if (nextHead == bufferTail) {
-            Cereal::get().write(prefix);
-            Cereal::get().write(" buffer full dropping char=");
-            writePrintableChar(c);
-            Cereal::get().write("\n");
+            if (kTraceInputHotPath) {
+                Cereal::get().write(prefix);
+                Cereal::get().write(" buffer full dropping char=");
+                writePrintableChar(c);
+                Cereal::get().write("\n");
+            }
             return false;
         }
 
         buffer[bufferHead] = c;
         bufferHead = nextHead;
-        Cereal::get().write(prefix);
-        Cereal::get().write(" char=");
-        writePrintableChar(c);
-        Cereal::get().write(" pending=");
-        writeDec(bufferCount());
-        Cereal::get().write("\n");
+        if (kTraceInputHotPath) {
+            Cereal::get().write(prefix);
+            Cereal::get().write(" char=");
+            writePrintableChar(c);
+            Cereal::get().write(" pending=");
+            writeDec(bufferCount());
+            Cereal::get().write("\n");
+        }
         return true;
     }
 
     void handleDataByte(uint8_t status, uint8_t scancode, const char* prefix) {
         if (status & kStatusAuxData) {
-            Cereal::get().write(prefix);
-            Cereal::get().write(" mouse-byte=");
-            writeHex(scancode);
-            Cereal::get().write("\n");
+            if (kTraceInputHotPath) {
+                Cereal::get().write(prefix);
+                Cereal::get().write(" mouse-byte=");
+                writeHex(scancode);
+                Cereal::get().write("\n");
+            }
             handleMouseByte(scancode);
             return;
         }
 
-        Cereal::get().write(prefix);
-        Cereal::get().write(" scancode=");
-        writeHex(scancode);
-        Cereal::get().write("\n");
+        if (kTraceInputHotPath) {
+            Cereal::get().write(prefix);
+            Cereal::get().write(" scancode=");
+            writeHex(scancode);
+            Cereal::get().write("\n");
+        }
 
         if (scancode == kDeviceAck || scancode == kKeyboardBatOk) {
             return;
@@ -417,16 +466,18 @@ private:
                 Event event = makeKeyEvent(c, modifiers);
                 const bool windowPosted = IPCManager::get().postKeyEventToFocusedWindow(event);
                 const bool inputPosted = postInputManagerEvent(event);
-                Cereal::get().write(prefix);
-                Cereal::get().write(" dispatch char=");
-                writePrintableChar(c);
-                Cereal::get().write(" window=");
-                Cereal::get().write(windowPosted ? "ok" : "fail");
-                Cereal::get().write(" input=");
-                Cereal::get().write(inputPosted ? "ok" : "fail");
-                Cereal::get().write(" modifiers=");
-                writeHex(static_cast<uint8_t>(modifiers & 0xFF));
-                Cereal::get().write("\n");
+                if (kTraceInputHotPath) {
+                    Cereal::get().write(prefix);
+                    Cereal::get().write(" dispatch char=");
+                    writePrintableChar(c);
+                    Cereal::get().write(" window=");
+                    Cereal::get().write(windowPosted ? "ok" : "fail");
+                    Cereal::get().write(" input=");
+                    Cereal::get().write(inputPosted ? "ok" : "fail");
+                    Cereal::get().write(" modifiers=");
+                    writeHex(static_cast<uint8_t>(modifiers & 0xFF));
+                    Cereal::get().write("\n");
+                }
 
                 if (appendToBuffer(c, prefix)) {
                     Scheduler::get().wakeAllBlockedProcesses();
@@ -451,9 +502,23 @@ private:
 
         mousePacketIndex = 0;
 
+        const uint8_t status = mousePacket[0];
+        if ((status & (kMouseXOverflow | kMouseYOverflow)) != 0) {
+            return;
+        }
+
         const int32_t dx = static_cast<int8_t>(mousePacket[1]);
         const int32_t dy = static_cast<int8_t>(mousePacket[2]);
-        const uint16_t buttons = static_cast<uint16_t>(mousePacket[0] & 0x07);
+        if (((status & kMouseXSign) != 0) != (dx < 0) ||
+            ((status & kMouseYSign) != 0) != (dy < 0)) {
+            return;
+        }
+        if (absMouseDelta(dx) > kMouseMaxRawDelta || absMouseDelta(dy) > kMouseMaxRawDelta) {
+            return;
+        }
+        const uint16_t buttons = static_cast<uint16_t>(status & 0x07);
+        const int32_t scaledDx = scaleMouseDelta(dx);
+        const int32_t scaledDy = scaleMouseDelta(dy);
 
         iFramebuffer* framebuffer = Console::get().getFramebuffer();
         int32_t maxX = framebuffer ? static_cast<int32_t>(framebuffer->getWidth()) - 1 : 1023;
@@ -461,8 +526,8 @@ private:
         if (maxX < 0) maxX = 0;
         if (maxY < 0) maxY = 0;
 
-        mouseX += dx;
-        mouseY -= dy;
+        mouseX += scaledDx;
+        mouseY -= scaledDy;
         if (mouseX < 0) mouseX = 0;
         if (mouseY < 0) mouseY = 0;
         if (mouseX > maxX) mouseX = maxX;
@@ -473,12 +538,33 @@ private:
         event.pointer.buttons = buttons;
         event.pointer.x = mouseX;
         event.pointer.y = mouseY;
-        event.pointer.deltaX = dx;
-        event.pointer.deltaY = -dy;
+        event.pointer.deltaX = scaledDx;
+        event.pointer.deltaY = -scaledDy;
         event.pointer.action = (buttons != mouseButtons) ? PointerEventAction::Button : PointerEventAction::Move;
         mouseButtons = buttons;
 
         IPCManager::get().postServiceEvent("graphics.compositor", &event, sizeof(event));
+    }
+
+    int32_t scaleMouseDelta(int32_t delta) const {
+        const int32_t absDelta = absMouseDelta(delta);
+        int32_t scaled = delta * kMouseSensitivityNumerator;
+
+        if (absDelta >= kMouseAccelerationThresholdHigh) {
+            scaled *= kMouseAccelerationFactorHigh;
+        } else if (absDelta >= kMouseAccelerationThresholdLow) {
+            scaled *= kMouseAccelerationFactorLow;
+        }
+
+        scaled /= kMouseSensitivityDenominator;
+        if (scaled == 0 && delta != 0) {
+            scaled = delta > 0 ? 1 : -1;
+        }
+        return scaled;
+    }
+
+    int32_t absMouseDelta(int32_t delta) const {
+        return delta < 0 ? -delta : delta;
     }
 
     bool postInputManagerEvent(const Event& event) {

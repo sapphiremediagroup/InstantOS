@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <cpu/idt/interrupt.hpp>
 
 class PCI {
 public:
@@ -13,6 +14,9 @@ public:
     void writeConfig8(uint16_t segment, uint8_t bus, uint8_t device, uint8_t function, uint16_t offset, uint8_t value);
     void writeConfig16(uint16_t segment, uint8_t bus, uint8_t device, uint8_t function, uint16_t offset, uint16_t value);
     void writeConfig32(uint16_t segment, uint8_t bus, uint8_t device, uint8_t function, uint16_t offset, uint32_t value);
+
+    bool registerLegacyInterrupt(uint16_t segment, uint8_t bus, uint8_t device, uint8_t function,
+                                 Interrupt* handler, uint8_t* outIrq = nullptr, uint8_t* outVector = nullptr);
     
 private:
     PCI() = default;

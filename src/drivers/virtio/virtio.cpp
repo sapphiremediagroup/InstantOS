@@ -1,5 +1,6 @@
 #include <drivers/virtio/virtio.hpp>
 #include <memory/heap.hpp>
+#include <memory/pmm.hpp>
 #include <common/string.hpp>
 
 namespace {
@@ -21,6 +22,9 @@ Virtqueue::Virtqueue()
       desc(nullptr),
       avail(nullptr),
       used(nullptr),
+      descPages(0),
+      availPages(0),
+      usedPages(0),
       freeList(nullptr) {
 }
 
@@ -41,9 +45,13 @@ bool Virtqueue::init(uint16_t requestedQueueSize) {
     const uint64_t availBytes = align_up(sizeof(uint16_t) * 2 + sizeof(uint16_t) * queueSize, 16);
     const uint64_t usedBytes = align_up(sizeof(uint16_t) * 2 + sizeof(VirtqUsedElem) * queueSize, 16);
 
-    desc = reinterpret_cast<VirtqDesc*>(kmalloc_aligned(descBytes, 16));
-    avail = reinterpret_cast<VirtqAvail*>(kmalloc_aligned(availBytes, 16));
-    used = reinterpret_cast<VirtqUsed*>(kmalloc_aligned(usedBytes, 16));
+    descPages = (descBytes + PMM::PAGE_SIZE - 1) / PMM::PAGE_SIZE;
+    availPages = (availBytes + PMM::PAGE_SIZE - 1) / PMM::PAGE_SIZE;
+    usedPages = (usedBytes + PMM::PAGE_SIZE - 1) / PMM::PAGE_SIZE;
+
+    desc = reinterpret_cast<VirtqDesc*>(PMM::AllocFrames(descPages));
+    avail = reinterpret_cast<VirtqAvail*>(PMM::AllocFrames(availPages));
+    used = reinterpret_cast<VirtqUsed*>(PMM::AllocFrames(usedPages));
     freeList = reinterpret_cast<uint16_t*>(kmalloc(sizeof(uint16_t) * queueSize));
 
     if (!desc || !avail || !used || !freeList) {
@@ -66,13 +74,13 @@ bool Virtqueue::init(uint16_t requestedQueueSize) {
 
 void Virtqueue::reset() {
     if (desc) {
-        kfree(desc);
+        PMM::FreeFrames(reinterpret_cast<uint64_t>(desc), descPages);
     }
     if (avail) {
-        kfree(avail);
+        PMM::FreeFrames(reinterpret_cast<uint64_t>(avail), availPages);
     }
     if (used) {
-        kfree(used);
+        PMM::FreeFrames(reinterpret_cast<uint64_t>(used), usedPages);
     }
     if (freeList) {
         kfree(freeList);
@@ -84,6 +92,9 @@ void Virtqueue::reset() {
     desc = nullptr;
     avail = nullptr;
     used = nullptr;
+    descPages = 0;
+    availPages = 0;
+    usedPages = 0;
     freeList = nullptr;
 }
 

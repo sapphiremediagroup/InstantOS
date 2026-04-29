@@ -1104,16 +1104,7 @@ void IPCManager::wakeQueueWaiters() {
         current->setState(ProcessState::Ready);
         Scheduler::get().wakeProcess(current);
     }
-
-    for (uint32_t pid = 1; pid < 4096; pid++) {
-        Process* process = Scheduler::get().getProcessByPID(pid);
-        if (!process || process->getState() != ProcessState::Blocked) {
-            continue;
-        }
-
-        process->setState(ProcessState::Ready);
-        Scheduler::get().wakeProcess(process);
-    }
+    Scheduler::get().wakeAllBlockedProcesses();
 }
 
 void IPCManager::cleanupProcess(Process* process) {
