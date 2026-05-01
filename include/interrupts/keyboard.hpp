@@ -356,12 +356,8 @@ private:
     static constexpr int kIoWaitIterations = 100000;
     static constexpr bool kTraceInputHotPath = false;
     static constexpr int32_t kMouseMaxRawDelta = 80;
-    static constexpr int32_t kMouseSensitivityNumerator = 2;
+    static constexpr int32_t kMouseSensitivityNumerator = 1;
     static constexpr int32_t kMouseSensitivityDenominator = 1;
-    static constexpr int32_t kMouseAccelerationThresholdLow = 4;
-    static constexpr int32_t kMouseAccelerationThresholdHigh = 10;
-    static constexpr int32_t kMouseAccelerationFactorLow = 2;
-    static constexpr int32_t kMouseAccelerationFactorHigh = 3;
 
     void ioDelay() {
         asm volatile("pause");
@@ -655,15 +651,7 @@ private:
     }
 
     int32_t scaleMouseDelta(int32_t delta) const {
-        const int32_t absDelta = absMouseDelta(delta);
         int32_t scaled = delta * kMouseSensitivityNumerator;
-
-        if (absDelta >= kMouseAccelerationThresholdHigh) {
-            scaled *= kMouseAccelerationFactorHigh;
-        } else if (absDelta >= kMouseAccelerationThresholdLow) {
-            scaled *= kMouseAccelerationFactorLow;
-        }
-
         scaled /= kMouseSensitivityDenominator;
         if (scaled == 0 && delta != 0) {
             scaled = delta > 0 ? 1 : -1;
