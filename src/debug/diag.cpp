@@ -353,6 +353,16 @@ const char* syscallName(uint64_t number) {
         case SyscallNumber::ThreadCreate: return "ThreadCreate";
         case SyscallNumber::ThreadExit: return "ThreadExit";
         case SyscallNumber::ThreadJoin: return "ThreadJoin";
+        case SyscallNumber::Seek: return "Seek";
+        case SyscallNumber::GPUCapsetInfo: return "GPUCapsetInfo";
+        case SyscallNumber::GPUCapset: return "GPUCapset";
+        case SyscallNumber::GPUContextCreate: return "GPUContextCreate";
+        case SyscallNumber::GPUContextDestroy: return "GPUContextDestroy";
+        case SyscallNumber::GPUResourceCreate3D: return "GPUResourceCreate3D";
+        case SyscallNumber::GPUResourceDestroy: return "GPUResourceDestroy";
+        case SyscallNumber::GPUResourceAssignUUID: return "GPUResourceAssignUUID";
+        case SyscallNumber::GPUSubmit3D: return "GPUSubmit3D";
+        case SyscallNumber::GPUWaitFence: return "GPUWaitFence";
     }
 
     return "Unknown";

@@ -165,14 +165,27 @@ uint64_t Syscall::sys_yield() {
 
 uint64_t Syscall::sys_sleep(uint64_t ms) {
     if (ms == 0) return 0;
-    
-    uint64_t start = Timer::get().getMilliseconds();
-    uint64_t target = start + ms;
+
+    Process* current = Scheduler::get().getCurrentProcess();
+    if (!current) {
+        return static_cast<uint64_t>(-1);
+    }
+
+    const uint64_t start = Timer::get().getMilliseconds();
+    uint64_t target = start;
+    if (UINT64_MAX - target < ms) {
+        target = UINT64_MAX;
+    } else {
+        target += ms;
+    }
 
     while (Timer::get().getMilliseconds() < target) {
-        Scheduler::get().yield();
+        current->sleepUntil(target);
+        current->setState(ProcessState::Blocked);
+        Scheduler::get().scheduleFromSyscall();
     }
-    
+
+    current->clearSleep();
     return 0;
 }
 

@@ -174,6 +174,7 @@ private:
     Message messages[MaxMessages];
     size_t head;
     size_t count;
+    volatile bool lock_flag = false;
 };
 
 class ServiceObject {

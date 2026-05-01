@@ -42,6 +42,7 @@ Console::Console(){
     backgroundColor = 0x494d64;
     writeLock = 0;
     useVirtIO = false;
+    copyScrollEnabled = false;
 
     resetAnsiState();
 }
@@ -451,6 +452,21 @@ void Console::newLine() {
     // Check if current line position is off-screen
     if (posY >= framebuffer->getHeight()) {
         scroll();
+    } else if (!copyScrollEnabled) {
+        uint64_t pitchPixels = framebuffer->getPitch();
+        uint64_t pitchBytes = pitchPixels * sizeof(uint32_t);
+        uint64_t height = framebuffer->getHeight();
+        uint8_t* fb = (uint8_t*)framebuffer->getRaw();
+        uint64_t clearEnd = posY + 16;
+        if (clearEnd > height) {
+            clearEnd = height;
+        }
+        for (uint64_t y = posY; y < clearEnd; y++) {
+            uint32_t* row = (uint32_t*)(fb + y * pitchBytes);
+            for (uint64_t x = 0; x < pitchPixels; x++) {
+                row[x] = backgroundColor;
+            }
+        }
     }
 }
 
@@ -460,6 +476,17 @@ void Console::scroll(){
     uint64_t pitchBytes = pitchPixels * sizeof(uint32_t);
     uint64_t height = framebuffer->getHeight();
     uint8_t* fb = (uint8_t*)framebuffer->getRaw();
+
+    if (!copyScrollEnabled) {
+        posY = 0;
+        for (uint64_t y = 0; y < scrollHeight && y < height; y++) {
+            uint32_t* row = (uint32_t*)(fb + y * pitchBytes);
+            for (uint64_t x = 0; x < pitchPixels; x++) {
+                row[x] = backgroundColor;
+            }
+        }
+        return;
+    }
 
     // Only scroll if we have enough height to scroll
     if (height > scrollHeight) {
@@ -472,7 +499,8 @@ void Console::scroll(){
     }
 
     // Clear the bottom line
-    for (uint64_t y = height - scrollHeight; y < height; y++) {
+    uint64_t clearStart = height > scrollHeight ? height - scrollHeight : 0;
+    for (uint64_t y = clearStart; y < height; y++) {
         uint32_t* row = (uint32_t*)(fb + y * pitchBytes);
         for (uint64_t x = 0; x < pitchPixels; x++) {
             row[x] = backgroundColor;
@@ -480,7 +508,7 @@ void Console::scroll(){
     }
 
     // After scrolling, cursor should be at the bottom line
-    posY = height - scrollHeight;
+    posY = clearStart;
 }
 
 void Console::flushIfNeeded() {

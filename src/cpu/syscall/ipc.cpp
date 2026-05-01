@@ -504,8 +504,19 @@ uint64_t Syscall::sys_queue_create() {
         return static_cast<uint64_t>(-1);
     }
 
+    if (strcmp(current->getName(), "/bin/input-manager.exe") == 0) {
+        traceStr("[ipc:input] sys_queue_create begin");
+        traceProcess(current);
+        traceStr("\n");
+    }
+
     MessageQueueObject* queue = IPCManager::get().createQueue();
     if (!queue) {
+        if (strcmp(current->getName(), "/bin/input-manager.exe") == 0) {
+            traceStr("[ipc:input] sys_queue_create createQueue failed");
+            traceProcess(current);
+            traceStr("\n");
+        }
         return static_cast<uint64_t>(-1);
     }
 
@@ -518,6 +529,16 @@ uint64_t Syscall::sys_queue_create() {
     );
     if (handleValue == static_cast<uint64_t>(-1)) {
         queue->release();
+        if (strcmp(current->getName(), "/bin/input-manager.exe") == 0) {
+            traceStr("[ipc:input] sys_queue_create allocateHandle failed");
+            traceProcess(current);
+            traceStr("\n");
+        }
+    } else if (strcmp(current->getName(), "/bin/input-manager.exe") == 0) {
+        traceStr("[ipc:input] sys_queue_create ok handle=");
+        traceHex(handleValue);
+        traceProcess(current);
+        traceStr("\n");
     }
     return handleValue;
 }

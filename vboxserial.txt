@@ -1,0 +1,282 @@
+[2J[2J[01;01H[=3h[2J[01;01H[2J[01;01H[=3h[2J[01;01H, XSAVE size: 832CPU: [ OK ] MMX: yes [enabled], TSC: yes [enabled], WP: yes [enabled], NX: yes [enabled], SSE: yes [enabled], SSE2: yes [enabled], SSE3: yes [enabled], SSSE3: yes [enabled], SSE4.1: yes [enabled], SSE4.2: yes [enabled], XSAVE: yes [enabled], XSAVEOPT: no, AVX: yes [enabled], AVX2: yes [enabled], AVX512: no, PKU: no, UMIP: no, FSGSBASE: yes [enabled], SMEP: no
+[PMM] 0x0000000000000000 - 0x0000000000020FFF  (reserved)
+[PMM] 0x00000000000A0000 - 0x00000000000FFFFF  (reserved)
+[PMM] 0x000000003D0BC000 - 0x000000003D752FFF  (reserved)
+[PMM] 0x000000003D7BF000 - 0x000000003D7C5FFF  (reserved)
+[PMM] 0x000000003D7C7000 - 0x000000003D7C8FFF  (reserved)
+[PMM] 0x000000003DEA2000 - 0x000000003DFB5FFF  (reserved)
+[PMM] 0x000000003EAED000 - 0x000000003EDFEFFF  (reserved)
+[PMM] 0x000000003F12D000 - 0x000000003F132FFF  (reserved)
+[PMM] 0x000000003F16E000 - 0x00000000FFFFFFFF  (reserved)
+PMM: reserved initrd frames: 1434
+[apic] iso source=0 gsi=2 flags=0x0000000000000000
+[apic] iso source=9 gsi=9 flags=0x000000000000000f
+[apic] ioapic id=2 addr=0x00000000fec00000 gsi_base=0
+[BOOT] before mapIRQ timer
+[apic] mapGSI gsi=2 index=2 vector=0x0000000000000040 dest=0 flags=0x0000000000000000
+[BOOT] after mapIRQ timer
+[TIME] CPU does not support TSC deadline mode; using PIT
+[kbd:init] begin
+[kbd:init] cfg-old=0x77
+[kbd:init] cfg-init=0x44
+[kbd:init] reset-ack=0xfa
+[kbd:init] reset-bat=0xaa
+[kbd:init] scan-set-cmd=0xfa
+[kbd:init] scan-set-2=0xfa
+[kbd:init] scan-ack=0xfa
+[kbd:init] mouse-defaults=0xfa
+[kbd:init] mouse-sample=0xfa
+[kbd:init] mouse-resolution=0xfa
+[kbd:init] mouse-stream=0xfa
+[kbd:init] cfg-new=0x47
+[kbd:init] ready
+[BOOT] before mapIRQ keyboard
+[apic] mapGSI gsi=1 index=1 vector=0x0000000000000021 dest=0 flags=0x0000000000000000
+[BOOT] after mapIRQ keyboard
+[BOOT] before mapIRQ mouse
+[apic] mapGSI gsi=12 index=12 vector=0x000000000000002c dest=0 flags=0x0000000000000000
+[BOOT] after mapIRQ mouse
+[usb] init
+[usb:xhci] probe 0:12.0
+[usb:xhci] found controller on 0:12.0
+[usb:xhci] controller 0:12.0 vendor=0x8086 device=0x1e31 mmio=0xe8400000 bar=32 caplen=128 version=0x100 slots=32 interrupters=8 ports=14 hcs2=0x59 hcs3=0x40001 hcc1=0x4000000 dboff=0x3000 rtsoff=0x2000 xecp=0x400
+[usb:xhci] irq msi vector=112
+[usb:xhci] initialized op=0xe8400080 runtime=0xe8402000 doorbells=0xe8403000 dcbaa=0x24000 cmd=0x25000 event=0x26000 erst=0x27000
+[usb:xhci] root ports=14 ppc=0
+[usb:xhci] port 1 status=0x6a1 connected=1 enabled=0 speed=1(full 12Mbps)
+[usb:xhci] bus=0 port=1 addr=0 stage=port-connected
+[usb:xhci] bus=0 port=1 addr=0 stage=enumeration-attempt try=1
+[usb:xhci] bus=0 port=1 addr=0 stage=port-reset-started
+[usb:xhci] event type=34(port) cc=1(Success) param=0x1000000 status=0x1000000 control=0x8801
+[usb:xhci] port 1 status=0x200603 connected=1 enabled=1 speed=1(full 12Mbps)
+[usb:xhci] bus=0 port=1 addr=0 stage=port-reset-completed
+[usb:xhci] bus=0 port=1 addr=0 stage=port-enabled
+[usb:xhci] port 1 status=0x603 connected=1 enabled=1 speed=1(full 12Mbps)
+[usb:xhci] event type=33(command) cc=1(Success) param=0x25000 status=0x1000000 control=0x1008401
+[usb:xhci] command completion trb=0x25000 cc=1(Success) slot=1
+[usb:xhci] bus=0 port=1 addr=1 stage=slot-enabled
+[usb:xhci] event type=33(command) cc=1(Success) param=0x25010 status=0x1000000 control=0x1008401
+[usb:xhci] command completion trb=0x25010 cc=1(Success) slot=1
+[usb:xhci] bus=0 port=1 addr=1 stage=default-addressed
+[usb:xhci] event type=32(transfer) cc=1(Success) param=0x2a020 status=0x1000000 control=0x1018001
+[usb:xhci] bus=0 port=1 addr=1 stage=device-descriptor-8
+[usb:xhci] event type=33(command) cc=1(Success) param=0x25020 status=0x1000000 control=0x1008401
+[usb:xhci] command completion trb=0x25020 cc=1(Success) slot=1
+[usb:xhci] bus=0 port=1 addr=1 stage=ep0-max-packet
+[usb:xhci] event type=33(command) cc=1(Success) param=0x25030 status=0x1000000 control=0x1008401
+[usb:xhci] command completion trb=0x25030 cc=1(Success) slot=1
+[usb:xhci] bus=0 port=1 addr=1 stage=address-assigned
+[usb:xhci] event type=32(transfer) cc=1(Success) param=0x2a020 status=0x1000000 control=0x1018001
+[usb:xhci] event type=32(transfer) cc=1(Success) param=0x2a050 status=0x1000000 control=0x1018001
+[usb:xhci] bus=0 port=1 addr=1 stage=device-descriptor
+[usb:xhci] device slot=1 vid=0x80ee pid=0x21 configs=1
+[usb:xhci] event type=32(transfer) cc=1(Success) param=0x2a080 status=0x1000000 control=0x1018001
+[usb:xhci] bus=0 port=1 addr=1 stage=config-header
+[usb:xhci] event type=32(transfer) cc=1(Success) param=0x2a0b0 status=0x1000000 control=0x1018001
+[usb:xhci] bus=0 port=1 addr=1 stage=full-descriptors
+[usb:xhci] event type=32(transfer) cc=1(Success) param=0x2a0d0 status=0x1000000 control=0x1018001
+[usb:xhci] bus=0 port=1 addr=1 stage=configuration-set
+[usb:xhci] event type=32(transfer) cc=1(Success) param=0x2a100 status=0x1000000 control=0x1018001
+[usb:hid] if=0 report-prefix=0x5 0x1 0x9 0x2 0xa1 0x1 0x9 0x1 0xa1 0x0 0x5 0x9 0x19 0x1 0x29 0x5 0x15 0x0 0x25 0x1 0x95 0x5 0x75 0x1 0x81 0x2 0x95 0x1 0x75 0x3 0x81 0x3 ...
+[usb:kbd] interface 0 report descriptor did not describe a keyboard
+[usb:kbd] no keyboard endpoint
+[usb:mouse] no boot mouse endpoint
+[usb:xhci] configured slot=1 config=1 total=34 usable=1
+[usb:xhci] bus=0 port=1 addr=1 stage=usable
+[usb:xhci] port 2 status=0x6a1 connected=1 enabled=0 speed=1(full 12Mbps)
+[usb:xhci] bus=0 port=2 addr=0 stage=port-connected
+[usb:xhci] bus=0 port=2 addr=0 stage=enumeration-attempt try=1
+[usb:xhci] bus=0 port=2 addr=0 stage=port-reset-started
+[usb:xhci] event type=34(port) cc=1(Success) param=0x2000000 status=0x1000000 control=0x8801
+[usb:xhci] port 2 status=0x200603 connected=1 enabled=1 speed=1(full 12Mbps)
+[usb:xhci] bus=0 port=2 addr=0 stage=port-reset-completed
+[usb:xhci] bus=0 port=2 addr=0 stage=port-enabled
+[usb:xhci] port 2 status=0x603 connected=1 enabled=1 speed=1(full 12Mbps)
+[usb:xhci] event type=33(command) cc=1(Success) param=0x25040 status=0x1000000 control=0x2008401
+[usb:xhci] command completion trb=0x25040 cc=1(Success) slot=2
+[usb:xhci] bus=0 port=2 addr=2 stage=slot-enabled
+[usb:xhci] event type=33(command) cc=1(Success) param=0x25050 status=0x1000000 control=0x2008401
+[usb:xhci] command completion trb=0x25050 cc=1(Success) slot=2
+[usb:xhci] bus=0 port=2 addr=2 stage=default-addressed
+[usb:xhci] event type=32(transfer) cc=1(Success) param=0x2d020 status=0x1000000 control=0x2018001
+[usb:xhci] bus=0 port=2 addr=2 stage=device-descriptor-8
+[usb:xhci] event type=33(command) cc=1(Success) param=0x25060 status=0x1000000 control=0x2008401
+[usb:xhci] command completion trb=0x25060 cc=1(Success) slot=2
+[usb:xhci] bus=0 port=2 addr=2 stage=ep0-max-packet
+[usb:xhci] event type=33(command) cc=1(Success) param=0x25070 status=0x1000000 control=0x2008401
+[usb:xhci] command completion trb=0x25070 cc=1(Success) slot=2
+[usb:xhci] bus=0 port=2 addr=2 stage=address-assigned
+[usb:xhci] event type=32(transfer) cc=1(Success) param=0x2d020 status=0x1000000 control=0x2018001
+[usb:xhci] event type=32(transfer) cc=1(Success) param=0x2d050 status=0x1000000 control=0x2018001
+[usb:xhci] bus=0 port=2 addr=2 stage=device-descriptor
+[usb:xhci] device slot=2 vid=0x80ee pid=0x22 configs=1
+[usb:xhci] event type=32(transfer) cc=1(Success) param=0x2d080 status=0x1000000 control=0x2018001
+[usb:xhci] bus=0 port=2 addr=2 stage=config-header
+[usb:xhci] event type=32(transfer) cc=1(Success) param=0x2d0b0 status=0x1000000 control=0x2018001
+[usb:xhci] bus=0 port=2 addr=2 stage=full-descriptors
+[usb:xhci] event type=32(transfer) cc=1(Success) param=0x2d0d0 status=0x1000000 control=0x2018001
+[usb:xhci] bus=0 port=2 addr=2 stage=configuration-set
+[usb:xhci] event type=32(transfer) cc=1(Success) param=0x2d100 status=0x1000000 control=0x2018001
+[usb:hid] if=0 report-prefix=0x5 0xd 0x9 0x4 0xa1 0x1 0x85 0x2 0x5 0xd 0x9 0x54 0x75 0x8 0x15 0x0 0x25 0xc 0x95 0x1 0x81 0x2 0x9 0x22 0xa1 0x2 0x9 0x42 0x15 0x0 0x25 0x1 ...
+[usb:kbd] interface 0 report descriptor did not describe a keyboard
+[usb:kbd] no keyboard endpoint
+[usb:mouse] no boot mouse endpoint
+[usb:xhci] configured slot=2 config=1 total=34 usable=1
+[usb:xhci] bus=0 port=2 addr=2 stage=usable
+[usb:xhci] port 3 status=0x6a1 connected=1 enabled=0 speed=1(full 12Mbps)
+[usb:xhci] bus=0 port=3 addr=0 stage=port-connected
+[usb:xhci] bus=0 port=3 addr=0 stage=enumeration-attempt try=1
+[usb:xhci] bus=0 port=3 addr=0 stage=port-reset-started
+[usb:xhci] event type=34(port) cc=1(Success) param=0x3000000 status=0x1000000 control=0x8801
+[usb:xhci] port 3 status=0x200603 connected=1 enabled=1 speed=1(full 12Mbps)
+[usb:xhci] bus=0 port=3 addr=0 stage=port-reset-completed
+[usb:xhci] bus=0 port=3 addr=0 stage=port-enabled
+[usb:xhci] port 3 status=0x603 connected=1 enabled=1 speed=1(full 12Mbps)
+[usb:xhci] event type=33(command) cc=1(Success) param=0x25080 status=0x1000000 control=0x3008401
+[usb:xhci] command completion trb=0x25080 cc=1(Success) slot=3
+[usb:xhci] bus=0 port=3 addr=3 stage=slot-enabled
+[usb:xhci] event type=33(command) cc=1(Success) param=0x25090 status=0x1000000 control=0x3008401
+[usb:xhci] command completion trb=0x25090 cc=1(Success) slot=3
+[usb:xhci] bus=0 port=3 addr=3 stage=default-addressed
+[usb:xhci] event type=32(transfer) cc=1(Success) param=0x30020 status=0x1000000 control=0x3018001
+[usb:xhci] bus=0 port=3 addr=3 stage=device-descriptor-8
+[usb:xhci] event type=33(command) cc=1(Success) param=0x250a0 status=0x1000000 control=0x3008401
+[usb:xhci] command completion trb=0x250a0 cc=1(Success) slot=3
+[usb:xhci] bus=0 port=3 addr=3 stage=ep0-max-packet
+[usb:xhci] event type=33(command) cc=1(Success) param=0x250b0 status=0x1000000 control=0x3008401
+[usb:xhci] command completion trb=0x250b0 cc=1(Success) slot=3
+[usb:xhci] bus=0 port=3 addr=3 stage=address-assigned
+[usb:xhci] event type=32(transfer) cc=1(Success) param=0x30020 status=0x1000000 control=0x3018001
+[usb:xhci] event type=32(transfer) cc=1(Success) param=0x30050 status=0x1000000 control=0x3018001
+[usb:xhci] bus=0 port=3 addr=3 stage=device-descriptor
+[usb:xhci] device slot=3 vid=0x80ee pid=0x23 configs=1
+[usb:xhci] event type=32(transfer) cc=1(Success) param=0x30080 status=0x1000000 control=0x3018001
+[usb:xhci] bus=0 port=3 addr=3 stage=config-header
+[usb:xhci] event type=32(transfer) cc=1(Success) param=0x300b0 status=0x1000000 control=0x3018001
+[usb:xhci] bus=0 port=3 addr=3 stage=full-descriptors
+[usb:xhci] event type=32(transfer) cc=1(Success) param=0x300d0 status=0x1000000 control=0x3018001
+[usb:xhci] bus=0 port=3 addr=3 stage=configuration-set
+[usb:xhci] event type=32(transfer) cc=1(Success) param=0x30100 status=0x1000000 control=0x3018001
+[usb:hid] if=0 report-prefix=0x5 0xd 0x9 0x5 0xa1 0x1 0x85 0x2 0x5 0xd 0x9 0x54 0x75 0x8 0x15 0x0 0x25 0xc 0x95 0x1 0x81 0x2 0x5 0xd 0x9 0x22 0xa1 0x2 0x9 0x42 0x15 0x0 ...
+[usb:kbd] interface 0 report descriptor did not describe a keyboard
+[usb:kbd] no keyboard endpoint
+[usb:mouse] no boot mouse endpoint
+[usb:xhci] configured slot=3 config=1 total=34 usable=1
+[usb:xhci] bus=0 port=3 addr=3 stage=usable
+[usb:xhci] port 4 status=0x2a0 connected=0 enabled=0 speed=0(unknown 0Mbps)
+[usb:xhci] port 5 status=0x2a0 connected=0 enabled=0 speed=0(unknown 0Mbps)
+[usb:xhci] port 6 status=0x2a0 connected=0 enabled=0 speed=0(unknown 0Mbps)
+[usb:xhci] port 7 status=0x2a0 connected=0 enabled=0 speed=0(unknown 0Mbps)
+[usb:xhci] port 8 status=0x2a0 connected=0 enabled=0 speed=0(unknown 0Mbps)
+[usb:xhci] port 9 status=0x2a0 connected=0 enabled=0 speed=0(unknown 0Mbps)
+[usb:xhci] port 10 status=0x2a0 connected=0 enabled=0 speed=0(unknown 0Mbps)
+[usb:xhci] port 11 status=0x2a0 connected=0 enabled=0 speed=0(unknown 0Mbps)
+[usb:xhci] port 12 status=0x2a0 connected=0 enabled=0 speed=0(unknown 0Mbps)
+[usb:xhci] port 13 status=0x2a0 connected=0 enabled=0 speed=0(unknown 0Mbps)
+[usb:xhci] port 14 status=0x2a0 connected=0 enabled=0 speed=0(unknown 0Mbps)
+[usb:xhci] controller initialized
+[usb:xhci] active controllers=1/1
+[usb] using xHCI input backend
+[i2c:hid] initialize
+[i2c:hid] no Intel LPSS I2C PCI controllers found
+[i2c:hid] no ACPI HID-over-I2C device hints found
+[input] keyboard detected:[input] keyboard detected: ps2.driver= ps2.driver=yesyes ps2.keyboard= ps2.keyboard=yesyes usb.controller= usb.controller=yesyes usb.xhci= usb.xhci=yesyes usb.xhci.controllers= usb.xhci.controllers=11//11 usb.keyboard= usb.keyboard=nono i2c.controllers= i2c.controllers=00 i2c.hints= i2c.hints=00 i2c.keyboard= i2c.keyboard=nono
+
+[BOOT] framebuffer fallback=1024x768
+[VGPU:init] detectDevice failed
+[BOOT] VirtIO GPU: unavailable, using boot framebuffer
+[BOOT] LAPIC ID=0
+[BOOT] IRQ target APIC ID=0
+[BOOT] GDTR base=3d687b24
+[BOOT] IDTR base=3d68bbe0
+[2Jdetecting ahci
+[AHCI] BAR5 raw: 0xe8414000
+AHCI: [ ... ] e8414000 31:2
+[AHCI] Initializing controller at ABAR: 0x3896590336
+[AHCI] Aligned ABAR: 0x3896590336, Pages needed: 2
+[AHCI] HBA Memory mapped at: 0x3896590336
+[AHCI] HBA Version: 0x65792
+[AHCI] HBA Capabilities: 0x3357810561
+[AHCI] Number of ports: 2
+[AHCI] Port Implemented register: 0x3
+[AHCI] Checking port 0...
+[AHCI] Port 0 type: SATAPI
+[AHCI] Checking port 1...
+[AHCI] Port 1 type: SATA
+[AHCI] Initializing SATA port 1...
+[AHCI Port 1] Stopping command engine...
+[AHCI Port 1] Allocating command list buffer...
+[AHCI Port 1] Allocating FIS buffer...
+[AHCI Port 1] Command list at: 0x1283072, FIS at: 0x1286400
+[AHCI Port 1] Allocating command tables...
+[AHCI Port 1] Starting command engine...
+[AHCI Port 1] Sending IDENTIFY command...
+[AHCI Port 1] IDENTIFY command failed
+[AHCI Port 1] Port is now active
+[AHCI] Port 1 initialized successfully
+[AHCI] Port 1 sector count: 0
+[AHCI] Port 1 capacity: 0 MB
+[AHCI] Port 1 initialized
+[AHCI] Total active ports: 1
+[AHCI] Active ports: 1
+[FAT32] Failed to read boot sector
+Filesystem mounted: [ FAIL ]
+Mounting initrdfs...
+InitrdFS at /bin: [ OK ]
+[PROC] Loading PE at base: 7fffffe00000
+[PROC] Entry point: 7fffffe01354
+/bin/input-manager.exe: [ OK ]
+[PROC] Loading PE at base: 7fffffe00000
+[PROC] Entry point: 7fffffe01404
+/bin/storage-manager.exe: [ OK ]
+[PROC] Loading PE at base: 7fffffe00000
+[PROC] Entry point: 7fffffe01404
+/bin/process-manager.exe: [ OK ]
+[PROC] Loading PE at base: 7fffffe00000
+[PROC] Entry point: 7fffffe06d18
+/bin/font-manager.exe: [ OK ]
+[PROC] Loading PE at base: 7fffffe00000
+[PROC] Entry point: 7fffffe01404
+/bin/session-manager.exe: [ OK ]
+[PROC] Loading PE at base: 7fffffe00000
+[PROC] Entry point: 7fffffe015d0
+/bin/login.exe: [ OK ]
+[input.manager] phase=enter
+[ipc:input] sys_queue_create begin pid=1 name=/bin/input-manager.exe
+[ipc:input] sys_queue_create ok handle=0x0006000000000003 pid=1 name=/bin/input-manager.exe
+[input.manager] phase=queue-created
+[input.manager] service queue handle=0x0006000000000003
+[input.manager] phase=registering
+[ipc:service] sys_register name=input.manager pid=1 name=/bin/input-manager.exe queue_handle=0x0006000000000003
+[ipc:service] register request name=input.manager owner=1 queue=0x0000000000458030 pending=0
+[ipc:service] registered name=input.manager slot=0 owner=1
+[ipc:service] sys_register result name=input.manager pid=1 name=/bin/input-manager.exe result=0x0000000000000000
+[ipc:input] input.manager registered; publishing buffered keyboard input
+[input.manager] phase=registered
+[input.manager] ready
+[ipc:input] sys_queue_create begin pid=1 name=/bin/input-manager.exe
+[ipc:input] sys_queue_create ok handle=0x0006000000000004 pid=1 name=/bin/input-manager.exe
+[input.manager] idle queue handle=0x0006000000000004
+[ipc:service] sys_register name=storage.manager pid=2 name=/bin/storage-manager.exe queue_handle=0x0006000000000003
+[ipc:service] register request name=storage.manager owner=2 queue=0x0000000000468030 pending=0
+[ipc:service] registered name=storage.manager slot=1 owner=2
+[ipc:service] sys_register result name=storage.manager pid=2 name=/bin/storage-manager.exe result=0x0000000000000000
+[storage.manager] ready
+[ipc:service] sys_register name=process.manager pid=3 name=/bin/process-manager.exe queue_handle=0x0006000000000003
+[ipc:service] register request name=process.manager owner=3 queue=0x0000000000470030 pending=0
+[ipc:service] registered name=process.manager slot=2 owner=3
+[ipc:service] sys_register result name=process.manager pid=3 name=/bin/process-manager.exe result=0x0000000000000000
+[process.manager] ready
+[ipc:service] sys_register name=font.manager pid=4 name=/bin/font-manager.exe queue_handle=0x0006000000000003
+[ipc:service] register request name=font.manager owner=4 queue=0x0000000000480030 pending=0
+[ipc:service] registered name=font.manager slot=3 owner=4
+[ipc:service] sys_register result name=font.manager pid=4 name=/bin/font-manager.exe result=0x0000000000000000
+[font.manager] ready
+[ipc:service] sys_register name=session.manager pid=5 name=/bin/session-manager.exe queue_handle=0x0006000000000003
+[ipc:service] register request name=session.manager owner=5 queue=0x0000000000488030 pending=0
+[ipc:service] registered name=session.manager slot=4 owner=5
+[ipc:service] sys_register result name=session.manager pid=5 name=/bin/session-manager.exe result=0x0000000000000000
+[session.manager] ready
+[ipc:service] connect found name=input.manager slot=0 owner=1 pending=0
+[ipc:service] sys_connect ok name=input.manager pid=6 name=/bin/login.exe handle=0x0007000000000003 pending=0
+login: [ipc:input] receive blocking handle=0x0007000000000003 pid=6 name=/bin/login.exe pending=0

@@ -3,6 +3,8 @@
 #include <common/string.hpp>
 #include <cpu/acpi/pci.hpp>
 #include <cpu/cereal/cereal.hpp>
+#include <drivers/usb/usb.hpp>
+#include <drivers/usb/xhci.hpp>
 #include <interrupts/keyboard.hpp>
 #include <memory/pmm.hpp>
 #include <memory/vmm.hpp>
@@ -77,30 +79,6 @@ constexpr uint32_t OHCI_TD_DATA0 = 2 << 24;
 constexpr uint32_t OHCI_TD_DATA1 = 3 << 24;
 constexpr uint32_t OHCI_TD_TOGGLE_FROM_ED = 0 << 24;
 constexpr uint32_t OHCI_TD_CC_NOT_ACCESSED = 0xFU << 28;
-
-constexpr uint8_t USB_REQUEST_GET_DESCRIPTOR = 0x06;
-constexpr uint8_t USB_REQUEST_SET_ADDRESS = 0x05;
-constexpr uint8_t USB_REQUEST_SET_CONFIGURATION = 0x09;
-constexpr uint8_t USB_REQUEST_SET_IDLE = 0x0A;
-constexpr uint8_t USB_REQUEST_SET_PROTOCOL = 0x0B;
-constexpr uint8_t USB_DESCRIPTOR_DEVICE = 0x01;
-constexpr uint8_t USB_DESCRIPTOR_CONFIGURATION = 0x02;
-constexpr uint8_t USB_DESCRIPTOR_INTERFACE = 0x04;
-constexpr uint8_t USB_DESCRIPTOR_ENDPOINT = 0x05;
-
-constexpr uint8_t USB_CLASS_HID = 0x03;
-constexpr uint8_t USB_HID_SUBCLASS_BOOT = 0x01;
-constexpr uint8_t USB_HID_PROTOCOL_KEYBOARD = 0x01;
-constexpr uint8_t USB_ENDPOINT_IN = 0x80;
-constexpr uint8_t USB_ENDPOINT_TYPE_INTERRUPT = 0x03;
-
-struct UsbSetupPacket {
-    uint8_t requestType;
-    uint8_t request;
-    uint16_t value;
-    uint16_t index;
-    uint16_t length;
-} __attribute__((packed));
 
 struct OHCIEndpointDescriptor {
     volatile uint32_t control;
@@ -221,6 +199,23 @@ char hid_usage_to_char(uint8_t usage, bool shift) {
     return shift ? shifted[usage] : normal[usage];
 }
 
+uint16_t hid_modifier_byte_to_key_modifiers(uint8_t modifiers) {
+    uint16_t out = KeyModifierNone;
+    if (modifiers & 0x22) {
+        out |= KeyModifierShift;
+    }
+    if (modifiers & 0x11) {
+        out |= KeyModifierControl;
+    }
+    if (modifiers & 0x44) {
+        out |= KeyModifierAlt;
+    }
+    if (modifiers & 0x88) {
+        out |= KeyModifierSuper;
+    }
+    return out;
+}
+
 bool report_had_key(const uint8_t* report, uint8_t usage) {
     for (int i = 2; i < 8; ++i) {
         if (report[i] == usage) {
@@ -243,23 +238,51 @@ void USBInput::initialize() {
 
     initialized = true;
     log_str("[usb] init\n");
+    xhciActive = XHCIController::get().initialize();
+    if (xhciActive) {
+        controllerReady = true;
+        log_str("[usb] using xHCI input backend\n");
+        return;
+    }
+
     controllerReady = detectController();
     if (!controllerReady) {
-        log_str("[usb] no OHCI keyboard controller ready\n");
+        log_str("[usb] no xHCI/OHCI input controller ready\n");
+    } else {
+        log_str("[usb] using OHCI input backend\n");
     }
 }
 
 void USBInput::poll() {
+    if (xhciActive) {
+        XHCIController::get().poll();
+        return;
+    }
+
     if (!keyboardReady) {
+        return;
+    }
+
+    if (__atomic_test_and_set(&polling_lock, __ATOMIC_ACQUIRE)) {
         return;
     }
 
     if (!interruptPending) {
         submitInterruptTransfer();
+        __atomic_clear(&polling_lock, __ATOMIC_RELEASE);
         return;
     }
 
     completeInterruptTransfer();
+    __atomic_clear(&polling_lock, __ATOMIC_RELEASE);
+}
+
+bool USBInput::hasKeyboard() const {
+    return xhciActive ? XHCIController::get().hasBootKeyboard() : keyboardReady;
+}
+
+bool USBInput::hasMouse() const {
+    return xhciActive ? XHCIController::get().hasBootMouse() : false;
 }
 
 bool USBInput::detectController() {
@@ -329,7 +352,7 @@ bool USBInput::initializeController(uint8_t bus, uint8_t slot, uint8_t func, uin
         return false;
     }
 
-    VMM::MapPage(base, base, Present | ReadWrite | CacheDisab | NoExecute);
+    VMM::MapPage(base, base, Present | ReadWrite | CacheDisab | WriteThru | NoExecute);
     regs = reinterpret_cast<volatile uint32_t*>(static_cast<uint64_t>(base));
 
     uint16_t command = PCI::get().readConfig16(0, bus, slot, func, PCI_COMMAND);
@@ -801,7 +824,8 @@ void USBInput::completeInterruptTransfer() {
     }
 
     auto* report = reinterpret_cast<uint8_t*>(interruptBuffer);
-    const bool shift = (report[0] & 0x22) != 0;
+    const uint16_t keyModifiers = hid_modifier_byte_to_key_modifiers(report[0]);
+    const bool shift = (keyModifiers & KeyModifierShift) != 0;
     for (int i = 2; i < 8; ++i) {
         uint8_t usage = report[i];
         if (usage == 0 || report_had_key(lastReport, usage)) {
@@ -810,7 +834,7 @@ void USBInput::completeInterruptTransfer() {
 
         char c = hid_usage_to_char(usage, shift);
         if (c != 0) {
-            Keyboard::get().injectChar(c, "[usb:kbd]");
+            Keyboard::get().injectKey(c, keyModifiers, "[usb:kbd]");
         }
     }
 

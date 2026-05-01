@@ -26,6 +26,7 @@ public:
     void scheduleFromSyscall();
     void yield();
     void wakeProcess(Process* process);
+    void wakeExpiredSleepers(uint64_t nowMs);
     void wakeAllBlockedProcesses();
     
     uint32_t allocatePID();

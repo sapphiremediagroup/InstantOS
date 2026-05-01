@@ -65,8 +65,8 @@ bool LAPIC::initialize() {
   uint64_t lapic_phys = madt->lapic_address;
   uint64_t lapic_virt = lapic_phys; // identity map
 
-  VMM::MapPage(lapic_virt, lapic_phys, 
-          PageFlags::Present | PageFlags::ReadWrite | PageFlags::CacheDisab | PageFlags::NoExecute);
+  VMM::MapPage(lapic_virt, lapic_phys,
+          PageFlags::Present | PageFlags::ReadWrite | PageFlags::CacheDisab | PageFlags::WriteThru | PageFlags::NoExecute);
 
   base = reinterpret_cast<volatile uint32_t *>(lapic_virt);
   initialized = true;
@@ -144,7 +144,7 @@ void IOAPIC::initialize(uint64_t physAddr, uint32_t gsiBaseIn) {
   uint64_t virt = physAddr;
 
   VMM::MapPage(virt, physAddr,
-          PageFlags::Present | PageFlags::ReadWrite | PageFlags::CacheDisab | PageFlags::NoExecute);
+          PageFlags::Present | PageFlags::ReadWrite | PageFlags::CacheDisab | PageFlags::WriteThru | PageFlags::NoExecute);
 
   base = reinterpret_cast<volatile uint32_t *>(virt);
 }
@@ -312,22 +312,21 @@ uint32_t APICManager::resolveIRQ(uint8_t irq) {
 void APICManager::mapIRQ(uint8_t irq, uint8_t vector, uint32_t dest) {
   uint32_t gsi = resolveIRQ(irq);
   uint16_t flags = getFlags(irq);
+  mapGSI(gsi, vector, dest, flags);
+}
 
+bool APICManager::mapGSI(uint32_t gsi, uint8_t vector, uint32_t dest, uint16_t flags) {
   IOAPIC *ioapic = getIOAPICForGSI(gsi);
   if (!ioapic) {
-    traceStr("[apic] mapIRQ failed irq=");
-    traceDec(irq);
-    traceStr(" gsi=");
+    traceStr("[apic] mapGSI failed gsi=");
     traceDec(gsi);
     traceStr("\n");
-    return;
+    return false;
   }
 
   uint32_t lapicId = dest;
   uint8_t redirectIndex = gsi - ioapic->getGSIBase();
-  traceStr("[apic] mapIRQ irq=");
-  traceDec(irq);
-  traceStr(" gsi=");
+  traceStr("[apic] mapGSI gsi=");
   traceDec(gsi);
   traceStr(" index=");
   traceDec(redirectIndex);
@@ -340,6 +339,7 @@ void APICManager::mapIRQ(uint8_t irq, uint8_t vector, uint32_t dest) {
   traceStr("\n");
 
   ioapic->setRedirect(redirectIndex, vector, lapicId, false, flags);
+  return true;
 }
 
 uint16_t APICManager::getFlags(uint8_t irq) {

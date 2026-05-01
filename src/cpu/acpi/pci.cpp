@@ -7,8 +7,15 @@
 namespace {
 constexpr uint16_t kInterruptLineOffset = 0x3C;
 constexpr uint16_t kInterruptPinOffset = 0x3D;
+constexpr uint16_t kStatusOffset = 0x06;
+constexpr uint16_t kCommandOffset = 0x04;
+constexpr uint16_t kCapabilityListOffset = 0x34;
+constexpr uint16_t kCommandInterruptDisable = 1 << 10;
+constexpr uint16_t kStatusCapabilityList = 1 << 4;
+constexpr uint8_t kCapabilityMsi = 0x05;
 constexpr uint8_t kMaxLegacyIrq = 15;
 constexpr uint8_t kMaxHandlersPerIrq = 8;
+uint8_t g_nextMsiVector = VECTOR_MSI_BASE;
 
 class PCILegacyIRQDispatcher : public Interrupt {
 public:
@@ -38,7 +45,7 @@ public:
 
     void Run(InterruptFrame* frame) override {
         for (uint8_t i = 0; i < handlerCount; ++i) {
-            if (handlers[i]) {
+            if (handlers[i] && handlers[i]->shouldDispatch()) {
                 handlers[i]->Run(frame);
             }
         }
@@ -50,8 +57,12 @@ private:
     uint8_t handlerCount;
 };
 
-PCILegacyIRQDispatcher g_pciDispatchers[16];
 bool g_pciDispatcherMapped[16] = {};
+
+PCILegacyIRQDispatcher* getLegacyDispatchers() {
+    static PCILegacyIRQDispatcher dispatchers[16];
+    return dispatchers;
+}
 }
 
 PCI& PCI::get() {
@@ -154,6 +165,67 @@ void PCI::writeConfig32(uint16_t segment, uint8_t bus, uint8_t device, uint8_t f
     outl(CONFIG_DATA, value);
 }
 
+uint16_t PCI::findCapability(uint16_t segment, uint8_t bus, uint8_t device, uint8_t function, uint8_t capabilityId) {
+    const uint16_t status = readConfig16(segment, bus, device, function, kStatusOffset);
+    if ((status & kStatusCapabilityList) == 0) {
+        return 0;
+    }
+
+    uint8_t capPtr = readConfig8(segment, bus, device, function, kCapabilityListOffset) & 0xFC;
+    for (uint32_t guard = 0; capPtr != 0 && guard < 64; ++guard) {
+        if (readConfig8(segment, bus, device, function, capPtr) == capabilityId) {
+            return capPtr;
+        }
+
+        capPtr = readConfig8(segment, bus, device, function, capPtr + 1) & 0xFC;
+    }
+
+    return 0;
+}
+
+bool PCI::registerMSIInterrupt(uint16_t segment, uint8_t bus, uint8_t device, uint8_t function,
+                               Interrupt* handler, uint8_t* outVector) {
+    if (!handler) {
+        return false;
+    }
+
+    const uint16_t cap = findCapability(segment, bus, device, function, kCapabilityMsi);
+    if (cap == 0 || g_nextMsiVector > VECTOR_MSI_LIMIT) {
+        return false;
+    }
+
+    const uint16_t control = readConfig16(segment, bus, device, function, cap + 2);
+    const bool is64Bit = (control & (1 << 7)) != 0;
+    const bool maskCapable = (control & (1 << 8)) != 0;
+    (void)maskCapable;
+
+    const uint8_t vector = g_nextMsiVector++;
+    const uint32_t destination = LAPIC::get().getId() & 0xFF;
+    const uint32_t messageAddress = 0xFEE00000U | (destination << 12);
+    const uint16_t messageData = vector;
+
+    writeConfig32(segment, bus, device, function, cap + 4, messageAddress);
+    if (is64Bit) {
+        writeConfig32(segment, bus, device, function, cap + 8, 0);
+        writeConfig16(segment, bus, device, function, cap + 12, messageData);
+    } else {
+        writeConfig16(segment, bus, device, function, cap + 8, messageData);
+    }
+
+    const uint16_t updatedControl = static_cast<uint16_t>((control & ~0x0070U) | 0x0001U);
+    writeConfig16(segment, bus, device, function, cap + 2, updatedControl);
+
+    uint16_t command = readConfig16(segment, bus, device, function, kCommandOffset);
+    command |= kCommandInterruptDisable;
+    writeConfig16(segment, bus, device, function, kCommandOffset, command);
+
+    ISR::registerIRQ(vector, handler);
+    if (outVector) {
+        *outVector = vector;
+    }
+    return true;
+}
+
 bool PCI::registerLegacyInterrupt(uint16_t segment, uint8_t bus, uint8_t device, uint8_t function,
                                   Interrupt* handler, uint8_t* outIrq, uint8_t* outVector) {
     if (!handler) {
@@ -171,7 +243,7 @@ bool PCI::registerLegacyInterrupt(uint16_t segment, uint8_t bus, uint8_t device,
     }
 
     const uint8_t vector = static_cast<uint8_t>(VECTOR_PCI_BASE + irq);
-    auto& dispatcher = g_pciDispatchers[irq];
+    auto& dispatcher = getLegacyDispatchers()[irq];
     if (!dispatcher.addHandler(handler)) {
         return false;
     }

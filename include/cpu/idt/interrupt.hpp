@@ -18,6 +18,10 @@ public:
 
     virtual void initialize() = 0;
 
+    virtual bool shouldDispatch() {
+        return true;
+    }
+
     virtual void Run(InterruptFrame* frame) = 0;
     void sendEOI(){
         LAPIC::get().sendEOI();

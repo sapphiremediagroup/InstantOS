@@ -10,6 +10,7 @@ public:
     
     bool initialize();
     void mapIRQ(uint8_t irq, uint8_t vector, uint32_t dest = 0);
+    bool mapGSI(uint32_t gsi, uint8_t vector, uint32_t dest = 0, uint16_t flags = 0);
     uint16_t getFlags(uint8_t irq);
     
     void startupAPs();

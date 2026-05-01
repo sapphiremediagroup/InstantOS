@@ -1,4 +1,5 @@
 #include <memory/vmm.hpp>
+#include <memory/heap.hpp>
 #include <memory/pmm.hpp>
 
 PageTable* VMM::s_pml4        = nullptr;
@@ -16,12 +17,98 @@ static void memzero(void* dst, uint64_t size) {
         p[i] = 0;
 }
 
-PageTable* VMM::AllocTable() {
-    uint64_t frame = PMM::AllocFrame();
-    if (frame == 0) return nullptr;
-    auto* table = reinterpret_cast<PageTable*>(frame);
+static PageTable* alloc_zeroed_table() {
+    PageTable* table = nullptr;
+    if (heap_is_initialized()) {
+        table = reinterpret_cast<PageTable*>(kmalloc_aligned(sizeof(PageTable), PAGE_SIZE));
+    } else {
+        uint64_t frame = PMM::AllocFrame();
+        if (frame == 0) return nullptr;
+        table = reinterpret_cast<PageTable*>(frame);
+    }
+    if (!table) return nullptr;
+    if ((reinterpret_cast<uint64_t>(table) & (PAGE_SIZE - 1)) != 0) return nullptr;
     memzero(table, sizeof(PageTable));
     return table;
+}
+
+static bool is_heap_table(PageTable* table) {
+    if (!table || !heap_is_initialized()) {
+        return false;
+    }
+
+    const uintptr_t base = heap_base();
+    const size_t size = heap_size();
+    const uintptr_t addr = reinterpret_cast<uintptr_t>(table);
+    return addr >= base && addr + sizeof(PageTable) <= base + size;
+}
+
+static PageTable* clone_table_if_needed(uint64_t& parentEntry) {
+    if (!(parentEntry & Present) || (parentEntry & LargePage)) {
+        return reinterpret_cast<PageTable*>(parentEntry & ADDR_MASK);
+    }
+
+    auto* table = reinterpret_cast<PageTable*>(parentEntry & ADDR_MASK);
+    if (!heap_is_initialized() || is_heap_table(table)) {
+        return table;
+    }
+
+    PageTable* clone = alloc_zeroed_table();
+    if (!clone) return nullptr;
+
+    for (uint64_t i = 0; i < 512; i++) {
+        clone->entries[i] = table->entries[i];
+    }
+
+    const uint64_t flags = (parentEntry & ~ADDR_MASK) | ReadWrite;
+    parentEntry = reinterpret_cast<uint64_t>(clone) | flags;
+    return clone;
+}
+
+static PageTable* splitLargePdptEntry(PageTable* pdpt, uint64_t pdpti) {
+    if (!pdpt) return nullptr;
+
+    uint64_t& entry = pdpt->entries[pdpti];
+    if ((entry & (Present | LargePage)) != (Present | LargePage)) {
+        return reinterpret_cast<PageTable*>(entry & ADDR_MASK);
+    }
+
+    PageTable* pd = alloc_zeroed_table();
+    if (!pd) return nullptr;
+
+    const uint64_t base = entry & 0x000FFFFFC0000000ULL;
+    const uint64_t flags = entry & ~ADDR_MASK & ~LargePage;
+    for (uint64_t i = 0; i < 512; i++) {
+        pd->entries[i] = (base + i * 0x200000ULL) | flags | Present | LargePage;
+    }
+
+    entry = reinterpret_cast<uint64_t>(pd) | flags | Present | ReadWrite | UserSuper;
+    return pd;
+}
+
+static PageTable* splitLargePdEntry(PageTable* pd, uint64_t pdi) {
+    if (!pd) return nullptr;
+
+    uint64_t& entry = pd->entries[pdi];
+    if ((entry & (Present | LargePage)) != (Present | LargePage)) {
+        return reinterpret_cast<PageTable*>(entry & ADDR_MASK);
+    }
+
+    PageTable* pt = alloc_zeroed_table();
+    if (!pt) return nullptr;
+
+    const uint64_t base = entry & 0x000FFFFFFFE00000ULL;
+    const uint64_t flags = entry & ~ADDR_MASK & ~LargePage;
+    for (uint64_t i = 0; i < 512; i++) {
+        pt->entries[i] = (base + i * PAGE_SIZE) | flags | Present;
+    }
+
+    entry = reinterpret_cast<uint64_t>(pt) | flags | Present | ReadWrite | UserSuper;
+    return pt;
+}
+
+PageTable* VMM::AllocTable() {
+    return alloc_zeroed_table();
 }
 
 void VMM::InvalidatePage(uint64_t addr) {
@@ -63,21 +150,30 @@ void VMM::MapPage(uint64_t virtualAddr, uint64_t physAddr, uint64_t flags) {
         if (!pdpt) return;
         pml4->entries[pml4i] = reinterpret_cast<uint64_t>(pdpt) | Present | ReadWrite | UserSuper;
     }
-    auto* pdpt = reinterpret_cast<PageTable*>(pml4->entries[pml4i] & ADDR_MASK);
+    auto* pdpt = clone_table_if_needed(pml4->entries[pml4i]);
+    if (!pdpt) return;
 
     if (!(pdpt->entries[pdpti] & Present)) {
         PageTable* pd = AllocTable();
         if (!pd) return;
         pdpt->entries[pdpti] = reinterpret_cast<uint64_t>(pd) | Present | ReadWrite | UserSuper;
     }
-    auto* pd = reinterpret_cast<PageTable*>(pdpt->entries[pdpti] & ADDR_MASK);
+    if (!(pdpt->entries[pdpti] & LargePage)) {
+        if (!clone_table_if_needed(pdpt->entries[pdpti])) return;
+    }
+    auto* pd = splitLargePdptEntry(pdpt, pdpti);
+    if (!pd) return;
 
     if (!(pd->entries[pdi] & Present)) {
         PageTable* pt = AllocTable();
         if (!pt) return;
         pd->entries[pdi] = reinterpret_cast<uint64_t>(pt) | Present | ReadWrite | UserSuper;
     }
-    auto* pt = reinterpret_cast<PageTable*>(pd->entries[pdi] & ADDR_MASK);
+    if (!(pd->entries[pdi] & LargePage)) {
+        if (!clone_table_if_needed(pd->entries[pdi])) return;
+    }
+    auto* pt = splitLargePdEntry(pd, pdi);
+    if (!pt) return;
 
     pt->entries[pti] = physAddr | (flags & ~ADDR_MASK) | Present;
 
@@ -94,14 +190,27 @@ void VMM::UnmapPage(uint64_t virtualAddr) {
 
     uint64_t pml4i = PML4Index(virtualAddr);
     if (!(pml4->entries[pml4i] & Present)) return;
-    auto* pdpt = reinterpret_cast<PageTable*>(pml4->entries[pml4i] & ADDR_MASK);
+    auto* pdpt = clone_table_if_needed(pml4->entries[pml4i]);
+    if (!pdpt) return;
 
     uint64_t pdpti = PDPTIndex(virtualAddr);
     if (!(pdpt->entries[pdpti] & Present)) return;
+    if (!(pdpt->entries[pdpti] & LargePage)) {
+        if (!clone_table_if_needed(pdpt->entries[pdpti])) return;
+    }
+    if (pdpt->entries[pdpti] & LargePage) {
+        if (!splitLargePdptEntry(pdpt, pdpti)) return;
+    }
     auto* pd = reinterpret_cast<PageTable*>(pdpt->entries[pdpti] & ADDR_MASK);
 
     uint64_t pdi = PDIndex(virtualAddr);
     if (!(pd->entries[pdi] & Present)) return;
+    if (!(pd->entries[pdi] & LargePage)) {
+        if (!clone_table_if_needed(pd->entries[pdi])) return;
+    }
+    if (pd->entries[pdi] & LargePage) {
+        if (!splitLargePdEntry(pd, pdi)) return;
+    }
     auto* pt = reinterpret_cast<PageTable*>(pd->entries[pdi] & ADDR_MASK);
 
     uint64_t pti = PTIndex(virtualAddr);
@@ -216,21 +325,30 @@ void VMM::MapPageInto(PageTable* pml4, uint64_t virtualAddr, uint64_t physAddr, 
         if (!pdpt) return;
         pml4->entries[pml4i] = reinterpret_cast<uint64_t>(pdpt) | Present | ReadWrite | UserSuper;
     }
-    auto* pdpt = reinterpret_cast<PageTable*>(pml4->entries[pml4i] & ADDR_MASK);
+    auto* pdpt = clone_table_if_needed(pml4->entries[pml4i]);
+    if (!pdpt) return;
 
     if (!(pdpt->entries[pdpti] & Present)) {
         PageTable* pd = AllocTable();
         if (!pd) return;
         pdpt->entries[pdpti] = reinterpret_cast<uint64_t>(pd) | Present | ReadWrite | UserSuper;
     }
-    auto* pd = reinterpret_cast<PageTable*>(pdpt->entries[pdpti] & ADDR_MASK);
+    if (!(pdpt->entries[pdpti] & LargePage)) {
+        if (!clone_table_if_needed(pdpt->entries[pdpti])) return;
+    }
+    auto* pd = splitLargePdptEntry(pdpt, pdpti);
+    if (!pd) return;
 
     if (!(pd->entries[pdi] & Present)) {
         PageTable* pt = AllocTable();
         if (!pt) return;
         pd->entries[pdi] = reinterpret_cast<uint64_t>(pt) | Present | ReadWrite | UserSuper;
     }
-    auto* pt = reinterpret_cast<PageTable*>(pd->entries[pdi] & ADDR_MASK);
+    if (!(pd->entries[pdi] & LargePage)) {
+        if (!clone_table_if_needed(pd->entries[pdi])) return;
+    }
+    auto* pt = splitLargePdEntry(pd, pdi);
+    if (!pt) return;
 
     pt->entries[pti] = physAddr | (flags & ~ADDR_MASK) | Present;
 }
@@ -248,14 +366,27 @@ void VMM::UnmapPageFrom(PageTable* pml4, uint64_t virtualAddr) {
 
     uint64_t pml4i = PML4Index(virtualAddr);
     if (!(pml4->entries[pml4i] & Present)) return;
-    auto* pdpt = reinterpret_cast<PageTable*>(pml4->entries[pml4i] & ADDR_MASK);
+    auto* pdpt = clone_table_if_needed(pml4->entries[pml4i]);
+    if (!pdpt) return;
 
     uint64_t pdpti = PDPTIndex(virtualAddr);
     if (!(pdpt->entries[pdpti] & Present)) return;
+    if (!(pdpt->entries[pdpti] & LargePage)) {
+        if (!clone_table_if_needed(pdpt->entries[pdpti])) return;
+    }
+    if (pdpt->entries[pdpti] & LargePage) {
+        if (!splitLargePdptEntry(pdpt, pdpti)) return;
+    }
     auto* pd = reinterpret_cast<PageTable*>(pdpt->entries[pdpti] & ADDR_MASK);
 
     uint64_t pdi = PDIndex(virtualAddr);
     if (!(pd->entries[pdi] & Present)) return;
+    if (!(pd->entries[pdi] & LargePage)) {
+        if (!clone_table_if_needed(pd->entries[pdi])) return;
+    }
+    if (pd->entries[pdi] & LargePage) {
+        if (!splitLargePdEntry(pd, pdi)) return;
+    }
     auto* pt = reinterpret_cast<PageTable*>(pd->entries[pdi] & ADDR_MASK);
 
     uint64_t pti = PTIndex(virtualAddr);
@@ -268,15 +399,51 @@ void VMM::UnmapRangeFrom(PageTable* pml4, uint64_t virtualBase, uint64_t pageCou
     }
 }
 
+void VMM::FreeAddressSpace(PageTable* pml4) {
+    if (!pml4) return;
+
+    for (int i = 0; i < 256; i++) {
+        if (pml4->entries[i] & Present) {
+            auto* pdpt = reinterpret_cast<PageTable*>(pml4->entries[i] & ADDR_MASK);
+            for (int j = 0; j < 512; j++) {
+                if (pdpt->entries[j] & Present) {
+                    if (pdpt->entries[j] & LargePage) {
+                        // 1GB large page
+                        PMM::FreeFrames(pdpt->entries[j] & ADDR_MASK, 512 * 512);
+                    } else {
+                        auto* pd = reinterpret_cast<PageTable*>(pdpt->entries[j] & ADDR_MASK);
+                        for (int k = 0; k < 512; k++) {
+                            if (pd->entries[k] & Present) {
+                                if (pd->entries[k] & LargePage) {
+                                    // 2MB large page
+                                    PMM::FreeFrames(pd->entries[k] & ADDR_MASK, 512);
+                                } else {
+                                    auto* pt = reinterpret_cast<PageTable*>(pd->entries[k] & ADDR_MASK);
+                                    for (int l = 0; l < 512; l++) {
+                                        if (pt->entries[l] & Present) {
+                                            PMM::FreeFrame(pt->entries[l] & ADDR_MASK);
+                                        }
+                                    }
+                                    PMM::FreeFrame(reinterpret_cast<uint64_t>(pt));
+                                }
+                            }
+                        }
+                        PMM::FreeFrame(reinterpret_cast<uint64_t>(pd));
+                    }
+                }
+            }
+            PMM::FreeFrame(reinterpret_cast<uint64_t>(pdpt));
+        }
+    }
+    PMM::FreeFrame(reinterpret_cast<uint64_t>(pml4));
+}
+
 void VMM::SetAddressSpace(PageTable* pml4) {
     if (!pml4) {
         // Don't switch to null page table!
         return;
     }
-    uint64_t phys = VirtualToPhysical(reinterpret_cast<uint64_t>(pml4));
-    if (!phys) {
-        phys = reinterpret_cast<uint64_t>(pml4);
-    }
+    uint64_t phys = reinterpret_cast<uint64_t>(pml4) & ADDR_MASK;
     asm volatile("mov %0, %%cr3" : : "r"(phys) : "memory");
 }
 

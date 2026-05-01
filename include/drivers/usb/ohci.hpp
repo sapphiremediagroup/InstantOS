@@ -8,12 +8,18 @@ public:
 
     void initialize();
     void poll();
+    bool isInitialized() const { return initialized; }
+    bool hasController() const { return controllerReady; }
+    bool isXhciActive() const { return xhciActive; }
+    bool hasKeyboard() const;
+    bool hasMouse() const;
 
 private:
     USBInput() = default;
 
     bool initialized = false;
     bool controllerReady = false;
+    bool xhciActive = false;
     bool keyboardReady = false;
     bool interruptPending = false;
 
@@ -42,4 +48,6 @@ private:
     bool enumerateDevice(uint8_t port, bool lowSpeed);
     void submitInterruptTransfer();
     void completeInterruptTransfer();
+
+    volatile bool polling_lock = false;
 };

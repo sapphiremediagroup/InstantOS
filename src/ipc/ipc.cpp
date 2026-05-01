@@ -435,7 +435,10 @@ void MessageQueueObject::release() {
 }
 
 bool MessageQueueObject::enqueue(const IPCMessageHeader& header, const void* payload) {
+    while (__atomic_test_and_set(&lock_flag, __ATOMIC_ACQUIRE)) { asm volatile("pause"); }
+
     if (count >= MaxMessages || header.size > MaxPayloadSize) {
+        __atomic_clear(&lock_flag, __ATOMIC_RELEASE);
         return false;
     }
 
@@ -445,17 +448,24 @@ bool MessageQueueObject::enqueue(const IPCMessageHeader& header, const void* pay
         memcpy(messages[slot].payload, payload, static_cast<size_t>(header.size));
     }
     count++;
+
+    __atomic_clear(&lock_flag, __ATOMIC_RELEASE);
     return true;
 }
 
 bool MessageQueueObject::dequeue(Message* outMessage) {
+    while (__atomic_test_and_set(&lock_flag, __ATOMIC_ACQUIRE)) { asm volatile("pause"); }
+
     if (!outMessage || count == 0) {
+        __atomic_clear(&lock_flag, __ATOMIC_RELEASE);
         return false;
     }
 
     *outMessage = messages[head];
     head = (head + 1) % MaxMessages;
     count--;
+
+    __atomic_clear(&lock_flag, __ATOMIC_RELEASE);
     return true;
 }
 

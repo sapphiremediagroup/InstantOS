@@ -167,6 +167,9 @@ private:
     int portNum;
     bool active;
     uint64_t sectorCount;
+    HBACmdHeader* commandList;
+    void* fisBuffer;
+    HBACmdTbl* commandTables[32];
 
     void startCmd();
     void stopCmd();

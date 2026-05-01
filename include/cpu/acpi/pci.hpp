@@ -15,6 +15,8 @@ public:
     void writeConfig16(uint16_t segment, uint8_t bus, uint8_t device, uint8_t function, uint16_t offset, uint16_t value);
     void writeConfig32(uint16_t segment, uint8_t bus, uint8_t device, uint8_t function, uint16_t offset, uint32_t value);
 
+    bool registerMSIInterrupt(uint16_t segment, uint8_t bus, uint8_t device, uint8_t function,
+                              Interrupt* handler, uint8_t* outVector = nullptr);
     bool registerLegacyInterrupt(uint16_t segment, uint8_t bus, uint8_t device, uint8_t function,
                                  Interrupt* handler, uint8_t* outIrq = nullptr, uint8_t* outVector = nullptr);
     
@@ -25,4 +27,5 @@ private:
     static constexpr uint16_t CONFIG_DATA = 0xCFC;
     
     uint32_t makeAddress(uint8_t bus, uint8_t device, uint8_t function, uint16_t offset);
+    uint16_t findCapability(uint16_t segment, uint8_t bus, uint8_t device, uint8_t function, uint8_t capabilityId);
 };

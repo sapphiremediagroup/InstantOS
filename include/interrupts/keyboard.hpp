@@ -21,7 +21,10 @@ public:
         shiftPressed = false;
         ctrlPressed = false;
         altPressed = false;
+        superPressed = false;
         capsLock = false;
+        keyboardPresent = false;
+        extendedPrefix = false;
         bufferHead = 0;
         bufferTail = 0;
 
@@ -52,6 +55,7 @@ public:
         if (resetAck == kDeviceAck) {
             const uint8_t resetBat = readDataWithTimeout();
             writeStatus("[kbd:init] reset-bat=", resetBat);
+            keyboardPresent = resetBat == kKeyboardBatOk;
         }
 
         const uint8_t scanSetCommandAck = sendDeviceCommand(0xF0);
@@ -59,10 +63,12 @@ public:
         if (scanSetCommandAck == kDeviceAck) {
             const uint8_t scanSetAck = sendDeviceCommand(0x02);
             writeStatus("[kbd:init] scan-set-2=", scanSetAck);
+            keyboardPresent = keyboardPresent || scanSetAck == kDeviceAck;
         }
 
         const uint8_t scanAck = sendDeviceCommand(0xF4);
         writeStatus("[kbd:init] scan-ack=", scanAck);
+        keyboardPresent = keyboardPresent || scanAck == kDeviceAck;
 
         waitForInputReady();
         outb(kCommandPort, 0xA8);
@@ -107,7 +113,14 @@ public:
 
     void Run(InterruptFrame* frame) override {
         (void)frame;
+        if (__atomic_test_and_set(&polling_lock, __ATOMIC_ACQUIRE)) {
+            sendEOI();
+            return;
+        }
+
         const bool handled = drainController(true);
+
+        __atomic_clear(&polling_lock, __ATOMIC_RELEASE);
 
         sendEOI();
 
@@ -135,6 +148,10 @@ public:
     }
 
     void servicePendingInput() {
+        if (__atomic_test_and_set(&polling_lock, __ATOMIC_ACQUIRE)) {
+            return;
+        }
+
         drainController(false);
         while (hasPendingControllerData()) {
             if (!drainController(false)) {
@@ -147,6 +164,8 @@ public:
                 break;
             }
         }
+
+        __atomic_clear(&polling_lock, __ATOMIC_RELEASE);
     }
 
     bool drainController(bool traceIrq = false) {
@@ -178,6 +197,10 @@ public:
     }
 
     bool injectChar(char c, const char* prefix = "[kbd:serial]") {
+        return injectKey(c, KeyModifierNone, prefix);
+    }
+
+    bool injectKey(char c, uint16_t modifiers, const char* prefix = "[kbd:serial]") {
         if (c == 0) {
             return false;
         }
@@ -186,8 +209,9 @@ public:
             c = '\n';
         }
 
-        const Event event = makeKeyEvent(c, KeyModifierNone);
+        const Event event = makeKeyEvent(c, modifiers);
         const bool windowPosted = IPCManager::get().postKeyEventToFocusedWindow(event);
+        IPCManager::get().postServiceEvent("graphics.compositor", &event, sizeof(event));
         const bool inputPosted = postInputManagerEvent(event);
         const bool buffered = appendToBuffer(c, prefix);
         if (kTraceInputHotPath) {
@@ -204,6 +228,65 @@ public:
         }
         Scheduler::get().wakeAllBlockedProcesses();
         return true;
+    }
+
+    void injectPointerDelta(uint8_t buttons, int8_t dx, int8_t dy, int8_t wheel = 0, const char* prefix = "[mouse]") {
+        const int32_t rawDx = static_cast<int32_t>(dx);
+        const int32_t rawDy = static_cast<int32_t>(dy);
+        if (absMouseDelta(rawDx) > kMouseMaxRawDelta || absMouseDelta(rawDy) > kMouseMaxRawDelta) {
+            return;
+        }
+
+        const int32_t scaledDx = scaleMouseDelta(rawDx);
+        const int32_t scaledDy = scaleMouseDelta(rawDy);
+
+        iFramebuffer* framebuffer = Console::get().getFramebuffer();
+        int32_t maxX = framebuffer ? static_cast<int32_t>(framebuffer->getWidth()) - 1 : 1023;
+        int32_t maxY = framebuffer ? static_cast<int32_t>(framebuffer->getHeight()) - 1 : 767;
+        if (maxX < 0) maxX = 0;
+        if (maxY < 0) maxY = 0;
+
+        mouseX += scaledDx;
+        mouseY -= scaledDy;
+        if (mouseX < 0) mouseX = 0;
+        if (mouseY < 0) mouseY = 0;
+        if (mouseX > maxX) mouseX = maxX;
+        if (mouseY > maxY) mouseY = maxY;
+
+        Event event = {};
+        event.type = EventType::Pointer;
+        event.pointer.buttons = static_cast<uint16_t>(buttons & 0x07);
+        event.pointer.x = mouseX;
+        event.pointer.y = mouseY;
+        event.pointer.deltaX = scaledDx;
+        event.pointer.deltaY = -scaledDy;
+        event.pointer.action = (event.pointer.buttons != mouseButtons) ? PointerEventAction::Button : PointerEventAction::Move;
+        mouseButtons = event.pointer.buttons;
+
+        IPCManager::get().postServiceEvent("graphics.compositor", &event, sizeof(event));
+        postInputManagerEvent(event);
+
+        if (wheel != 0) {
+            Event scroll = {};
+            scroll.type = EventType::Pointer;
+            scroll.pointer.buttons = mouseButtons;
+            scroll.pointer.x = mouseX;
+            scroll.pointer.y = mouseY;
+            scroll.pointer.deltaY = static_cast<int32_t>(wheel);
+            scroll.pointer.action = PointerEventAction::Scroll;
+            IPCManager::get().postServiceEvent("graphics.compositor", &scroll, sizeof(scroll));
+            postInputManagerEvent(scroll);
+        }
+
+        if (kTraceInputHotPath) {
+            Cereal::get().write(prefix);
+            Cereal::get().write(" pointer dx=");
+            writeDec(scaledDx);
+            Cereal::get().write(" dy=");
+            writeDec(-scaledDy);
+            Cereal::get().write("\n");
+        }
+        Scheduler::get().wakeAllBlockedProcesses();
     }
 
     void publishBufferedInputToInputManager() {
@@ -240,6 +323,10 @@ public:
         static Keyboard instance;
         return instance;
     }
+
+    bool isInitialized() const { return initialized; }
+    bool isKeyboardPresent() const { return keyboardPresent; }
+    bool isMouseEnabled() const { return mouseEnabled; }
     
 private:
     static constexpr uint16_t kDataPort = 0x60;
@@ -443,11 +530,30 @@ private:
             return;
         }
 
+        if (scancode == 0xE0) {
+            extendedPrefix = true;
+            return;
+        }
+
+        const bool extended = extendedPrefix;
+        extendedPrefix = false;
+
         if (scancode & 0x80) {
             scancode &= 0x7F;
-            if (scancode == 0x2A || scancode == 0x36) shiftPressed = false;
+            if (extended) {
+                if (scancode == 0x5B || scancode == 0x5C) {
+                    superPressed = false;
+                }
+            } else if (scancode == 0x2A || scancode == 0x36) shiftPressed = false;
             else if (scancode == 0x1D) ctrlPressed = false;
             else if (scancode == 0x38) altPressed = false;
+            return;
+        }
+
+        if (extended) {
+            if (scancode == 0x5B || scancode == 0x5C) {
+                superPressed = true;
+            }
             return;
         }
 
@@ -463,8 +569,10 @@ private:
                 if (ctrlPressed) modifiers |= KeyModifierControl;
                 if (altPressed) modifiers |= KeyModifierAlt;
                 if (capsLock) modifiers |= KeyModifierCapsLock;
+                if (superPressed) modifiers |= KeyModifierSuper;
                 Event event = makeKeyEvent(c, modifiers);
                 const bool windowPosted = IPCManager::get().postKeyEventToFocusedWindow(event);
+                IPCManager::get().postServiceEvent("graphics.compositor", &event, sizeof(event));
                 const bool inputPosted = postInputManagerEvent(event);
                 if (kTraceInputHotPath) {
                     Cereal::get().write(prefix);
@@ -570,8 +678,8 @@ private:
     bool postInputManagerEvent(const Event& event) {
         const bool posted = IPCManager::get().postServiceEvent("input.manager", &event, sizeof(event));
         if (!posted) {
-            Cereal::get().write("[kbd] input.manager post failed keycode=");
-            writeHex(static_cast<uint8_t>(event.key.keycode & 0xFF));
+            Cereal::get().write("[kbd] input.manager post failed type=");
+            writeDec(static_cast<int>(event.type));
             Cereal::get().write("\n");
         }
         return posted;
@@ -644,14 +752,18 @@ private:
     volatile int bufferTail = 0;
     
     bool initialized = false;
+    bool keyboardPresent = false;
     bool shiftPressed;
     bool ctrlPressed;
     bool altPressed;
+    bool superPressed;
     bool capsLock;
+    bool extendedPrefix;
     uint8_t mousePacket[3] = {0, 0, 0};
     int mousePacketIndex = 0;
     int32_t mouseX = 0;
     int32_t mouseY = 0;
     uint16_t mouseButtons = 0;
     bool mouseEnabled = false;
+    volatile bool polling_lock = false;
 };

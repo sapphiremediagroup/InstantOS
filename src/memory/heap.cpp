@@ -324,6 +324,18 @@ HeapStats heap_stats() {
     return s;
 }
 
+bool heap_is_initialized() {
+    return heap_base_addr != 0 && heap_total_size != 0;
+}
+
+uintptr_t heap_base() {
+    return heap_base_addr;
+}
+
+size_t heap_size() {
+    return heap_total_size;
+}
+
 void* operator new(size_t size) {
     return kmalloc(size);
 }

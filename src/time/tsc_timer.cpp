@@ -24,6 +24,10 @@ enum class TimerBackend {
 };
 
 TimerBackend timerBackend = TimerBackend::TscDeadline;
+uint64_t timer_tick_hz = 1000;
+uint64_t timer_tick_divisor = 0;
+uint64_t boot_tsc = 0;
+uint64_t next_tsc_deadline = 0;
 
 uint32_t cpuid_max_basic_leaf() {
     uint32_t eax = 0;
@@ -78,25 +82,8 @@ uint64_t lapic_calibrate_tsc_frequency() {
 
     return end_tsc - start_tsc;
 }
-}
 
-volatile uint64_t uptime_ticks = 0;
-volatile uint64_t uptime_ms = 0;
-
-uint64_t tsc_frequency = 0;
-uint64_t cycles_per_ms = 0;
-uint64_t cycles_per_us = 0;
-
-bool cpu_has_tsc_deadline() {
-    uint32_t eax = 1;
-    uint32_t ebx = 0;
-    uint32_t ecx = 0;
-    uint32_t edx = 0;
-    cpuid(&eax, &ebx, &ecx, &edx);
-    return (ecx & (1U << 24)) != 0;
-}
-
-uint64_t detect_tsc_frequency() {
+uint64_t cpuid_tsc_frequency_candidate() {
     const uint32_t max_leaf = cpuid_max_basic_leaf();
     uint32_t eax = 0;
     uint32_t ebx = 0;
@@ -120,11 +107,59 @@ uint64_t detect_tsc_frequency() {
         }
     }
 
-    return lapic_calibrate_tsc_frequency();
+    return 0;
+}
+
+uint64_t choose_tsc_frequency(uint64_t cpuidFrequency, uint64_t calibratedFrequency) {
+    if (cpuidFrequency == 0) {
+        return calibratedFrequency;
+    }
+    if (calibratedFrequency == 0) {
+        return cpuidFrequency;
+    }
+
+    const uint64_t larger = cpuidFrequency > calibratedFrequency ? cpuidFrequency : calibratedFrequency;
+    const uint64_t smaller = cpuidFrequency > calibratedFrequency ? calibratedFrequency : cpuidFrequency;
+    const uint64_t diff = larger - smaller;
+
+    // Trust CPUID only when it is close to the measured RTC calibration.
+    if (diff <= (calibratedFrequency / 20ULL)) {
+        return cpuidFrequency;
+    }
+
+    return calibratedFrequency;
+}
+}
+
+volatile uint64_t uptime_ticks = 0;
+volatile uint64_t uptime_ms = 0;
+
+uint64_t tsc_frequency = 0;
+uint64_t cycles_per_ms = 0;
+uint64_t cycles_per_us = 0;
+
+bool cpu_has_tsc_deadline() {
+    uint32_t eax = 1;
+    uint32_t ebx = 0;
+    uint32_t ecx = 0;
+    uint32_t edx = 0;
+    cpuid(&eax, &ebx, &ecx, &edx);
+    return (ecx & (1U << 24)) != 0;
+}
+
+uint64_t detect_tsc_frequency() {
+    const uint64_t cpuidFrequency = cpuid_tsc_frequency_candidate();
+    const uint64_t calibratedFrequency = lapic_calibrate_tsc_frequency();
+    return choose_tsc_frequency(cpuidFrequency, calibratedFrequency);
 }
 
 void lapic_enable_tsc_deadline_mode() {
     wrmsr(kMsrTscDeadline, 0);
+    timerBackend = TimerBackend::TscDeadline;
+    timer_tick_hz = 1000;
+    timer_tick_divisor = 0;
+    boot_tsc = rdtsc();
+    next_tsc_deadline = 0;
     LAPIC::get().write(LAPIC_TIMER, VECTOR_TIMER | kLapicTimerDeadlineMode);
 }
 
@@ -137,7 +172,18 @@ void timer_schedule_next_tick() {
         return;
     }
 
-    tsc_deadline_set(rdtsc() + cycles_per_ms);
+    const uint64_t now = rdtsc();
+    if (next_tsc_deadline == 0) {
+        next_tsc_deadline = now + cycles_per_ms;
+    } else {
+        next_tsc_deadline += cycles_per_ms;
+        if (next_tsc_deadline <= now) {
+            const uint64_t ticksBehind = ((now - next_tsc_deadline) / cycles_per_ms) + 1ULL;
+            next_tsc_deadline += ticksBehind * cycles_per_ms;
+        }
+    }
+
+    tsc_deadline_set(next_tsc_deadline);
 }
 
 void pit_enable_timer_mode(uint32_t frequency_hz) {
@@ -153,6 +199,13 @@ void pit_enable_timer_mode(uint32_t frequency_hz) {
     }
 
     timerBackend = TimerBackend::Pit;
+    timer_tick_divisor = divisor;
+    timer_tick_hz = kPitBaseFrequency / divisor;
+    if (timer_tick_hz == 0) {
+        timer_tick_hz = 18;
+    }
+    boot_tsc = 0;
+    next_tsc_deadline = 0;
     outb(kPitCommand, 0x36);
     outb(kPitChannel0, static_cast<uint8_t>(divisor & 0xFF));
     outb(kPitChannel0, static_cast<uint8_t>((divisor >> 8) & 0xFF));
@@ -160,7 +213,18 @@ void pit_enable_timer_mode(uint32_t frequency_hz) {
 
 void timer_interrupt_handler() {
     uptime_ticks = uptime_ticks + 1;
-    uptime_ms = uptime_ms + 1;
+    if (timerBackend == TimerBackend::TscDeadline && boot_tsc != 0 && cycles_per_ms != 0) {
+        uptime_ms = (rdtsc() - boot_tsc) / cycles_per_ms;
+    } else if (timer_tick_hz != 0) {
+        uptime_ms = (uptime_ticks * 1000ULL) / timer_tick_hz;
+    } else {
+        uptime_ms = uptime_ticks;
+    }
+
+    USBInput::get().poll();
+    Keyboard::get().servicePendingInput();
+
+    Scheduler::get().wakeExpiredSleepers(uptime_ms);
 
     if (timerBackend == TimerBackend::TscDeadline) {
         timer_schedule_next_tick();
@@ -174,6 +238,14 @@ uint64_t time_get_uptime_ticks() {
 }
 
 uint64_t time_get_uptime_ms() {
+    if (timerBackend == TimerBackend::TscDeadline && boot_tsc != 0 && cycles_per_ms != 0) {
+        return (rdtsc() - boot_tsc) / cycles_per_ms;
+    }
+
+    if (timer_tick_hz != 0) {
+        return (uptime_ticks * 1000ULL) / timer_tick_hz;
+    }
+
     return uptime_ms;
 }
 
@@ -183,8 +255,6 @@ void Timer::initialize() {
 void Timer::Run(InterruptFrame* frame) {
     timer_interrupt_handler();
 
-    USBInput::get().poll();
-    Keyboard::get().servicePendingInput();
 
     Process* current = Scheduler::get().getCurrentProcess();
     const bool interruptedUser = frame && frame->cs == kUserCodeSelector;

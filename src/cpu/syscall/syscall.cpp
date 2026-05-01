@@ -6,7 +6,7 @@
 #include <debug/diag.hpp>
 #include <memory/vmm.hpp>
 #include <common/ports.hpp>
-#include <cpuid.h>
+#include <cpu/cpuid.hpp>
 extern "C" void atexit(){
     return;
 }
@@ -275,6 +275,24 @@ uint64_t Syscall::handle(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
             return sys_thread_join(arg1, arg2);
         case Seek:
             return sys_seek(arg1, arg2, arg3);
+        case GPUCapsetInfo:
+            return sys_gpu_capset_info(arg1);
+        case GPUCapset:
+            return sys_gpu_capset(arg1);
+        case GPUContextCreate:
+            return sys_gpu_context_create(arg1);
+        case GPUContextDestroy:
+            return sys_gpu_context_destroy(arg1);
+        case GPUResourceCreate3D:
+            return sys_gpu_resource_create_3d(arg1);
+        case GPUResourceDestroy:
+            return sys_gpu_resource_destroy(arg1);
+        case GPUResourceAssignUUID:
+            return sys_gpu_resource_assign_uuid(arg1);
+        case GPUSubmit3D:
+            return sys_gpu_submit_3d(arg1);
+        case GPUWaitFence:
+            return sys_gpu_wait_fence(arg1);
         default:
             return (uint64_t)-1;
     }
@@ -372,8 +390,18 @@ bool Syscall::copyUserString(uint64_t ptr, char* dest, size_t destSize) {
 
 extern "C" uint64_t syscallHandler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t arg4, uint64_t arg5) {
     Process* current = Scheduler::get().getCurrentProcess();
+    
+    if (current && current->userFpuState) {
+        CPU::saveExtendedState(current->userFpuState);
+    }
+
     Debug::beginSyscallTrace(current, syscall_num, arg1, arg2, arg3, arg4, arg5);
     uint64_t result = Syscall::get().handle(syscall_num, arg1, arg2, arg3, arg4, arg5);
     Debug::endSyscallTrace(current);
+
+    if (current && current->userFpuState) {
+        CPU::restoreExtendedState(current->userFpuState);
+    }
+
     return result;
 }

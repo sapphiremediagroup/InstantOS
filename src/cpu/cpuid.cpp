@@ -407,6 +407,11 @@ bool CPU::initialize() {
         features.avxEnabled = (readXcr0() & XCR0_AVX) != 0;
         features.avx512Enabled = (readXcr0() & (XCR0_OPMASK | XCR0_ZMM_HI256 | XCR0_HI16_ZMM)) ==
                                   (XCR0_OPMASK | XCR0_ZMM_HI256 | XCR0_HI16_ZMM);
+
+        uint32_t eax, ebx, ecx, edx;
+        __cpuid_count(0x0D, 0, eax, ebx, ecx, edx);
+        Console::get().drawText(", XSAVE size: ");
+        Console::get().drawNumber(ebx);
     }
 
     if (features.smep) {

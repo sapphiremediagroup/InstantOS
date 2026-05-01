@@ -55,6 +55,20 @@ Boot the generated image in QEMU with:
 
 `run.sh` creates `build/ahci.img` on first run and copies `OVMF_VARS.4m.fd` into `build/` if needed.
 
+USB input modes are selected with `USB_MODE`:
+
+```bash
+USB_MODE=xhci ./run.sh   # qemu-xhci with USB keyboard and mouse
+USB_MODE=ohci ./run.sh   # OHCI regression path with USB keyboard
+USB_MODE=none ./run.sh   # no emulated USB controller
+```
+
+For headless smoke testing without KVM:
+
+```bash
+QEMU_ACCEL=tcg QEMU_DISPLAY=none USB_MODE=xhci ./run.sh
+```
+
 ## build and run
 If you want the full workflow in one command, use:
 

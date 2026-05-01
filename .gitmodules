@@ -1,6 +1,6 @@
 [submodule "outside/iUserApps"]
 	path = outside/iUserApps
-	url = https://github.com/ZincPlatforms/iUserApps
+	url = https://github.com/sapphiremediagroup/iUserApps
 [submodule "outside/iboot"]
 	path = outside/iboot
-	url = https://github.com/ZincPlatforms/iboot
+	url = https://github.com/sapphiremediagroup/iboot

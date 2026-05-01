@@ -12,7 +12,7 @@
 extern "C" void enterUsermode(uint64_t entry, uint64_t stack);
 
 constexpr uint64_t USER_STACK_TOP = 0x00007FFFFFFFE000;
-constexpr size_t USER_STACK_PAGES = 4;
+constexpr size_t USER_STACK_PAGES = 32;
 
 struct ProcessSharedState {
     PageTable* pageTable;
@@ -49,7 +49,7 @@ void releaseSharedState(ProcessSharedState* state) {
 
     state->handleTable.closeAll();
     if (state->pageTable) {
-        PMM::FreeFrame(reinterpret_cast<uint64_t>(state->pageTable));
+        VMM::FreeAddressSpace(state->pageTable);
     }
     delete state;
 }
@@ -105,7 +105,8 @@ bool initializeAddressSpace(ProcessSharedState* state) {
 Process::Process(uint32_t pid)
     : sharedState(nullptr), sessionID(0), uid(0), gid(0), pid(pid), parentPID(0), exitCode(0),
       state(ProcessState::Ready), priority(ProcessPriority::Normal), kernelStack(0), userStack(0),
-      userStackBase(0), userStackSize(0), fpuState(nullptr), validUserState(false), savedUserRSP(0),
+      userStackBase(0), userStackSize(0), fpuState(nullptr), userFpuState(nullptr), validUserState(false), savedUserRSP(0),
+      sleepDeadlineMs(0), sleeping(false),
       threadObject(nullptr) {
     next = nullptr;
     allNext = nullptr;
@@ -150,6 +151,13 @@ Process::Process(uint32_t pid)
     void* fpuPhys = kmalloc_aligned(sizeof(FPUState), 64);
     if (fpuPhys) {
         fpuState = reinterpret_cast<FPUState*>(fpuPhys);
+        CPU::initializeExtendedState(fpuState);
+    }
+
+    void* userFpuPhys = kmalloc_aligned(sizeof(FPUState), 64);
+    if (userFpuPhys) {
+        userFpuState = reinterpret_cast<FPUState*>(userFpuPhys);
+        CPU::initializeExtendedState(userFpuState);
     }
 
     context.rax = 0;
@@ -171,11 +179,7 @@ Process::Process(uint32_t pid)
     context.rip = 0;
     context.rflags = 0x202;
 
-    uint64_t pageTablePhys = VMM::VirtualToPhysical(reinterpret_cast<uint64_t>(sharedState->pageTable));
-    if (!pageTablePhys) {
-        pageTablePhys = reinterpret_cast<uint64_t>(sharedState->pageTable);
-    }
-    context.cr3 = pageTablePhys;
+    context.cr3 = reinterpret_cast<uint64_t>(sharedState->pageTable) & ADDR_MASK;
     context.xstate = reinterpret_cast<uint64_t>(fpuState);
 
     if (fpuState) {
@@ -187,6 +191,7 @@ Process::Process(uint32_t pid, Process* sharedFrom, uint64_t stackSize)
     : sharedState(nullptr), sessionID(0), uid(0), gid(0), pid(pid), parentPID(0), exitCode(0),
       state(ProcessState::Ready), priority(ProcessPriority::Normal), kernelStack(0), userStack(0),
       userStackBase(0), userStackSize(0), fpuState(nullptr), validUserState(false), savedUserRSP(0),
+      sleepDeadlineMs(0), sleeping(false),
       threadObject(nullptr) {
     next = nullptr;
     allNext = nullptr;
@@ -287,6 +292,10 @@ Process::~Process() {
 
     if (fpuState) {
         kfree(fpuState);
+    }
+
+    if (userFpuState) {
+        kfree(userFpuState);
     }
 
     releaseSharedState(sharedState);

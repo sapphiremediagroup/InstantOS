@@ -14,6 +14,7 @@ private:
     int writeLock;
     Pair<uint64_t, uint64_t> savedCursorPointer { 0, 0 };
     bool useVirtIO;
+    bool copyScrollEnabled;
     
     enum class AnsiState {
         NORMAL,
@@ -119,6 +120,7 @@ public:
     void setTextColor(Color color);
     void setBackgroundColor(Color color);
     void setVirtIO(bool enabled) { useVirtIO = enabled; }
+    void setCopyScrollEnabled(bool enabled) { copyScrollEnabled = enabled; }
     iFramebuffer* getFramebuffer() { return framebuffer; }
 
     template<typename... Args>

@@ -29,6 +29,7 @@ public:
 
     static void MapPage(uint64_t virtualAddr, uint64_t physAddr, uint64_t flags);
     static void UnmapPage(uint64_t virtualAddr);
+    static void FreeAddressSpace(PageTable* pml4);
 
     static uint64_t VirtualToPhysical(uint64_t virtualAddr);
     static uint64_t VirtualToPhysicalIn(PageTable* pml4, uint64_t virtualAddr);

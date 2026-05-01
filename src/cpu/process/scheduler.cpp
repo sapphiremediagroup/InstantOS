@@ -8,6 +8,7 @@
 #include <cpu/percpu.hpp>
 #include <cpu/cereal/cereal.hpp>
 #include <common/ports.hpp>
+#include <time/tsc_timer.hpp>
 
 namespace {
 constexpr uint64_t kUserCodeSelector = 0x23;
@@ -50,6 +51,18 @@ uint64_t readCR3() {
     uint64_t cr3 = 0;
     asm volatile("mov %%cr3, %0" : "=r"(cr3));
     return cr3;
+}
+
+uint64_t processCR3(Process* process) {
+    if (!process) {
+        return 0;
+    }
+
+    if (PageTable* pageTable = process->getPageTable()) {
+        return reinterpret_cast<uint64_t>(pageTable) & ADDR_MASK;
+    }
+
+    return process->getContext()->cr3 & ADDR_MASK;
 }
 
 void prepareInterruptReturnToUser(InterruptFrame* frame) {
@@ -153,12 +166,11 @@ void Scheduler::initialize() {
     // Create idle process
     idleProcess = new Process(0);
     idleProcess->setName("<idle>");
-    uint64_t pml4Phys = VMM::VirtualToPhysical(reinterpret_cast<uint64_t>(VMM::GetKernelAddressSpace()));
-    if (!pml4Phys) pml4Phys = reinterpret_cast<uint64_t>(VMM::GetKernelAddressSpace());
-    idleProcess->getContext()->cr3 = pml4Phys;
+    idleProcess->getContext()->cr3 =
+        reinterpret_cast<uint64_t>(VMM::GetKernelAddressSpace()) & ADDR_MASK;
     idleProcess->setPriority(ProcessPriority::Idle);
     idleProcess->getContext()->rip = reinterpret_cast<uint64_t>(idleLoop);
-    idleProcess->getContext()->rsp = idleProcess->getKernelStack();
+    idleProcess->getContext()->rsp = idleProcess->getKernelStack() - 8;
     idleProcess->getContext()->rflags = 0x202; // IF enabled
     idleProcess->setState(ProcessState::Ready);
     
@@ -337,6 +349,7 @@ void Scheduler::schedule() {
     Process* oldProcess = currentProcess;
     currentProcess = nextProcess;
     currentProcess->setState(ProcessState::Running);
+    currentProcess->getContext()->cr3 = processCR3(currentProcess);
     
     // If it's a regular process, it's already removed from the ready queue head by getNextProcess
     // or specifically handled by round-robin logic there.
@@ -352,11 +365,21 @@ void Scheduler::schedule() {
     asm volatile("cli");
     
     if (oldProcess) {
+        if (oldProcess->getFPUState()) {
+            CPU::saveExtendedState(oldProcess->getFPUState());
+        }
+        if (nextProcess->getFPUState()) {
+            CPU::restoreExtendedState(nextProcess->getFPUState());
+        }
+        oldProcess->getContext()->cr3 = processCR3(oldProcess);
         oldProcess->setValidUserState(false);
         oldProcess->setSavedUserRSP(getPerCPU()->userRSP);
         switchContext(oldProcess->getContext(), nextProcess->getContext());
         getPerCPU()->userRSP = currentProcess->getSavedUserRSP();
     } else {
+        if (nextProcess->getFPUState()) {
+            CPU::restoreExtendedState(nextProcess->getFPUState());
+        }
         switchContext(nullptr, nextProcess->getContext());
     }
     if (oldProcess && oldProcess->getState() == ProcessState::Terminated) {
@@ -415,7 +438,11 @@ void Scheduler::schedule(InterruptFrame* frame) {
 
     // Brand-new tasks have no IRQ frame and no blocked-syscall context to
     // resume. They must still enter through the normal kernel switch path.
-    if (interruptedUser && !nextProcess->hasValidUserState() && !nextHasKernelResume) {
+    if (interruptedUser &&
+        oldProcess &&
+        oldProcess->getState() == ProcessState::Running &&
+        !nextProcess->hasValidUserState() &&
+        !nextHasKernelResume) {
         traceSwitchInvariant("irq-defer-kernel", oldProcess, nextProcess);
         if (oldProcess) {
             removeFromReadyQueue(oldProcess);
@@ -427,7 +454,11 @@ void Scheduler::schedule(InterruptFrame* frame) {
 
     // Brand-new processes start at processTrampoline and are expected to be
     // entered via the normal kernel context-switch path, not from an IRQ frame.
-    if (!nextProcess->hasValidUserState() && nextProcess->getSavedUserRSP() == 0) {
+    if (interruptedUser &&
+        oldProcess &&
+        oldProcess->getState() == ProcessState::Running &&
+        !nextProcess->hasValidUserState() &&
+        nextProcess->getSavedUserRSP() == 0) {
         traceSwitchInvariant("irq-defer-new", oldProcess, nextProcess);
         if (oldProcess) {
             removeFromReadyQueue(oldProcess);
@@ -443,6 +474,7 @@ void Scheduler::schedule(InterruptFrame* frame) {
     
     currentProcess = nextProcess;
     currentProcess->setState(ProcessState::Running);
+    currentProcess->getContext()->cr3 = processCR3(currentProcess);
 
     if (nextProcess->getFPUState()) {
         CPU::restoreExtendedState(nextProcess->getFPUState());
@@ -480,6 +512,7 @@ void Scheduler::schedule(InterruptFrame* frame) {
         asm volatile("cli");
         
         if (oldProcess) {
+            oldProcess->getContext()->cr3 = processCR3(oldProcess);
             oldProcess->setValidUserState(false);
             oldProcess->setSavedUserRSP(interruptedUser ? frame->rsp : getPerCPU()->userRSP);
             if (interruptedUser) {
@@ -511,13 +544,36 @@ void Scheduler::wakeProcess(Process* process) {
 
     if (process->getState() == ProcessState::Ready) {
         addToReadyQueueFront(process);
+    } else if (process->getState() == ProcessState::Blocked) {
+        process->clearSleep();
+        process->setState(ProcessState::Ready);
+        addToReadyQueueFront(process);
+    }
+}
+
+void Scheduler::wakeExpiredSleepers(uint64_t nowMs) {
+    Process* process = allProcessesHead;
+    while (process) {
+        if (process->getState() == ProcessState::Blocked && process->sleepDeadlineReached(nowMs)) {
+            process->clearSleep();
+            process->setState(ProcessState::Ready);
+            addToReadyQueueFront(process);
+        }
+        process = process->allNext;
     }
 }
 
 void Scheduler::wakeAllBlockedProcesses() {
+    const uint64_t nowMs = time_get_uptime_ms();
     Process* process = allProcessesHead;
     while (process) {
         if (process->getState() == ProcessState::Blocked) {
+            if (process->isSleeping() && !process->sleepDeadlineReached(nowMs)) {
+                process = process->allNext;
+                continue;
+            }
+
+            process->clearSleep();
             process->setState(ProcessState::Ready);
             addToReadyQueue(process);
         }

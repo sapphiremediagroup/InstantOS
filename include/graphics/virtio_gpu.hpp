@@ -76,9 +76,16 @@ constexpr uint32_t VIRTIO_GPU_MAX_SCANOUTS = 16;
 constexpr uint32_t VIRTIO_GPU_CONTEXT_NAME_MAX = 64;
 constexpr uint32_t VIRTIO_GPU_CAPSET_VIRGL = 1;
 constexpr uint32_t VIRTIO_GPU_CAPSET_VIRGL2 = 2;
+constexpr uint8_t VIRTIO_GPU_SHM_ID_HOST_VISIBLE = 1;
 
 constexpr uint32_t VIRTIO_GPU_CONTEXT_INIT_CAPSET_ID_MASK = 0x000000FFU;
 constexpr uint32_t VIRTIO_GPU_RESOURCE_FLAG_Y_0_TOP = (1U << 0);
+constexpr uint32_t VIRTIO_GPU_BLOB_MEM_GUEST = 0x0001U;
+constexpr uint32_t VIRTIO_GPU_BLOB_MEM_HOST3D = 0x0002U;
+constexpr uint32_t VIRTIO_GPU_BLOB_MEM_HOST3D_GUEST = 0x0003U;
+constexpr uint32_t VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE = (1U << 0);
+constexpr uint32_t VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE = (1U << 1);
+constexpr uint32_t VIRTIO_GPU_BLOB_FLAG_USE_CROSS_DEVICE = (1U << 2);
 
 // VirtIO GPU command/response payloads are plain wire structs. Keep their
 // layout explicit and guard it with compile-time size assertions below.
@@ -186,6 +193,27 @@ struct alignas(8) VirtIOGPUResourceCreate3D {
     uint32_t padding;
 };
 
+struct alignas(8) VirtIOGPUResourceCreateBlob {
+    VirtIOGPUCtrlHdr hdr;
+    uint32_t resource_id;
+    uint32_t blob_mem;
+    uint32_t blob_flags;
+    uint32_t nr_entries;
+    uint64_t blob_id;
+    uint64_t size;
+};
+
+struct alignas(8) VirtIOGPUResourceAssignUUID {
+    VirtIOGPUCtrlHdr hdr;
+    uint32_t resource_id;
+    uint32_t padding;
+};
+
+struct alignas(8) VirtIOGPURespResourceUUID {
+    VirtIOGPUCtrlHdr hdr;
+    uint8_t uuid[16];
+};
+
 struct alignas(8) VirtIOGPUCtxCreate {
     VirtIOGPUCtrlHdr hdr;
     uint32_t nlen;
@@ -229,6 +257,38 @@ struct alignas(8) VirtIOGPUGetCapset {
     uint32_t capset_version;
 };
 
+struct alignas(8) VirtIOGPUResourceMapBlob {
+    VirtIOGPUCtrlHdr hdr;
+    uint32_t resource_id;
+    uint32_t padding;
+    uint64_t offset;
+};
+
+struct alignas(8) VirtIOGPURespMapInfo {
+    VirtIOGPUCtrlHdr hdr;
+    uint32_t map_info;
+    uint32_t padding;
+};
+
+struct alignas(8) VirtIOGPUResourceUnmapBlob {
+    VirtIOGPUCtrlHdr hdr;
+    uint32_t resource_id;
+    uint32_t padding;
+};
+
+struct alignas(8) VirtIOGPUSetScanoutBlob {
+    VirtIOGPUCtrlHdr hdr;
+    VirtIOGPURect r;
+    uint32_t scanout_id;
+    uint32_t resource_id;
+    uint32_t width;
+    uint32_t height;
+    uint32_t format;
+    uint32_t padding;
+    uint32_t strides[4];
+    uint32_t offsets[4];
+};
+
 struct alignas(4) VirtIOGPUConfig {
     uint32_t events_read;
     uint32_t events_clear;
@@ -258,6 +318,25 @@ struct VirtIOGPUCommandStatus {
     uint32_t usedLength;
 };
 
+struct VirtIOGPUVirglProbeResult {
+    bool capsetInfoOk;
+    bool capsetFetchOk;
+    bool contextCreateOk;
+    bool resourceCreateOk;
+    bool resourceAttachOk;
+    bool submitTransportOk;
+    bool submitResponseOk;
+    bool fenceCompleted;
+    uint32_t capsetId;
+    uint32_t capsetVersion;
+    uint32_t capsetSize;
+    uint32_t responseType;
+    uint64_t submittedFence;
+    uint64_t completedFence;
+    uint32_t resourceId;
+    uint32_t ctxId;
+};
+
 static_assert(sizeof(VirtIOGPURect) == 16, "VirtIOGPURect layout mismatch");
 static_assert(sizeof(VirtIOGPUCtrlHdr) == 24, "VirtIOGPUCtrlHdr layout mismatch");
 static_assert(offsetof(VirtIOGPUCtrlHdr, fence_id) == 8, "VirtIOGPUCtrlHdr fence_id offset mismatch");
@@ -274,6 +353,9 @@ static_assert(sizeof(VirtIOGPUResourceAttachBacking) == 32, "VirtIOGPUResourceAt
 static_assert(sizeof(VirtIOGPUBox) == 24, "VirtIOGPUBox layout mismatch");
 static_assert(sizeof(VirtIOGPUTransferHost3D) == 72, "VirtIOGPUTransferHost3D layout mismatch");
 static_assert(sizeof(VirtIOGPUResourceCreate3D) == 72, "VirtIOGPUResourceCreate3D layout mismatch");
+static_assert(sizeof(VirtIOGPUResourceCreateBlob) == 56, "VirtIOGPUResourceCreateBlob layout mismatch");
+static_assert(sizeof(VirtIOGPUResourceAssignUUID) == 32, "VirtIOGPUResourceAssignUUID layout mismatch");
+static_assert(sizeof(VirtIOGPURespResourceUUID) == 40, "VirtIOGPURespResourceUUID layout mismatch");
 static_assert(sizeof(VirtIOGPUCtxCreate) == 96, "VirtIOGPUCtxCreate layout mismatch");
 static_assert(sizeof(VirtIOGPUCtxDestroy) == 24, "VirtIOGPUCtxDestroy layout mismatch");
 static_assert(sizeof(VirtIOGPUCtxResource) == 32, "VirtIOGPUCtxResource layout mismatch");
@@ -281,12 +363,30 @@ static_assert(sizeof(VirtIOGPUCmdSubmit3D) == 32, "VirtIOGPUCmdSubmit3D layout m
 static_assert(sizeof(VirtIOGPUGetCapsetInfo) == 32, "VirtIOGPUGetCapsetInfo layout mismatch");
 static_assert(sizeof(VirtIOGPUCapsetInfo) == 40, "VirtIOGPUCapsetInfo layout mismatch");
 static_assert(sizeof(VirtIOGPUGetCapset) == 32, "VirtIOGPUGetCapset layout mismatch");
+static_assert(sizeof(VirtIOGPUResourceMapBlob) == 40, "VirtIOGPUResourceMapBlob layout mismatch");
+static_assert(sizeof(VirtIOGPURespMapInfo) == 32, "VirtIOGPURespMapInfo layout mismatch");
+static_assert(sizeof(VirtIOGPUResourceUnmapBlob) == 32, "VirtIOGPUResourceUnmapBlob layout mismatch");
+static_assert(sizeof(VirtIOGPUSetScanoutBlob) == 96, "VirtIOGPUSetScanoutBlob layout mismatch");
 static_assert(sizeof(VirtIOGPUConfig) == 16, "VirtIOGPUConfig layout mismatch");
 static_assert(sizeof(VirtIOGPUResourceDetachBacking) == 32, "VirtIOGPUResourceDetachBacking layout mismatch");
 static_assert(sizeof(VirtIOGPUResourceUnref) == 32, "VirtIOGPUResourceUnref layout mismatch");
 
 class VirtIOGPUDriver {
 public:
+    enum class ResourceBackingType : uint8_t {
+        None = 0,
+        GuestBacking,
+        BlobGuest,
+        BlobHost3D,
+        BlobHost3DGuest
+    };
+
+    enum class IRQMode : uint8_t {
+        None = 0,
+        LegacyINTx,
+        MSI
+    };
+
     static VirtIOGPUDriver& get();
     
     bool initialize();
@@ -295,8 +395,25 @@ public:
     bool supportsVirgl() const { return virglSupported; }
     bool supportsContextInit() const { return contextInitSupported; }
     bool supportsBlobResources() const { return resourceBlobSupported; }
+    bool supportsResourceUUID() const { return resourceUUIDSupported; }
+    bool isUsingBlobScanout() const { return blobScanoutActive; }
+    void setFallbackDisplayMode(uint32_t width, uint32_t height);
     uint32_t getNumCapsets() const { return numCapsets; }
     VirtIOGPUCommandStatus getLastCommandStatus() const { return lastCommandStatus; }
+    IRQMode getIRQMode() const { return irqMode; }
+    uint8_t getIRQLine() const { return pciIrqLine; }
+    uint8_t getIRQVector() const { return pciIrqVector; }
+    uint32_t getInterruptCount() const { return interruptCount; }
+    uint32_t getQueueInterruptCount() const { return queueInterruptCount; }
+    uint32_t getConfigInterruptCount() const { return configInterruptCount; }
+    uint64_t getLastSubmittedFence() const { return lastSubmittedFence; }
+    uint64_t getLastCompletedFence() const { return lastCompletedFence; }
+    uint64_t getLastResponseFence() const { return lastResponseFence; }
+    uint32_t getLastResponseType() const { return lastResponseType; }
+    static const char* describeControlType(uint32_t type);
+    static const char* describeResponseType(uint32_t type);
+    bool waitForFence(uint64_t fenceId, uint64_t spinLimit = 1000000ULL, uint64_t* completedFence = nullptr,
+                      uint32_t* responseType = nullptr);
     
     // Display info
     uint32_t getMaxWidth() const { return maxWidth; }
@@ -317,14 +434,28 @@ public:
     // VirGL / 3D transport plumbing
     bool getCapsetInfo(uint32_t capsetIndex, VirtIOGPUCapsetInfo* info);
     bool getCapset(uint32_t capsetId, uint32_t capsetVersion, void* buffer, uint32_t bufferSize, uint32_t* actualSize = nullptr);
-    bool createContext(uint32_t* ctxId, const char* debugName = nullptr, uint32_t contextInit = 0);
+    bool runVirglProbe(VirtIOGPUVirglProbeResult* result = nullptr);
+    bool createContext(uint32_t* ctxId, const char* debugName = nullptr, uint32_t contextInit = 0,
+                       uint8_t ringIdx = 0, bool useRingIdx = false);
+    bool createContextWithCapset(uint32_t* ctxId, uint32_t capsetId, const char* debugName = nullptr,
+                                 uint32_t contextInitFlags = 0, uint8_t ringIdx = 0, bool useRingIdx = false);
     bool destroyContext(uint32_t ctxId);
+    bool configureContextRing(uint32_t ctxId, uint8_t ringIdx, bool useRingIdx = true);
     bool attachResourceToContext(uint32_t ctxId, uint32_t resourceId);
     bool detachResourceFromContext(uint32_t ctxId, uint32_t resourceId);
     bool createResource3D(const VirtIOGPUResourceCreate3D& resource, uint32_t* outResourceId);
+    bool createBlobResource(const VirtIOGPUResourceCreateBlob& resource, uint32_t* outResourceId,
+                            uint64_t guestAddress = 0, uint32_t guestLength = 0);
+    bool assignResourceUUID(uint32_t resourceId, uint8_t outUUID[16]);
     bool destroyResource3D(uint32_t ctxId, uint32_t resourceId, bool hasBacking = false);
     bool destroyContextWithResource(uint32_t ctxId, uint32_t resourceId = 0, bool resourceHasBacking = false);
     bool attachBacking(uint32_t resourceId, uint64_t guestAddress, uint32_t length);
+    bool mapBlobResource(uint32_t resourceId, void** outPtr, uint64_t* outOffset = nullptr, uint32_t* outMapInfo = nullptr);
+    bool unmapBlobResource(uint32_t resourceId);
+    bool setScanoutBlob(const VirtIOGPUSetScanoutBlob& request);
+    bool allocateHostVisibleBlob(uint64_t size, uint32_t* outResourceId, void** outPtr,
+                                 uint64_t* outOffset = nullptr, uint32_t* outMapInfo = nullptr,
+                                 uint32_t blobFlags = VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE);
     bool transferToHost3D(uint32_t ctxId, uint32_t resourceId, const VirtIOGPUBox& box,
                           uint64_t offset, uint32_t level, uint32_t stride, uint32_t layerStride);
     bool transferFromHost3D(uint32_t ctxId, uint32_t resourceId, const VirtIOGPUBox& box,
@@ -334,9 +465,60 @@ public:
     bool unrefResource(uint32_t resourceId);
     uint32_t allocateResourceId();
     uint32_t allocateContextId();
+    bool claimPendingInterrupt();
     void handleInterrupt();
     
 private:
+    static constexpr size_t MaxTrackedResources = 64;
+    static constexpr size_t MaxTrackedContexts = 32;
+    static constexpr size_t MaxResourceContexts = 8;
+    static constexpr size_t MaxContextResources = 16;
+
+    struct FenceWaiter {
+        bool used;
+        bool completed;
+        bool transportOk;
+        uint16_t headDesc;
+        uint64_t expectedFence;
+        void* responseBuffer;
+        size_t responseSize;
+        uint32_t usedLength;
+        uint32_t responseType;
+        uint64_t completedFence;
+        uint32_t ownerPID;
+    };
+
+    struct ResourceRecord {
+        bool used;
+        uint32_t resourceId;
+        ResourceBackingType backingType;
+        bool attachedBacking;
+        bool mapped;
+        uint32_t mapInfo;
+        uint64_t size;
+        void* guestPtr;
+        uint64_t guestPhys;
+        uint32_t guestLength;
+        uint64_t hostVisibleOffset;
+        bool hasUUID;
+        uint8_t uuid[16];
+        uint32_t boundContextCount;
+        uint32_t boundContexts[MaxResourceContexts];
+    };
+
+    struct ContextRecord {
+        bool used;
+        uint32_t ctxId;
+        uint32_t contextInit;
+        uint32_t capsetId;
+        uint8_t ringIdx;
+        bool useRingIdx;
+        uint32_t attachedResourceCount;
+        uint32_t attachedResources[MaxContextResources];
+    };
+
+    static constexpr size_t MaxFenceWaiters = 16;
+
     VirtIOGPUDriver();
     
     bool detectDevice();
@@ -344,14 +526,33 @@ private:
     bool negotiateFeatures();
     bool setupQueues();
     bool getDisplayInfo();
-    bool createResource();
+    bool createResource(bool allowBlobScanout = true);
     bool attachBacking();
     bool setScanout();
     void resetCommandStatus();
-    void initializeHeader(VirtIOGPUCtrlHdr* hdr, uint32_t type, uint32_t ctxId = 0);
-    bool waitForFence(uint16_t headDesc, uint64_t expectedFence, void* resp, size_t respSize);
+    uint32_t sanitizeContextInit(uint32_t contextInit, uint32_t capsetId = 0) const;
+    void initializeHeader(VirtIOGPUCtrlHdr* hdr, uint32_t type, uint32_t ctxId = 0,
+                          uint8_t ringIdx = 0, bool useRingIdx = false);
+    bool awaitFence(FenceWaiter& waiter);
+    FenceWaiter* allocateFenceWaiter();
+    void releaseFenceWaiter(FenceWaiter* waiter);
+    void processControlQueueCompletions();
     bool destroyFramebufferResource();
     void releaseFramebufferMemory();
+    ResourceRecord* findResourceRecord(uint32_t resourceId);
+    const ResourceRecord* findResourceRecord(uint32_t resourceId) const;
+    ResourceRecord* ensureResourceRecord(uint32_t resourceId);
+    void releaseResourceRecord(uint32_t resourceId);
+    ContextRecord* findContextRecord(uint32_t ctxId);
+    const ContextRecord* findContextRecord(uint32_t ctxId) const;
+    ContextRecord* ensureContextRecord(uint32_t ctxId);
+    ContextRecord* requireContextRecord(uint32_t ctxId);
+    void releaseContextRecord(uint32_t ctxId);
+    bool bindResourceToContextRecord(uint32_t ctxId, uint32_t resourceId);
+    void unbindResourceFromContextRecord(uint32_t ctxId, uint32_t resourceId);
+    void unbindResourceFromAllContexts(uint32_t resourceId);
+    uint64_t allocateHostVisibleOffset(uint64_t size);
+    void logCommandError(uint32_t requestType, uint32_t responseType, uint32_t ctxId, uint64_t fenceId) const;
     
     // Queue operations
     bool sendCommand(const void* cmd, size_t cmdSize, void* resp, size_t respSize);
@@ -371,6 +572,8 @@ private:
     bool virglSupported;
     bool contextInitSupported;
     bool resourceBlobSupported;
+    bool resourceUUIDSupported;
+    bool blobScanoutActive;
     
     // PCI location
     uint8_t bus;
@@ -383,6 +586,9 @@ private:
     uint32_t notifyOffMultiplier;
     volatile uint8_t* isrCfg;
     volatile void* deviceCfg;
+    void* hostVisibleShmBase;
+    uint64_t hostVisibleShmLength;
+    uint64_t nextHostVisibleOffset;
     
     // Queues
     Virtqueue controlQueue;
@@ -397,6 +603,8 @@ private:
     uint32_t maxHeight;
     uint32_t currentWidth;
     uint32_t currentHeight;
+    uint32_t fallbackWidth;
+    uint32_t fallbackHeight;
     uint32_t numCapsets;
     uint32_t fbSize;
     uint32_t resourceId;
@@ -416,5 +624,10 @@ private:
     uint32_t queueInterruptCount;
     uint32_t configInterruptCount;
     bool irqRegistered;
+    IRQMode irqMode;
+    bool interruptLatched;
     int commandLock;
+    FenceWaiter fenceWaiters[MaxFenceWaiters];
+    ResourceRecord resourceRecords[MaxTrackedResources];
+    ContextRecord contextRecords[MaxTrackedContexts];
 };

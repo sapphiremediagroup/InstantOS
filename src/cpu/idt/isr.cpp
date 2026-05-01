@@ -3,6 +3,7 @@
 #include <debug/diag.hpp>
 #include <cpu/process/scheduler.hpp>
 #include <graphics/console.hpp>
+#include <cpu/cpuid.hpp>
 #include <memory/vmm.hpp>
 
 Interrupt *interruptHandlers[256] = {nullptr};
@@ -96,6 +97,9 @@ extern "C" void exceptionHandler(InterruptFrame* frame) {
         Process* current = Scheduler::get().getCurrentProcess();
 
         if (current) {
+            if (current->userFpuState) {
+                CPU::saveExtendedState(current->userFpuState);
+            }
             Console::get().drawText("User process crash.\n");
             Debug::printCurrentProcessSummary();
             const char* exception_name = (frame->interrupt < 32) ? exception_names[frame->interrupt] : "Unknown Exception";
@@ -105,26 +109,29 @@ extern "C" void exceptionHandler(InterruptFrame* frame) {
             Console::get().drawHex(frame->rip);
             Debug::printAddressSymbol(frame->rip);
             Console::get().drawText("\n");
+            if (frame->interrupt == 0x0E) {
+                uint64_t cr2;
+                asm volatile("mov %%cr2, %0" : "=r"(cr2));
+                Console::get().drawText("cr2: ");
+                Console::get().drawHex(cr2);
+                Console::get().drawText("\nerr: ");
+                Console::get().drawNumber(frame->errCode);
+                Debug::printPageFaultReason(frame->errCode);
+                printPageWalk(cr2);
+                Console::get().drawText("\n");
+            }
             Debug::printCurrentProcessSyscall();
-            for(;;);
         }
 
         if (current) {
-            if (frame->interrupt == 0x0E) {
-                current->sendSignal(SIGSEGV);
-            } else {
-                current->sendSignal(SIGTERM);
-            }
-
-            current->handlePendingSignals();
-
-            if (current->getState() == ProcessState::Terminated) {
-                Scheduler::get().schedule(frame);
-            }
+            current->setExitCode(128 + ((frame->interrupt == 0x0E) ? SIGSEGV : SIGTERM));
+            current->setState(ProcessState::Terminated);
+            current->setValidUserState(false);
+            Scheduler::get().schedule(frame);
         }
         return;
     }
-    Console::get().drawText("\033[2J");
+    // Console::get().drawText("\033[2J");
     const char* exception_name = (frame->interrupt < 32) ? exception_names[frame->interrupt] : "Unknown";
     Console::get().drawText(exception_name);
     Console::get().drawText("\n\t- Interrupt: ");
@@ -181,10 +188,19 @@ extern "C" void irqHandler(InterruptFrame* frame) {
         return;
     }
 
+    Process* current = (frame->cs == 0x23) ? Scheduler::get().getCurrentProcess() : nullptr;
+    if (current && current->userFpuState) {
+        CPU::saveExtendedState(current->userFpuState);
+    }
+
     Interrupt* handler = interruptHandlers[frame->interrupt];
     if (handler != nullptr) {
         handler->Run(frame);
     } else {
         LAPIC::get().sendEOI();
+    }
+
+    if (current && current->userFpuState) {
+        CPU::restoreExtendedState(current->userFpuState);
     }
 }

@@ -8,6 +8,13 @@
 #include <graphics/console.hpp>
 
 namespace {
+uint64_t alignUserEntryStack(uint64_t stack) {
+    // User entry arrives via iretq/process trampolines, not a real call.
+    // Preserve the Win64/SysV "return-address already pushed" layout so
+    // callee prologues see RSP % 16 == 8 on entry.
+    return ((stack - 8) & ~0xFULL) + 8;
+}
+
 void assignUserProcessPriority(Process* proc, const char* path) {
     if (!proc || !path) {
         return;
@@ -42,7 +49,7 @@ Process* ProcessExecutor::createUserProcess(uint64_t entry) {
     proc->setName("<user>");
     
     uint64_t stack = proc->getUserStack();
-    stack &= ~0xFULL;
+    stack = alignUserEntryStack(stack);
     
     proc->getContext()->rip = entry;
     proc->getContext()->rsp = stack;
@@ -147,7 +154,7 @@ Process* ProcessExecutor::createUserProcessWithCode(void* code, size_t codeSize)
                 uint64_t trampolineAddr = reinterpret_cast<uint64_t>(&processTrampoline);
 
                 uint64_t userStack = proc->getUserStack();
-                userStack &= ~0xFULL;
+                userStack = alignUserEntryStack(userStack);
 
                 uint64_t kernelStack = proc->getKernelStack();
                 kernelStack -= 8;
@@ -199,7 +206,7 @@ Process* ProcessExecutor::createUserProcessWithCode(void* code, size_t codeSize)
     VMM::MapRangeInto(proc->getPageTable(), USER_CODE_BASE, codePhys, pages, PageFlags::Present | PageFlags::ReadWrite | PageFlags::UserSuper);
     
     uint64_t userStack = proc->getUserStack();
-    userStack &= ~0xFULL;
+    userStack = alignUserEntryStack(userStack);
 
     uint64_t entry = USER_CODE_BASE;
     uint64_t trampolineAddr = reinterpret_cast<uint64_t>(&processTrampoline);
@@ -258,7 +265,7 @@ void ProcessExecutor::setupArguments(Process* proc, int argc, const char** argv)
     if (!proc || argc < 0) return;
     
     uint64_t userStack = proc->getUserStack();
-    userStack &= ~0xFULL;
+    userStack = alignUserEntryStack(userStack);
     
     size_t totalStringSize = 0;
     for (int i = 0; i < argc; i++) {
@@ -271,7 +278,7 @@ void ProcessExecutor::setupArguments(Process* proc, int argc, const char** argv)
     size_t totalSize = totalStringSize + (argc + 1) * sizeof(uint64_t) + sizeof(uint64_t);
     
     userStack -= totalSize;
-    userStack &= ~0xFULL;
+    userStack = alignUserEntryStack(userStack);
     
     uint8_t* buffer = new uint8_t[totalSize];
     if (!buffer) return;
@@ -307,7 +314,6 @@ void ProcessExecutor::setupArguments(Process* proc, int argc, const char** argv)
     proc->setUserStack(userStack);
    
     uint64_t* userRspOnStack = reinterpret_cast<uint64_t*>(proc->getContext()->rsp + 8);
-    uint64_t oldValue = *userRspOnStack;
     *userRspOnStack = userStack;
 }
 

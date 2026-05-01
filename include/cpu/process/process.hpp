@@ -18,7 +18,7 @@ enum class ProcessPriority {
 };
 
 struct alignas(64) FPUState {
-  uint8_t data[PAGE_SIZE];
+  uint8_t data[8192];
 };
 
 struct ProcessContext {
@@ -114,6 +114,20 @@ public:
   uint64_t getSavedUserRSP() const { return savedUserRSP; }
   void setSavedUserRSP(uint64_t rsp) { savedUserRSP = rsp; }
 
+  bool isSleeping() const { return sleeping; }
+  uint64_t getSleepDeadlineMs() const { return sleepDeadlineMs; }
+  void sleepUntil(uint64_t deadlineMs) {
+    sleepDeadlineMs = deadlineMs;
+    sleeping = true;
+  }
+  void clearSleep() {
+    sleepDeadlineMs = 0;
+    sleeping = false;
+  }
+  bool sleepDeadlineReached(uint64_t nowMs) const {
+    return sleeping && nowMs >= sleepDeadlineMs;
+  }
+
   SignalHandler *getSignalHandler() { return &signalHandler; }
   void sendSignal(int sig);
   void handlePendingSignals();
@@ -174,7 +188,7 @@ public:
 
   Debug::SyscallTrace& getSyscallTrace() { return syscallTrace; }
   const Debug::SyscallTrace& getSyscallTrace() const { return syscallTrace; }
-
+  FPUState *userFpuState;
 private:
   ProcessSharedState *sharedState;
   char cwd[256];
@@ -195,6 +209,8 @@ private:
   FPUState *fpuState;
   bool validUserState;
   uint64_t savedUserRSP;
+  uint64_t sleepDeadlineMs;
+  bool sleeping;
   SignalHandler signalHandler;
   Debug::SyscallTrace syscallTrace;
   ThreadObject *threadObject;

@@ -23,7 +23,9 @@
 #include <cpu/apic/pic.hpp>
 #include <cpu/cpuid.hpp>
 #include <debug/diag.hpp>
+#include <drivers/hid/i2c_hid.hpp>
 #include <drivers/usb/ohci.hpp>
+#include <drivers/usb/xhci.hpp>
 #include <interrupts/keyboard.hpp>
 #include <interrupts/timer.hpp>
 #include <time/time.hpp>
@@ -44,6 +46,240 @@ void drawHexLine(const char* label, uint64_t value) {
 
 void drawTextLine(const char* text) {
     Console::get().drawText(text);
+    Console::get().drawText("\n");
+}
+
+const char* virtioIrqModeName(VirtIOGPUDriver::IRQMode mode) {
+    switch (mode) {
+        case VirtIOGPUDriver::IRQMode::LegacyINTx:
+            return "INTx";
+        case VirtIOGPUDriver::IRQMode::MSI:
+            return "MSI";
+        case VirtIOGPUDriver::IRQMode::None:
+        default:
+            return "none";
+    }
+}
+
+void drawBoolLine(const char* label, bool value) {
+    Console::get().drawText(label);
+    Console::get().drawText(value ? "yes" : "no");
+    Console::get().drawText("\n");
+}
+
+void logBootText(const char* text) {
+    Console::get().drawText(text);
+    Cereal::get().write(text);
+}
+
+void logBootNumber(uint64_t value) {
+    Console::get().drawNumber(static_cast<int64_t>(value));
+    char buffer[21];
+    int pos = 0;
+    if (value == 0) {
+        Cereal::get().write('0');
+        return;
+    }
+    while (value > 0 && pos < static_cast<int>(sizeof(buffer))) {
+        buffer[pos++] = static_cast<char>('0' + (value % 10));
+        value /= 10;
+    }
+    while (pos > 0) {
+        Cereal::get().write(buffer[--pos]);
+    }
+}
+
+bool hasAnyKeyboard() {
+    return Keyboard::get().isKeyboardPresent() ||
+        USBInput::get().hasKeyboard() ||
+        I2CHIDController::get().hasKeyboard();
+}
+
+void pollInputBackends() {
+    Keyboard::get().servicePendingInput();
+    USBInput::get().poll();
+    I2CHIDController::get().poll();
+}
+
+bool waitForKeyboardProbe(uint32_t iterations) {
+    for (uint32_t i = 0; i < iterations; ++i) {
+        if (hasAnyKeyboard()) {
+            return true;
+        }
+        pollInputBackends();
+        asm volatile("pause");
+    }
+    return hasAnyKeyboard();
+}
+
+void drawKeyboardStatus(const char* prefix) {
+    logBootText(prefix);
+    logBootText(" ps2.driver=");
+    logBootText(Keyboard::get().isInitialized() ? "yes" : "no");
+    logBootText(" ps2.keyboard=");
+    logBootText(Keyboard::get().isKeyboardPresent() ? "yes" : "no");
+    logBootText(" usb.controller=");
+    logBootText(USBInput::get().hasController() ? "yes" : "no");
+    logBootText(" usb.xhci=");
+    logBootText(USBInput::get().isXhciActive() ? "yes" : "no");
+    logBootText(" usb.xhci.controllers=");
+    logBootNumber(XHCIController::get().controllerCount());
+    logBootText("/");
+    logBootNumber(XHCIController::get().initializedControllerCount());
+    logBootText(" usb.keyboard=");
+    logBootText(USBInput::get().hasKeyboard() ? "yes" : "no");
+    logBootText(" i2c.controllers=");
+    logBootNumber(I2CHIDController::get().getControllerCount());
+    logBootText(" i2c.hints=");
+    logBootNumber(I2CHIDController::get().getHidHintCount());
+    logBootText(" i2c.keyboard=");
+    logBootText(I2CHIDController::get().hasKeyboard() ? "yes" : "no");
+    logBootText("\n");
+}
+
+void drawKeyboardFailureHints() {
+    logBootText("[input] detail: xhci.controllers=");
+    logBootNumber(XHCIController::get().controllerCount());
+    logBootText(" initialized=");
+    logBootNumber(XHCIController::get().initializedControllerCount());
+    logBootText(" usb.backend=");
+    if (!USBInput::get().hasController()) {
+        logBootText("none");
+    } else if (USBInput::get().isXhciActive()) {
+        logBootText("xhci");
+    } else {
+        logBootText("ohci");
+    }
+    logBootText(" ps2=");
+    logBootText(Keyboard::get().isKeyboardPresent() ? "detected" : "missing");
+    logBootText(" usb=");
+    logBootText(USBInput::get().hasKeyboard() ? "detected" : "missing");
+    logBootText(" i2c.devices=");
+    logBootNumber(I2CHIDController::get().getDeviceCount());
+    logBootText("\n");
+
+    logBootText("[input] hint: if xhci.controllers>0 but usb.keyboard=no, check the on-screen [usb:xhci] logs for the bus/port that failed enumeration\n");
+}
+
+void waitForKeyboardBeforeBoot() {
+    // Real hardware can surface USB/I2C keyboards a little after controller init.
+    // Give the input backends a short chance to settle before showing a warning.
+    if (waitForKeyboardProbe(500000)) {
+        drawKeyboardStatus("[input] keyboard detected:");
+        return;
+    }
+
+    Console::get().setTextColor(0xFFDD66);
+    logBootText("[input] no keyboard detected; waiting for PS/2, USB, or I2C keyboard input\n");
+    Console::get().setTextColor(0xFFFFFF);
+    drawKeyboardStatus("[input] state:");
+    drawKeyboardFailureHints();
+
+    uint32_t polls = 0;
+    while (!hasAnyKeyboard()) {
+        pollInputBackends();
+        if (++polls == 2000000) {
+            drawKeyboardStatus("[input] still waiting:");
+            drawKeyboardFailureHints();
+            polls = 0;
+        }
+        asm volatile("pause");
+    }
+
+    drawKeyboardStatus("[input] keyboard detected:");
+}
+
+void dumpVirtIOGPUCaps(VirtIOGPUDriver& virtioGpu) {
+    drawBoolLine("[VGPU] virgl=", virtioGpu.supportsVirgl());
+    drawBoolLine("[VGPU] context_init=", virtioGpu.supportsContextInit());
+    drawBoolLine("[VGPU] resource_blob=", virtioGpu.supportsBlobResources());
+    drawBoolLine("[VGPU] resource_uuid=", virtioGpu.supportsResourceUUID());
+    drawBoolLine("[VGPU] scanout_blob_active=", virtioGpu.isUsingBlobScanout());
+
+    Console::get().drawText("[VGPU] capsets=");
+    Console::get().drawNumber(static_cast<int64_t>(virtioGpu.getNumCapsets()));
+    Console::get().drawText("\n");
+
+    for (uint32_t i = 0; i < virtioGpu.getNumCapsets(); ++i) {
+        VirtIOGPUCapsetInfo info = {};
+        if (!virtioGpu.getCapsetInfo(i, &info)) {
+            Console::get().drawText("[VGPU] capset[");
+            Console::get().drawNumber(static_cast<int64_t>(i));
+            Console::get().drawText("]: query failed\n");
+            continue;
+        }
+
+        Console::get().drawText("[VGPU] capset[");
+        Console::get().drawNumber(static_cast<int64_t>(i));
+        Console::get().drawText("]: id=");
+        Console::get().drawNumber(static_cast<int64_t>(info.capset_id));
+        Console::get().drawText(" version=");
+        Console::get().drawNumber(static_cast<int64_t>(info.capset_max_version));
+        Console::get().drawText(" size=");
+        Console::get().drawNumber(static_cast<int64_t>(info.capset_max_size));
+        Console::get().drawText("\n");
+    }
+}
+
+void dumpVirtIOGPUFences(VirtIOGPUDriver& virtioGpu) {
+    Console::get().drawText("[VGPU] fences submitted=");
+    Console::get().drawHex(virtioGpu.getLastSubmittedFence());
+    Console::get().drawText(" completed=");
+    Console::get().drawHex(virtioGpu.getLastCompletedFence());
+    Console::get().drawText(" last_resp=");
+    Console::get().drawText(VirtIOGPUDriver::describeResponseType(virtioGpu.getLastResponseType()));
+    Console::get().drawText("\n");
+
+    Console::get().drawText("[VGPU] irq queue=");
+    Console::get().drawNumber(static_cast<int64_t>(virtioGpu.getQueueInterruptCount()));
+    Console::get().drawText(" config=");
+    Console::get().drawNumber(static_cast<int64_t>(virtioGpu.getConfigInterruptCount()));
+    Console::get().drawText(" total=");
+    Console::get().drawNumber(static_cast<int64_t>(virtioGpu.getInterruptCount()));
+    Console::get().drawText("\n");
+}
+
+void runVirtIOGPUProbe(VirtIOGPUDriver& virtioGpu) {
+    if (!virtioGpu.supportsVirgl()) {
+        return;
+    }
+
+    VirtIOGPUVirglProbeResult probe = {};
+    const bool ok = virtioGpu.runVirglProbe(&probe);
+    Console::get().drawText("[VGPU] probe: ");
+    Console::get().drawText(ok ? "transport-ok" : "incomplete");
+    Console::get().drawText("\n");
+
+    Console::get().drawText("[VGPU] probe capset id=");
+    Console::get().drawNumber(static_cast<int64_t>(probe.capsetId));
+    Console::get().drawText(" version=");
+    Console::get().drawNumber(static_cast<int64_t>(probe.capsetVersion));
+    Console::get().drawText(" size=");
+    Console::get().drawNumber(static_cast<int64_t>(probe.capsetSize));
+    Console::get().drawText("\n");
+
+    Console::get().drawText("[VGPU] probe stages: capset-info=");
+    Console::get().drawText(probe.capsetInfoOk ? "ok" : "fail");
+    Console::get().drawText(" capset=");
+    Console::get().drawText(probe.capsetFetchOk ? "ok" : "fail");
+    Console::get().drawText(" ctx=");
+    Console::get().drawText(probe.contextCreateOk ? "ok" : "fail");
+    Console::get().drawText(" res=");
+    Console::get().drawText(probe.resourceCreateOk ? "ok" : "fail");
+    Console::get().drawText(" attach=");
+    Console::get().drawText(probe.resourceAttachOk ? "ok" : "fail");
+    Console::get().drawText(" submit=");
+    Console::get().drawText(probe.submitTransportOk ? "ok" : "fail");
+    Console::get().drawText(" fence=");
+    Console::get().drawText(probe.fenceCompleted ? "ok" : "fail");
+    Console::get().drawText("\n");
+
+    Console::get().drawText("[VGPU] probe response=");
+    Console::get().drawText(VirtIOGPUDriver::describeResponseType(probe.responseType));
+    Console::get().drawText(" submitted=");
+    Console::get().drawHex(probe.submittedFence);
+    Console::get().drawText(" completed=");
+    Console::get().drawHex(probe.completedFence);
     Console::get().drawText("\n");
 }
 
@@ -81,6 +317,38 @@ static void printMemoryDiagnostics(size_t heapSize) {
     Console::get().drawNumber(static_cast<int64_t>(stats.free_block_count));
     Console::get().drawText("\n");
 }
+
+#ifdef INPUT_PROBE_ONLY
+static void runInputProbeOnly() {
+    Console::get().drawText("[input-probe] results\n");
+    drawBoolLine("[input-probe] ps2.keyboard=", Keyboard::get().isInitialized());
+    drawBoolLine("[input-probe] ps2.mouse=", Keyboard::get().isMouseEnabled());
+    drawBoolLine("[input-probe] usb.controller=", USBInput::get().hasController());
+    drawBoolLine("[input-probe] usb.xhci=", USBInput::get().isXhciActive());
+    drawBoolLine("[input-probe] usb.keyboard=", USBInput::get().hasKeyboard());
+    drawBoolLine("[input-probe] usb.mouse=", USBInput::get().hasMouse());
+    drawBoolLine("[input-probe] i2c.controller=", I2CHIDController::get().getControllerCount() > 0);
+    drawBoolLine("[input-probe] i2c.hid-acpi=", I2CHIDController::get().getHidHintCount() > 0);
+    drawBoolLine("[input-probe] i2c.hid-device=", I2CHIDController::get().getDeviceCount() > 0);
+    drawBoolLine("[input-probe] i2c.keyboard=", I2CHIDController::get().hasKeyboard());
+    drawBoolLine("[input-probe] i2c.mouse=", I2CHIDController::get().hasMouse());
+    Console::get().drawText("[input-probe] i2c.controllers=");
+    Console::get().drawNumber(I2CHIDController::get().getControllerCount());
+    Console::get().drawText(" hints=");
+    Console::get().drawNumber(I2CHIDController::get().getHidHintCount());
+    Console::get().drawText(" devices=");
+    Console::get().drawNumber(I2CHIDController::get().getDeviceCount());
+    Console::get().drawText("\n[input-probe] done; halting after input polling\n");
+
+    asm volatile("sti");
+    while (true) {
+        Keyboard::get().servicePendingInput();
+        USBInput::get().poll();
+        I2CHIDController::get().poll();
+        asm volatile("hlt");
+    }
+}
+#endif
 
 extern "C" void InstantOS(BootInfo* bootInfo) {
     runtimeBase = bootInfo->kernelBase;
@@ -192,18 +460,49 @@ extern "C" void InstantOS(BootInfo* bootInfo) {
     drawTextLine("[BOOT] before mapIRQ mouse");
     apic.mapIRQ(IRQ_MOUSE, VECTOR_MOUSE, targetCore);
     drawTextLine("[BOOT] after mapIRQ mouse");
-    // USBInput::get().initialize();
+    USBInput::get().initialize();
+    I2CHIDController::get().initialize();
+
+#ifndef INPUT_PROBE_ONLY
+    waitForKeyboardBeforeBoot();
+#endif
+
+#ifdef INPUT_PROBE_ONLY
+    runInputProbeOnly();
+#endif
 
     VirtIOGPUDriver& virtioGpu = VirtIOGPUDriver::get();
+    Console::get().drawText("[BOOT] framebuffer fallback=");
+    Console::get().drawNumber(static_cast<int64_t>(fb.getWidth()));
+    Console::get().drawText("x");
+    Console::get().drawNumber(static_cast<int64_t>(fb.getHeight()));
+    Console::get().drawText("\n");
+    virtioGpu.setFallbackDisplayMode(static_cast<uint32_t>(fb.getWidth()),
+                                     static_cast<uint32_t>(fb.getHeight()));
     if (virtioGpu.initialize()) {
         uint32_t gpuWidth = 0;
         uint32_t gpuHeight = 0;
         virtioGpu.getMode(&gpuWidth, &gpuHeight);
         fb.switchToVirtIO(virtioGpu.getFramebuffer(), gpuWidth, gpuHeight, virtioGpu.getPitch());
         Console::get().setVirtIO(true);
+        Console::get().setCopyScrollEnabled(true);
         fb.clear(0);
         virtioGpu.flush(0, 0, gpuWidth, gpuHeight);
         Console::get().drawText("[BOOT] VirtIO GPU: [ OK ]\n");
+        Console::get().drawText("[BOOT] VirtIO GPU IRQ mode: ");
+        Console::get().drawText(virtioIrqModeName(virtioGpu.getIRQMode()));
+        Console::get().drawText(", vector=");
+        Console::get().drawHex(virtioGpu.getIRQVector());
+        if (virtioGpu.getIRQMode() == VirtIOGPUDriver::IRQMode::LegacyINTx) {
+            Console::get().drawText(", line=");
+            Console::get().drawNumber(virtioGpu.getIRQLine());
+        }
+        Console::get().drawText(", irq_registered=");
+        Console::get().drawText(virtioGpu.getIRQMode() == VirtIOGPUDriver::IRQMode::None ? "no" : "yes");
+        Console::get().drawText("\n");
+        dumpVirtIOGPUCaps(virtioGpu);
+        runVirtIOGPUProbe(virtioGpu);
+        dumpVirtIOGPUFences(virtioGpu);
     } else {
         Console::get().drawText("[BOOT] VirtIO GPU: unavailable, using boot framebuffer\n");
     }
@@ -258,10 +557,6 @@ extern "C" void InstantOS(BootInfo* bootInfo) {
         Console::get().drawText(" ]\n");
     }
     
-    Console::get().drawText("testing new\n");
-    volatile auto* idk = new int[16];
-    delete[] idk;
-    Console::get().drawText("Hello World\n");
     
     if (bootInfo->initrdBase && bootInfo->initrdSize) {
         Console::get().drawText("Mounting initrdfs...\n");

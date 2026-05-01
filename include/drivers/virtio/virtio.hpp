@@ -10,6 +10,7 @@ constexpr uint8_t VIRTIO_PCI_CAP_NOTIFY_CFG = 2;
 constexpr uint8_t VIRTIO_PCI_CAP_ISR_CFG = 3;
 constexpr uint8_t VIRTIO_PCI_CAP_DEVICE_CFG = 4;
 constexpr uint8_t VIRTIO_PCI_CAP_PCI_CFG = 5;
+constexpr uint8_t VIRTIO_PCI_CAP_SHARED_MEMORY_CFG = 8;
 
 // VirtIO Device Status
 constexpr uint8_t VIRTIO_STATUS_ACKNOWLEDGE = 1;
@@ -93,6 +94,20 @@ struct VirtioPCICapability {
 struct VirtioPCINotifyCap {
     VirtioPCICapability cap;
     uint32_t notify_off_multiplier;
+} __attribute__((packed));
+
+struct VirtioPCISharedMemoryCap {
+    uint8_t cap_vndr;
+    uint8_t cap_next;
+    uint8_t cap_len;
+    uint8_t cfg_type;
+    uint8_t bar;
+    uint8_t id;
+    uint8_t padding[2];
+    uint32_t offset_lo;
+    uint32_t length_lo;
+    uint32_t offset_hi;
+    uint32_t length_hi;
 } __attribute__((packed));
 
 class Virtqueue {

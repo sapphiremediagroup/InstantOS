@@ -2,5 +2,6 @@ build
 builddir
 *.o
 *.log
-.vscode
+vboxserial.txt
+.*
 testing

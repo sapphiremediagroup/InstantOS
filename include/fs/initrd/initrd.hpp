@@ -33,6 +33,10 @@ public:
     static VNode* nodeLookup(VNode* node, const char* name);
     
 private:
+    static const char* nodePathPrefix(VNode* node);
+    static bool splitImmediateChild(const char* prefix, const char* fullPath, char* childName, bool* isDirectory);
+    static VNode* createDirectoryNode(InitrdFS* fs, const char* prefix);
+
     void* data;
     size_t dataSize;
     InitrdHeader* header;

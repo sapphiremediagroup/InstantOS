@@ -124,7 +124,8 @@ enum KeyModifiers : uint16_t {
     KeyModifierShift = 1 << 0,
     KeyModifierControl = 1 << 1,
     KeyModifierAlt = 1 << 2,
-    KeyModifierCapsLock = 1 << 3
+    KeyModifierCapsLock = 1 << 3,
+    KeyModifierSuper = 1 << 4
 };
 
 enum class PointerEventAction : uint16_t {
@@ -179,6 +180,79 @@ struct Event {
         WindowEvent window;
         uint8_t raw[48];
     };
+};
+
+struct GPUCapsetInfo {
+    uint32_t index;
+    uint32_t capsetId;
+    uint32_t capsetMaxVersion;
+    uint32_t capsetMaxSize;
+};
+
+struct GPUCapsetData {
+    uint32_t capsetId;
+    uint32_t capsetVersion;
+    uint32_t bufferSize;
+    uint32_t actualSize;
+    uint64_t buffer;
+};
+
+struct GPUContextCreate {
+    uint32_t ctxId;
+    uint32_t capsetId;
+    uint32_t contextInit;
+    uint8_t ringIdx;
+    uint8_t useRingIdx;
+    uint8_t reserved[2];
+    char debugName[64];
+};
+
+struct GPUResourceCreate3D {
+    uint32_t ctxId;
+    uint32_t resourceId;
+    uint32_t target;
+    uint32_t format;
+    uint32_t bind;
+    uint32_t width;
+    uint32_t height;
+    uint32_t depth;
+    uint32_t arraySize;
+    uint32_t lastLevel;
+    uint32_t nrSamples;
+    uint32_t flags;
+};
+
+struct GPUResourceDestroy {
+    uint32_t ctxId;
+    uint32_t resourceId;
+    uint8_t hasBacking;
+    uint8_t reserved[3];
+};
+
+struct GPUResourceUUID {
+    uint32_t resourceId;
+    uint8_t uuid[16];
+};
+
+struct GPUSubmit3D {
+    uint32_t ctxId;
+    uint32_t size;
+    uint64_t commands;
+    uint8_t transportOk;
+    uint8_t responseOk;
+    uint8_t reserved[6];
+    uint32_t responseType;
+    uint64_t submittedFence;
+    uint64_t completedFence;
+};
+
+struct GPUWaitFence {
+    uint64_t fenceId;
+    uint64_t timeoutIterations;
+    uint64_t completedFence;
+    uint32_t responseType;
+    uint8_t completed;
+    uint8_t reserved[3];
 };
 #include <fs/vfs/vfs.hpp>
 
@@ -261,6 +335,15 @@ enum class SyscallNumber : uint64_t {
     ThreadExit,
     ThreadJoin,
     Seek,
+    GPUCapsetInfo,
+    GPUCapset,
+    GPUContextCreate,
+    GPUContextDestroy,
+    GPUResourceCreate3D,
+    GPUResourceDestroy,
+    GPUResourceAssignUUID,
+    GPUSubmit3D,
+    GPUWaitFence,
 };
 
 struct SyscallFrame {
@@ -348,6 +431,15 @@ private:
     uint64_t sys_thread_exit(uint64_t code);
     uint64_t sys_thread_join(uint64_t handle, uint64_t statusPtr);
     uint64_t sys_seek(uint64_t handle, uint64_t offset, uint64_t whence);
+    uint64_t sys_gpu_capset_info(uint64_t infoPtr);
+    uint64_t sys_gpu_capset(uint64_t dataPtr);
+    uint64_t sys_gpu_context_create(uint64_t createPtr);
+    uint64_t sys_gpu_context_destroy(uint64_t ctxId);
+    uint64_t sys_gpu_resource_create_3d(uint64_t createPtr);
+    uint64_t sys_gpu_resource_destroy(uint64_t destroyPtr);
+    uint64_t sys_gpu_resource_assign_uuid(uint64_t uuidPtr);
+    uint64_t sys_gpu_submit_3d(uint64_t submitPtr);
+    uint64_t sys_gpu_wait_fence(uint64_t waitPtr);
     uint64_t sys_getuserinfo(uint64_t uid, uint64_t info_ptr);
     uint64_t sys_readdir(uint64_t path, uint64_t entries, uint64_t count);
     uint64_t sys_fb_flush(uint64_t x, uint64_t y, uint64_t w, uint64_t h);

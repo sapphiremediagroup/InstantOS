@@ -6,6 +6,43 @@
 #include <graphics/console.hpp>
 #include <stddef.h>
 
+namespace {
+constexpr uint64_t kDmaPageFlags = PageFlags::Present | PageFlags::ReadWrite | PageFlags::NoExecute;
+
+uint64_t alignDown(uint64_t value, uint64_t alignment) {
+    return value & ~(alignment - 1);
+}
+
+uint64_t alignUp(uint64_t value, uint64_t alignment) {
+    return (value + alignment - 1) & ~(alignment - 1);
+}
+
+void zeroMemory(void* ptr, size_t size) {
+    uint8_t* bytes = reinterpret_cast<uint8_t*>(ptr);
+    for (size_t i = 0; i < size; i++) {
+        bytes[i] = 0;
+    }
+}
+
+void mapIdentityRange(uint64_t phys, size_t size, uint64_t flags) {
+    if (!phys || size == 0) {
+        return;
+    }
+
+    uint64_t start = alignDown(phys, PMM::PAGE_SIZE);
+    uint64_t end = alignUp(phys + size, PMM::PAGE_SIZE);
+    for (uint64_t addr = start; addr < end; addr += PMM::PAGE_SIZE) {
+        VMM::MapPage(addr, addr, flags);
+    }
+}
+
+uint64_t dmaAddress(const void* ptr) {
+    uint64_t virt = reinterpret_cast<uint64_t>(ptr);
+    uint64_t phys = VMM::VirtualToPhysicalIn(VMM::GetAddressSpace(), virt);
+    return phys ? phys : virt;
+}
+}
+
 const DeviceInfo supportedDevices[] = {
 	{ Vendors::ATI, 0x4380, "ATI SB600" },
 	{ Vendors::ATI, 0x4390, "ATI SB700/800" },
@@ -142,7 +179,11 @@ bool get_device_info(Vendors vendorID, uint16_t deviceID, const char **name, uin
 }
 
 
-AHCIPort::AHCIPort(HBAPort* port, int portNum) : port(port), portNum(portNum), active(false), sectorCount(0) {
+AHCIPort::AHCIPort(HBAPort* port, int portNum)
+    : port(port), portNum(portNum), active(false), sectorCount(0), commandList(nullptr), fisBuffer(nullptr) {
+    for (int i = 0; i < 32; i++) {
+        commandTables[i] = nullptr;
+    }
 }
 
 int AHCIPort::getType() {
@@ -220,22 +261,23 @@ bool AHCIPort::initialize() {
         return false;
     }
 
-    for (int i = 0; i < 1024; i++) {
-        ((uint8_t*)clb)[i] = 0;
-    }
-    for (int i = 0; i < 256; i++) {
-        ((uint8_t*)fb)[i] = 0;
-    }
+    zeroMemory(clb, 1024);
+    zeroMemory(fb, 256);
 
-    port->clb = (uint64_t)clb & 0xFFFFFFFF;
-    port->clbu = ((uint64_t)clb >> 32) & 0xFFFFFFFF;
-    port->fb = (uint64_t)fb & 0xFFFFFFFF;
-    port->fbu = ((uint64_t)fb >> 32) & 0xFFFFFFFF;
+    commandList = reinterpret_cast<HBACmdHeader*>(clb);
+    fisBuffer = fb;
+
+    uint64_t clbPhys = dmaAddress(clb);
+    uint64_t fbPhys = dmaAddress(fb);
+    port->clb = clbPhys & 0xFFFFFFFF;
+    port->clbu = (clbPhys >> 32) & 0xFFFFFFFF;
+    port->fb = fbPhys & 0xFFFFFFFF;
+    port->fbu = (fbPhys >> 32) & 0xFFFFFFFF;
 
     Console::get().log("[AHCI Port {}] Command list at: 0x{}, FIS at: 0x{}", portNum, (uint64_t)clb, (uint64_t)fb);
 
     Console::get().log("[AHCI Port {}] Allocating command tables...", portNum);
-    HBACmdHeader* cmdheader = (HBACmdHeader*)clb;
+    HBACmdHeader* cmdheader = commandList;
     for (int i = 0; i < 32; i++) {
         cmdheader[i].prdtl = 8;
 
@@ -244,22 +286,22 @@ bool AHCIPort::initialize() {
             Console::get().log("[AHCI Port {}] Failed to allocate command table {}", portNum, i);
             Console::get().drawText("[AHCI] Port init failed: no command table\n");
             for (int j = 0; j < i; j++) {
-                uint64_t ctbAddr = (uint64_t)cmdheader[j].ctba | ((uint64_t)cmdheader[j].ctbau << 32);
-                if (ctbAddr) {
-                    kfree(reinterpret_cast<void*>(ctbAddr));
-                }
+                kfree(commandTables[j]);
+                commandTables[j] = nullptr;
             }
             kfree(fb);
             kfree(clb);
+            fisBuffer = nullptr;
+            commandList = nullptr;
             return false;
         }
 
-        for (int j = 0; j < 256; j++) {
-            ((uint8_t*)ctb)[j] = 0;
-        }
+        zeroMemory(ctb, 256);
 
-        cmdheader[i].ctba = (uint64_t)ctb & 0xFFFFFFFF;
-        cmdheader[i].ctbau = ((uint64_t)ctb >> 32) & 0xFFFFFFFF;
+        commandTables[i] = reinterpret_cast<HBACmdTbl*>(ctb);
+        uint64_t ctbPhys = dmaAddress(ctb);
+        cmdheader[i].ctba = ctbPhys & 0xFFFFFFFF;
+        cmdheader[i].ctbau = (ctbPhys >> 32) & 0xFFFFFFFF;
     }
 
     Console::get().log("[AHCI Port {}] Starting command engine...", portNum);
@@ -267,11 +309,10 @@ bool AHCIPort::initialize() {
 
     Console::get().log("[AHCI Port {}] Sending IDENTIFY command...", portNum);
     uint64_t identifyFrame = PMM::AllocFrame();
+    mapIdentityRange(identifyFrame, PMM::PAGE_SIZE, kDmaPageFlags);
     uint16_t* identifyBuffer = reinterpret_cast<uint16_t*>(identifyFrame);
     if (identifyBuffer) {
-        for (int i = 0; i < 256; i++) {
-            identifyBuffer[i] = 0;
-        }
+        zeroMemory(identifyBuffer, 512);
     }
 
     if (identifyBuffer && identify(identifyBuffer)) {
@@ -294,31 +335,32 @@ bool AHCIPort::initialize() {
 }
 
 bool AHCIPort::executeCommand(uint8_t cmd, uint64_t lba, uint32_t count, void* buffer, bool isWrite) {
+    if (!commandList || !buffer || count == 0) {
+        return false;
+    }
+
     port->is = (uint32_t)-1;
 
     int slot = findCmdSlot();
     if (slot == -1) return false;
 
-    uint64_t clb = (uint64_t)port->clb | ((uint64_t)port->clbu << 32);
-    HBACmdHeader* cmdheader = (HBACmdHeader*)clb;
-
-    cmdheader += slot;
+    HBACmdHeader* cmdheader = commandList + slot;
     cmdheader->cfl = sizeof(FISRegH2D) / sizeof(uint32_t);
     cmdheader->w = isWrite ? 1 : 0;
-    cmdheader->prdtl = (uint16_t)((count - 1) / 8) + 1;
+    cmdheader->prdtl = (uint16_t)((count - 1) / 16) + 1;
 
     if (cmdheader->prdtl > 8) {
         return false;
     }
 
-    uint64_t ctb = (uint64_t)cmdheader->ctba | ((uint64_t)cmdheader->ctbau << 32);
-    HBACmdTbl* cmdtbl = (HBACmdTbl*)ctb;
-
-    for (int i = 0; i < 256; i++) {
-        ((uint8_t*)cmdtbl)[i] = 0;
+    HBACmdTbl* cmdtbl = commandTables[slot];
+    if (!cmdtbl) {
+        return false;
     }
 
-    uint64_t buf = (uint64_t)buffer;
+    zeroMemory(cmdtbl, 256);
+
+    uint64_t buf = dmaAddress(buffer);
     int i;
     for (i = 0; i < cmdheader->prdtl - 1; i++) {
         cmdtbl->prdt_entry[i].dba = buf & 0xFFFFFFFF;
@@ -408,7 +450,7 @@ bool AHCIController::initialize() {
 
     for (size_t i = 0; i < pages_needed; i++) {
         void* addr = (void*)(abar_aligned + i * 4096);
-        VMM::MapPage(reinterpret_cast<uint64_t>(addr), reinterpret_cast<uint64_t>(addr), PageFlags::Present | PageFlags::ReadWrite | PageFlags::CacheDisab | PageFlags::NoExecute);
+        VMM::MapPage(reinterpret_cast<uint64_t>(addr), reinterpret_cast<uint64_t>(addr), PageFlags::Present | PageFlags::ReadWrite | PageFlags::CacheDisab | PageFlags::WriteThru | PageFlags::NoExecute);
     }
 
     uint64_t offset_in_page = abar - abar_aligned;

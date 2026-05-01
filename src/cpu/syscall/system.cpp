@@ -5,6 +5,7 @@
 #include <interrupts/timer.hpp>
 #include <memory/pmm.hpp>
 #include <memory/vmm.hpp>
+#include <memory/heap.hpp>
 #include <graphics/console.hpp>
 #include <graphics/virtio_gpu.hpp>
 #include <common/string.hpp>
@@ -256,6 +257,211 @@ uint64_t Syscall::sys_fb_flush(uint64_t x, uint64_t y, uint64_t w, uint64_t h) {
     }
 
     return 0;
+}
+
+uint64_t Syscall::sys_gpu_capset_info(uint64_t infoPtr) {
+    if (!isValidUserPointer(infoPtr, sizeof(GPUCapsetInfo))) {
+        return static_cast<uint64_t>(-1);
+    }
+
+    GPUCapsetInfo query = {};
+    if (!copyFromUser(&query, infoPtr, sizeof(query))) {
+        return static_cast<uint64_t>(-1);
+    }
+
+    VirtIOGPUDriver& gpu = VirtIOGPUDriver::get();
+    VirtIOGPUCapsetInfo info = {};
+    if (!gpu.getCapsetInfo(query.index, &info)) {
+        return static_cast<uint64_t>(-1);
+    }
+
+    query.capsetId = info.capset_id;
+    query.capsetMaxVersion = info.capset_max_version;
+    query.capsetMaxSize = info.capset_max_size;
+    return copyToUser(infoPtr, &query, sizeof(query)) ? 0 : static_cast<uint64_t>(-1);
+}
+
+uint64_t Syscall::sys_gpu_capset(uint64_t dataPtr) {
+    if (!isValidUserPointer(dataPtr, sizeof(GPUCapsetData))) {
+        return static_cast<uint64_t>(-1);
+    }
+
+    GPUCapsetData request = {};
+    if (!copyFromUser(&request, dataPtr, sizeof(request))) {
+        return static_cast<uint64_t>(-1);
+    }
+    if (request.bufferSize == 0 || !isValidUserPointer(request.buffer, request.bufferSize)) {
+        return static_cast<uint64_t>(-1);
+    }
+
+    void* kernelBuffer = kmalloc(request.bufferSize);
+    if (!kernelBuffer) {
+        return static_cast<uint64_t>(-1);
+    }
+
+    VirtIOGPUDriver& gpu = VirtIOGPUDriver::get();
+    uint32_t actualSize = 0;
+    const bool ok = gpu.getCapset(request.capsetId, request.capsetVersion, kernelBuffer, request.bufferSize, &actualSize);
+    if (ok) {
+        request.actualSize = actualSize;
+    }
+
+    bool copied = false;
+    if (ok) {
+        copied = copyToUser(request.buffer, kernelBuffer, request.actualSize) &&
+                 copyToUser(dataPtr, &request, sizeof(request));
+    }
+    kfree(kernelBuffer);
+    return copied ? 0 : static_cast<uint64_t>(-1);
+}
+
+uint64_t Syscall::sys_gpu_context_create(uint64_t createPtr) {
+    if (!isValidUserPointer(createPtr, sizeof(GPUContextCreate))) {
+        return static_cast<uint64_t>(-1);
+    }
+
+    GPUContextCreate request = {};
+    if (!copyFromUser(&request, createPtr, sizeof(request))) {
+        return static_cast<uint64_t>(-1);
+    }
+
+    VirtIOGPUDriver& gpu = VirtIOGPUDriver::get();
+    uint32_t ctxId = 0;
+    const bool ok = request.capsetId != 0
+        ? gpu.createContextWithCapset(&ctxId, request.capsetId, request.debugName,
+                                      request.contextInit, request.ringIdx, request.useRingIdx != 0)
+        : gpu.createContext(&ctxId, request.debugName, request.contextInit,
+                            request.ringIdx, request.useRingIdx != 0);
+    if (!ok) {
+        return static_cast<uint64_t>(-1);
+    }
+
+    request.ctxId = ctxId;
+    return copyToUser(createPtr, &request, sizeof(request)) ? 0 : static_cast<uint64_t>(-1);
+}
+
+uint64_t Syscall::sys_gpu_context_destroy(uint64_t ctxId) {
+    return VirtIOGPUDriver::get().destroyContext(static_cast<uint32_t>(ctxId)) ? 0 : static_cast<uint64_t>(-1);
+}
+
+uint64_t Syscall::sys_gpu_resource_create_3d(uint64_t createPtr) {
+    if (!isValidUserPointer(createPtr, sizeof(GPUResourceCreate3D))) {
+        return static_cast<uint64_t>(-1);
+    }
+
+    GPUResourceCreate3D request = {};
+    if (!copyFromUser(&request, createPtr, sizeof(request))) {
+        return static_cast<uint64_t>(-1);
+    }
+
+    VirtIOGPUResourceCreate3D resource = {};
+    resource.hdr.ctx_id = request.ctxId;
+    resource.target = request.target;
+    resource.format = request.format;
+    resource.bind = request.bind;
+    resource.width = request.width;
+    resource.height = request.height;
+    resource.depth = request.depth;
+    resource.array_size = request.arraySize;
+    resource.last_level = request.lastLevel;
+    resource.nr_samples = request.nrSamples;
+    resource.flags = request.flags;
+
+    uint32_t resourceIdValue = 0;
+    if (!VirtIOGPUDriver::get().createResource3D(resource, &resourceIdValue)) {
+        return static_cast<uint64_t>(-1);
+    }
+
+    request.resourceId = resourceIdValue;
+    return copyToUser(createPtr, &request, sizeof(request)) ? 0 : static_cast<uint64_t>(-1);
+}
+
+uint64_t Syscall::sys_gpu_resource_destroy(uint64_t destroyPtr) {
+    if (!isValidUserPointer(destroyPtr, sizeof(GPUResourceDestroy))) {
+        return static_cast<uint64_t>(-1);
+    }
+
+    GPUResourceDestroy request = {};
+    if (!copyFromUser(&request, destroyPtr, sizeof(request))) {
+        return static_cast<uint64_t>(-1);
+    }
+
+    return VirtIOGPUDriver::get().destroyResource3D(request.ctxId, request.resourceId, request.hasBacking != 0)
+        ? 0
+        : static_cast<uint64_t>(-1);
+}
+
+uint64_t Syscall::sys_gpu_resource_assign_uuid(uint64_t uuidPtr) {
+    if (!isValidUserPointer(uuidPtr, sizeof(GPUResourceUUID))) {
+        return static_cast<uint64_t>(-1);
+    }
+
+    GPUResourceUUID request = {};
+    if (!copyFromUser(&request, uuidPtr, sizeof(request))) {
+        return static_cast<uint64_t>(-1);
+    }
+
+    if (!VirtIOGPUDriver::get().assignResourceUUID(request.resourceId, request.uuid)) {
+        return static_cast<uint64_t>(-1);
+    }
+
+    return copyToUser(uuidPtr, &request, sizeof(request)) ? 0 : static_cast<uint64_t>(-1);
+}
+
+uint64_t Syscall::sys_gpu_submit_3d(uint64_t submitPtr) {
+    if (!isValidUserPointer(submitPtr, sizeof(GPUSubmit3D))) {
+        return static_cast<uint64_t>(-1);
+    }
+
+    GPUSubmit3D request = {};
+    if (!copyFromUser(&request, submitPtr, sizeof(request))) {
+        return static_cast<uint64_t>(-1);
+    }
+    if (request.size == 0 || !isValidUserPointer(request.commands, request.size)) {
+        return static_cast<uint64_t>(-1);
+    }
+
+    void* kernelCommands = kmalloc(request.size);
+    if (!kernelCommands) {
+        return static_cast<uint64_t>(-1);
+    }
+    if (!copyFromUser(kernelCommands, request.commands, request.size)) {
+        kfree(kernelCommands);
+        return static_cast<uint64_t>(-1);
+    }
+
+    const bool ok = VirtIOGPUDriver::get().submit3D(request.ctxId, kernelCommands, request.size);
+    kfree(kernelCommands);
+
+    const VirtIOGPUCommandStatus status = VirtIOGPUDriver::get().getLastCommandStatus();
+    request.transportOk = ok ? 1 : 0;
+    request.responseOk = status.responseOk ? 1 : 0;
+    request.responseType = status.responseType;
+    request.submittedFence = status.submittedFence;
+    request.completedFence = status.completedFence;
+
+    return copyToUser(submitPtr, &request, sizeof(request)) ? 0 : static_cast<uint64_t>(-1);
+}
+
+uint64_t Syscall::sys_gpu_wait_fence(uint64_t waitPtr) {
+    if (!isValidUserPointer(waitPtr, sizeof(GPUWaitFence))) {
+        return static_cast<uint64_t>(-1);
+    }
+
+    GPUWaitFence request = {};
+    if (!copyFromUser(&request, waitPtr, sizeof(request))) {
+        return static_cast<uint64_t>(-1);
+    }
+
+    const uint64_t spinLimit = request.timeoutIterations != 0 ? request.timeoutIterations : 1000000ULL;
+    uint64_t completedFence = 0;
+    uint32_t responseType = 0;
+    const bool ok = VirtIOGPUDriver::get().waitForFence(request.fenceId, spinLimit, &completedFence, &responseType);
+
+    request.completed = ok ? 1 : 0;
+    request.completedFence = completedFence;
+    request.responseType = responseType;
+    return copyToUser(waitPtr, &request, sizeof(request)) ? 0 : static_cast<uint64_t>(-1);
 }
 
 extern "C" void _purecall() {
