@@ -17,7 +17,6 @@ public:
             return;
         }
 
-        Cereal::get().write("[kbd:init] begin\n");
         shiftPressed = false;
         ctrlPressed = false;
         altPressed = false;
@@ -37,7 +36,6 @@ public:
         flushOutputBuffer();
 
         const uint8_t originalConfig = readControllerConfig();
-        writeStatus("[kbd:init] cfg-old=", originalConfig);
 
         uint8_t initConfig = originalConfig;
         initConfig &= static_cast<uint8_t>(~(kConfigKeyboardIrq | kConfigMouseIrq));
@@ -45,41 +43,31 @@ public:
         initConfig |= kConfigSystemFlag;
         initConfig |= kConfigTranslation;
         writeControllerConfig(initConfig);
-        writeStatus("[kbd:init] cfg-init=", initConfig);
 
         waitForInputReady();
         outb(kCommandPort, 0xAE);
 
         const uint8_t resetAck = sendDeviceCommand(0xFF);
-        writeStatus("[kbd:init] reset-ack=", resetAck);
         if (resetAck == kDeviceAck) {
             const uint8_t resetBat = readDataWithTimeout();
-            writeStatus("[kbd:init] reset-bat=", resetBat);
             keyboardPresent = resetBat == kKeyboardBatOk;
         }
 
         const uint8_t scanSetCommandAck = sendDeviceCommand(0xF0);
-        writeStatus("[kbd:init] scan-set-cmd=", scanSetCommandAck);
         if (scanSetCommandAck == kDeviceAck) {
             const uint8_t scanSetAck = sendDeviceCommand(0x02);
-            writeStatus("[kbd:init] scan-set-2=", scanSetAck);
             keyboardPresent = keyboardPresent || scanSetAck == kDeviceAck;
         }
 
         const uint8_t scanAck = sendDeviceCommand(0xF4);
-        writeStatus("[kbd:init] scan-ack=", scanAck);
         keyboardPresent = keyboardPresent || scanAck == kDeviceAck;
 
         waitForInputReady();
         outb(kCommandPort, 0xA8);
         const uint8_t mouseDefaultAck = sendAuxDeviceCommand(0xF6);
-        writeStatus("[kbd:init] mouse-defaults=", mouseDefaultAck);
         const uint8_t mouseSampleAck = sendAuxDeviceCommandWithData(0xF3, kMouseSampleRate);
-        writeStatus("[kbd:init] mouse-sample=", mouseSampleAck);
         const uint8_t mouseResolutionAck = sendAuxDeviceCommandWithData(0xE8, kMouseResolution);
-        writeStatus("[kbd:init] mouse-resolution=", mouseResolutionAck);
         const uint8_t mouseStreamAck = sendAuxDeviceCommand(0xF4);
-        writeStatus("[kbd:init] mouse-stream=", mouseStreamAck);
         mouseEnabled = mouseDefaultAck == kDeviceAck &&
             mouseSampleAck == kDeviceAck &&
             mouseResolutionAck == kDeviceAck &&
@@ -98,7 +86,6 @@ public:
         }
         runtimeConfig &= static_cast<uint8_t>(~kConfigKeyboardDisabled);
         writeControllerConfig(runtimeConfig);
-        writeStatus("[kbd:init] cfg-new=", runtimeConfig);
 
         iFramebuffer* framebuffer = Console::get().getFramebuffer();
         if (framebuffer) {
@@ -108,7 +95,6 @@ public:
         mouseButtons = 0;
         mousePacketIndex = 0;
         initialized = true;
-        Cereal::get().write("[kbd:init] ready\n");
     }
 
     void Run(InterruptFrame* frame) override {
@@ -172,12 +158,6 @@ public:
         uint8_t status = inb(kStatusPort);
         bool handled = false;
 
-        if (traceIrq && kTraceInputHotPath) {
-            Cereal::get().write("[kbd:irq] status=");
-            writeHex(status);
-            Cereal::get().write("\n");
-        }
-
         if ((status & kStatusOutputFull) == 0) {
             return false;
         }
@@ -214,18 +194,6 @@ public:
         IPCManager::get().postServiceEvent("graphics.compositor", &event, sizeof(event));
         const bool inputPosted = postInputManagerEvent(event);
         const bool buffered = appendToBuffer(c, prefix);
-        if (kTraceInputHotPath) {
-            Cereal::get().write(prefix);
-            Cereal::get().write(" inject dispatch window=");
-            Cereal::get().write(windowPosted ? "ok" : "fail");
-            Cereal::get().write(" input=");
-            Cereal::get().write(inputPosted ? "ok" : "fail");
-            Cereal::get().write(" buffered=");
-            Cereal::get().write(buffered ? "ok" : "full");
-            Cereal::get().write(" pending=");
-            writeDec(bufferCount());
-            Cereal::get().write("\n");
-        }
         Scheduler::get().wakeAllBlockedProcesses();
         return true;
     }
@@ -247,7 +215,7 @@ public:
         if (maxY < 0) maxY = 0;
 
         mouseX += scaledDx;
-        mouseY -= scaledDy;
+        mouseY += scaledDy;
         if (mouseX < 0) mouseX = 0;
         if (mouseY < 0) mouseY = 0;
         if (mouseX > maxX) mouseX = maxX;
@@ -259,7 +227,7 @@ public:
         event.pointer.x = mouseX;
         event.pointer.y = mouseY;
         event.pointer.deltaX = scaledDx;
-        event.pointer.deltaY = -scaledDy;
+        event.pointer.deltaY = scaledDy;
         event.pointer.action = (event.pointer.buttons != mouseButtons) ? PointerEventAction::Button : PointerEventAction::Move;
         mouseButtons = event.pointer.buttons;
 
@@ -278,44 +246,17 @@ public:
             postInputManagerEvent(scroll);
         }
 
-        if (kTraceInputHotPath) {
-            Cereal::get().write(prefix);
-            Cereal::get().write(" pointer dx=");
-            writeDec(scaledDx);
-            Cereal::get().write(" dy=");
-            writeDec(-scaledDy);
-            Cereal::get().write("\n");
-        }
         Scheduler::get().wakeAllBlockedProcesses();
     }
 
     void publishBufferedInputToInputManager() {
-        if (kTraceInputHotPath) {
-            Cereal::get().write("[kbd] publish buffered to input.manager count=");
-            writeDec(bufferCount());
-            Cereal::get().write("\n");
-        }
         while (hasKey()) {
             const char c = buffer[bufferTail];
             const Event event = makeKeyEvent(c, KeyModifierNone);
             if (!postInputManagerEvent(event)) {
-                if (kTraceInputHotPath) {
-                    Cereal::get().write("[kbd] publish buffered failed char=");
-                    writePrintableChar(c);
-                    Cereal::get().write(" remaining=");
-                    writeDec(bufferCount());
-                    Cereal::get().write("\n");
-                }
                 break;
             }
             bufferTail = (bufferTail + 1) % BUFFER_SIZE;
-            if (kTraceInputHotPath) {
-                Cereal::get().write("[kbd] publish buffered ok char=");
-                writePrintableChar(c);
-                Cereal::get().write(" remaining=");
-                writeDec(bufferCount());
-                Cereal::get().write("\n");
-            }
         }
     }
 
@@ -370,7 +311,6 @@ private:
             }
             ioDelay();
         }
-        Cereal::get().write("[kbd:init] wait input timeout\n");
         return false;
     }
 
@@ -381,7 +321,6 @@ private:
             }
             ioDelay();
         }
-        Cereal::get().write("[kbd:init] wait output timeout\n");
         return false;
     }
 
@@ -395,7 +334,6 @@ private:
     void flushOutputBuffer() {
         for (int i = 0; i < 32 && (inb(kStatusPort) & kStatusOutputFull); ++i) {
             uint8_t byte = inb(kDataPort);
-            writeStatus("[kbd:init] flush=", byte);
         }
     }
 
@@ -460,12 +398,6 @@ private:
         outb(kDataPort, config);
     }
 
-    void writeStatus(const char* prefix, uint8_t value) {
-        Cereal::get().write(prefix);
-        writeHex(value);
-        Cereal::get().write("\n");
-    }
-
     Event makeKeyEvent(char c, uint16_t modifiers) {
         Event event = {};
         event.type = EventType::Key;
@@ -481,45 +413,18 @@ private:
     bool appendToBuffer(char c, const char* prefix) {
         int nextHead = (bufferHead + 1) % BUFFER_SIZE;
         if (nextHead == bufferTail) {
-            if (kTraceInputHotPath) {
-                Cereal::get().write(prefix);
-                Cereal::get().write(" buffer full dropping char=");
-                writePrintableChar(c);
-                Cereal::get().write("\n");
-            }
             return false;
         }
 
         buffer[bufferHead] = c;
         bufferHead = nextHead;
-        if (kTraceInputHotPath) {
-            Cereal::get().write(prefix);
-            Cereal::get().write(" char=");
-            writePrintableChar(c);
-            Cereal::get().write(" pending=");
-            writeDec(bufferCount());
-            Cereal::get().write("\n");
-        }
         return true;
     }
 
     void handleDataByte(uint8_t status, uint8_t scancode, const char* prefix) {
         if (status & kStatusAuxData) {
-            if (kTraceInputHotPath) {
-                Cereal::get().write(prefix);
-                Cereal::get().write(" mouse-byte=");
-                writeHex(scancode);
-                Cereal::get().write("\n");
-            }
             handleMouseByte(scancode);
             return;
-        }
-
-        if (kTraceInputHotPath) {
-            Cereal::get().write(prefix);
-            Cereal::get().write(" scancode=");
-            writeHex(scancode);
-            Cereal::get().write("\n");
         }
 
         if (scancode == kDeviceAck || scancode == kKeyboardBatOk) {
@@ -570,18 +475,6 @@ private:
                 const bool windowPosted = IPCManager::get().postKeyEventToFocusedWindow(event);
                 IPCManager::get().postServiceEvent("graphics.compositor", &event, sizeof(event));
                 const bool inputPosted = postInputManagerEvent(event);
-                if (kTraceInputHotPath) {
-                    Cereal::get().write(prefix);
-                    Cereal::get().write(" dispatch char=");
-                    writePrintableChar(c);
-                    Cereal::get().write(" window=");
-                    Cereal::get().write(windowPosted ? "ok" : "fail");
-                    Cereal::get().write(" input=");
-                    Cereal::get().write(inputPosted ? "ok" : "fail");
-                    Cereal::get().write(" modifiers=");
-                    writeHex(static_cast<uint8_t>(modifiers & 0xFF));
-                    Cereal::get().write("\n");
-                }
 
                 if (appendToBuffer(c, prefix)) {
                     Scheduler::get().wakeAllBlockedProcesses();
@@ -631,7 +524,7 @@ private:
         if (maxY < 0) maxY = 0;
 
         mouseX += scaledDx;
-        mouseY -= scaledDy;
+        mouseY += scaledDy;
         if (mouseX < 0) mouseX = 0;
         if (mouseY < 0) mouseY = 0;
         if (mouseX > maxX) mouseX = maxX;
@@ -643,7 +536,7 @@ private:
         event.pointer.x = mouseX;
         event.pointer.y = mouseY;
         event.pointer.deltaX = scaledDx;
-        event.pointer.deltaY = -scaledDy;
+        event.pointer.deltaY = scaledDy;
         event.pointer.action = (buttons != mouseButtons) ? PointerEventAction::Button : PointerEventAction::Move;
         mouseButtons = buttons;
 
@@ -665,51 +558,7 @@ private:
 
     bool postInputManagerEvent(const Event& event) {
         const bool posted = IPCManager::get().postServiceEvent("input.manager", &event, sizeof(event));
-        if (!posted) {
-            Cereal::get().write("[kbd] input.manager post failed type=");
-            writeDec(static_cast<int>(event.type));
-            Cereal::get().write("\n");
-        }
         return posted;
-    }
-
-    void writeHex(uint8_t value) {
-        static constexpr char digits[] = "0123456789abcdef";
-        char buf[5] = { '0', 'x', digits[(value >> 4) & 0xF], digits[value & 0xF], '\0' };
-        Cereal::get().write(buf);
-    }
-
-    void writeDec(int value) {
-        char buf[11];
-        int pos = 0;
-
-        if (value == 0) {
-            Cereal::get().write('0');
-            return;
-        }
-
-        while (value > 0 && pos < static_cast<int>(sizeof(buf))) {
-            buf[pos++] = static_cast<char>('0' + (value % 10));
-            value /= 10;
-        }
-
-        while (pos > 0) {
-            Cereal::get().write(buf[--pos]);
-        }
-    }
-
-    void writePrintableChar(char c) {
-        if (c == '\n') {
-            Cereal::get().write("\\n");
-        } else if (c == '\r') {
-            Cereal::get().write("\\r");
-        } else if (c == '\b') {
-            Cereal::get().write("\\b");
-        } else if (c == '\t') {
-            Cereal::get().write("\\t");
-        } else {
-            Cereal::get().write(c);
-        }
     }
 
     int bufferCount() const {

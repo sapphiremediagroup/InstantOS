@@ -12,6 +12,7 @@ class iFramebuffer {
 
         void putPixel(uint64_t x, uint64_t y, Color color);
         void clear(Color color);
+        void fillRect(uint64_t x, uint64_t y, uint64_t w, uint64_t h, Color color);
         void clearGradient(Color c1, Color c2);
         uint64_t getWidth();
         uint64_t getHeight();

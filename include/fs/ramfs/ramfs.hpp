@@ -17,6 +17,16 @@ struct RamFSNode {
     uint64_t ctime;
 };
 
+struct RamFSFileData {
+    void* data;
+    uint64_t size;
+    uint32_t links;
+    uint32_t mode;
+    uint64_t atime;
+    uint64_t mtime;
+    uint64_t ctime;
+};
+
 class RamFS : public FileSystem {
 public:
     RamFS();
@@ -37,6 +47,13 @@ public:
     static int nodeMkdir(VNode* parent, const char* name, uint32_t mode, VNode** result);
     static int nodeUnlink(VNode* parent, const char* name);
     static int nodeRmdir(VNode* parent, const char* name);
+    static int nodeTruncate(VNode* node, uint64_t size);
+    static int nodeRename(VNode* oldParent, const char* oldName, VNode* newParent, const char* newName);
+    static int nodeChmod(VNode* node, uint32_t mode);
+    static int nodeUtime(VNode* node, uint64_t atime, uint64_t mtime);
+    static int nodeLink(VNode* oldParent, const char* oldName, VNode* newParent, const char* newName);
+    static int nodeSymlink(VNode* parent, const char* name, const char* target, VNode** result);
+    static int64_t nodeReadlink(VNode* node, char* buffer, uint64_t size);
     
 private:
     VNode* rootNode;

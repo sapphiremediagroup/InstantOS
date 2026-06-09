@@ -18,14 +18,17 @@ public:
     
     Process* getCurrentProcess() { return currentProcess; }
     void setCurrentProcess(Process* proc) { currentProcess = proc; }
+    Process* getAllProcessesHead() { return allProcessesHead; }
     Process* getNextProcess();
     Process* getProcessByPID(uint32_t pid);
+    Process* findChild(uint32_t parentPID, int64_t pid, bool terminatedOnly, bool* hasMatchingChild = nullptr);
     
     void schedule();
     void schedule(struct InterruptFrame* frame);
     void scheduleFromSyscall();
     void yield();
     void wakeProcess(Process* process);
+    void wakeParentOf(Process* process);
     void wakeExpiredSleepers(uint64_t nowMs);
     void wakeAllBlockedProcesses();
     

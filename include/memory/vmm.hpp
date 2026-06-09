@@ -30,6 +30,7 @@ public:
     static void MapPage(uint64_t virtualAddr, uint64_t physAddr, uint64_t flags);
     static void UnmapPage(uint64_t virtualAddr);
     static void FreeAddressSpace(PageTable* pml4);
+    static PageTable* AllocTable();
 
     static uint64_t VirtualToPhysical(uint64_t virtualAddr);
     static uint64_t VirtualToPhysicalIn(PageTable* pml4, uint64_t virtualAddr);
@@ -43,6 +44,8 @@ public:
     static void MapPageInto(PageTable* pml4, uint64_t virtualAddr, uint64_t physAddr, uint64_t flags);
     static void MapRangeInto(PageTable* pml4, uint64_t virtualBase, uint64_t physBase,
                              uint64_t pageCount, uint64_t flags);
+    static bool ProtectPageIn(PageTable* pml4, uint64_t virtualAddr, uint64_t flags);
+    static bool ProtectRangeIn(PageTable* pml4, uint64_t virtualBase, uint64_t pageCount, uint64_t flags);
     static void UnmapPageFrom(PageTable* pml4, uint64_t virtualAddr);
     static void UnmapRangeFrom(PageTable* pml4, uint64_t virtualBase, uint64_t pageCount);
 
@@ -60,7 +63,6 @@ private:
     static PageTable* s_pml4;
     static bool       s_initialized;
 
-    static PageTable* AllocTable();
     static void       InvalidatePage(uint64_t addr);
 
     static constexpr uint64_t PML4Index(uint64_t addr) { return (addr >> 39) & 0x1FF; }

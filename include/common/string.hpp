@@ -13,6 +13,9 @@ int memcmp(const void* b1, const void* b2, size_t count);
 void* memchr(const void* b1, int val, size_t count);
 void* memrchr(const void* b1, int val, size_t count);
 
+void memory_init_acceleration();
+bool memory_validate_acceleration();
+
 size_t strlen(const char* str);
 char* strcpy(char* dest, const char* src);
 char* strncpy(char* dest, const char* src, size_t n);

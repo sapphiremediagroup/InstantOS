@@ -17,7 +17,7 @@ struct InitrdHeader {
 
 class InitrdFS : public FileSystem {
 public:
-    InitrdFS(void* data, size_t size);
+    InitrdFS(void* data, size_t size, const char* prefix = "");
     ~InitrdFS() override;
     
     int mount(const char* path) override;
@@ -39,6 +39,7 @@ private:
 
     void* data;
     size_t dataSize;
+    char rootPrefix[64];
     InitrdHeader* header;
     VNode* rootNode;
     VNodeOps ops;

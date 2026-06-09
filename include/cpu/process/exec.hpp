@@ -10,9 +10,12 @@ public:
     static Process* createKernelProcess(void (*entry)());
     static Process* createUserProcess(uint64_t entry);
     static Process* createUserProcessWithCode(void* code, size_t codeSize);
-    static Process* createUserProcessWithArgs(void* code, size_t codeSize, int argc, const char** argv);
+    static Process* createUserProcessWithArgs(void* code, size_t codeSize, int argc, const char** argv,
+                                              int envc = 0, const char** envp = nullptr,
+                                              const char* execPath = nullptr);
     static Process* loadUserBinary(const char* path);
-    static Process* loadUserBinaryWithArgs(const char* path, int argc, const char** argv);
+    static Process* loadUserBinaryWithArgs(const char* path, int argc, const char** argv,
+                                           int envc = 0, const char** envp = nullptr);
     static void executeUserProcess(Process* proc, GDT* gdt);
     
 private:

@@ -51,6 +51,13 @@ struct VNodeOps {
     int (*mkdir)(VNode* parent, const char* name, uint32_t mode, VNode** result);
     int (*unlink)(VNode* parent, const char* name);
     int (*rmdir)(VNode* parent, const char* name);
+    int (*truncate)(VNode* node, uint64_t size);
+    int (*rename)(VNode* oldParent, const char* oldName, VNode* newParent, const char* newName);
+    int (*chmod)(VNode* node, uint32_t mode);
+    int (*utime)(VNode* node, uint64_t atime, uint64_t mtime);
+    int (*link)(VNode* oldParent, const char* oldName, VNode* newParent, const char* newName);
+    int (*symlink)(VNode* parent, const char* name, const char* target, VNode** result);
+    int64_t (*readlink)(VNode* node, char* buffer, uint64_t size);
 };
 
 class VNode {
@@ -116,7 +123,7 @@ struct MountPoint {
 
 class VFS {
 public:
-    VFS() : rootFS(nullptr), mountPoints(nullptr), initialized(false) {}
+    VFS() : rootFS(nullptr), mountPoints(nullptr), initialized(false), lastError(0) {}
     
     static VFS& get();
     
@@ -125,26 +132,40 @@ public:
     int mount(FileSystem* fs, const char* path);
     int unmount(const char* path);
     
-    int open(const char* path, int flags, FileDescriptor** fd);
+    int open(const char* path, int flags, FileDescriptor** fd, uint32_t mode = 0666);
     void retain(FileDescriptor* fd);
     int close(FileDescriptor* fd);
     int64_t read(FileDescriptor* fd, void* buffer, uint64_t size);
     int64_t write(FileDescriptor* fd, const void* buffer, uint64_t size);
     int64_t seek(FileDescriptor* fd, int64_t offset, SeekMode mode);
+    int truncate(FileDescriptor* fd, uint64_t size);
+    int truncate(const char* path, uint64_t size);
+    int chmod(FileDescriptor* fd, uint32_t mode);
+    int chmod(const char* path, uint32_t mode);
+    int utime(FileDescriptor* fd, uint64_t atime, uint64_t mtime);
+    int utime(const char* path, uint64_t atime, uint64_t mtime);
     int stat(const char* path, FileStats* stats);
+    int lstat(const char* path, FileStats* stats);
+    int64_t readlink(const char* path, char* buffer, uint64_t size);
     int readdir(const char* path, DirEntry* entries, uint64_t count, uint64_t* read);
     
     int create(const char* path, uint32_t mode);
     int mkdir(const char* path, uint32_t mode);
     int unlink(const char* path);
     int rmdir(const char* path);
+    int rename(const char* oldPath, const char* newPath);
+    int link(const char* oldPath, const char* newPath);
+    int symlink(const char* target, const char* linkPath);
+    int getLastError() const { return lastError; }
     
 private:
-    VNode* resolvePath(const char* path, char* lastComponent);
+    VNode* resolvePath(const char* path, char* lastComponent, bool followFinal = true, int symlinkDepth = 0);
+    void setLastError(int error) { lastError = error; }
     void splitPath(const char* path, char* parent, char* name);
     FileSystem* findMount(const char* path, char* relativePath);
     
     FileSystem* rootFS;
     MountPoint* mountPoints;
     bool initialized;
+    int lastError;
 };

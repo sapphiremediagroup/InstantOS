@@ -35,6 +35,7 @@ struct VirtIONetConfig {
 constexpr size_t VIRTIO_NET_MTU = 1514;  // Ethernet frame size
 constexpr size_t VIRTIO_NET_BUFFER_SIZE = sizeof(VirtIONetHdr) + VIRTIO_NET_MTU;
 constexpr size_t VIRTIO_NET_RX_BUFFERS = 32;
+constexpr size_t VIRTIO_NET_TX_BUFFERS = 64;
 
 class VirtIONetDriver {
 public:
@@ -62,6 +63,8 @@ private:
     bool negotiateFeatures();
     bool setupQueues();
     bool fillRxQueue();
+    bool queueRxBuffer(size_t index);
+    void reclaimTxCompletions();
     
     // Queue operations
     void notifyQueue(uint16_t queueIdx);
@@ -84,10 +87,11 @@ private:
     uint8_t function;
     
     // VirtIO structures
-    VirtioPCICommonCfg* commonCfg;
+    volatile VirtioPCICommonCfg* commonCfg;
     volatile uint32_t* notifyBase;
     uint32_t notifyOffMultiplier;
-    VirtIONetConfig* deviceCfg;
+    volatile VirtIONetConfig* deviceCfg;
+    uint64_t negotiatedFeatures;
     
     // Queues
     Virtqueue rxQueue;  // Queue 0: receive
@@ -96,6 +100,8 @@ private:
     // RX buffers
     void* rxBuffers[VIRTIO_NET_RX_BUFFERS];
     uint64_t rxBuffersPhys[VIRTIO_NET_RX_BUFFERS];
+    int rxDesc[VIRTIO_NET_RX_BUFFERS];
+    uint64_t txBuffers[VIRTIO_NET_TX_BUFFERS];
     
     // MAC address
     uint8_t macAddr[6];

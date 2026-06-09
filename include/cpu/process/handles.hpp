@@ -16,7 +16,8 @@ enum class HandleType : uint16_t {
   SharedMemory,
   GpuContext,
   Font,
-  Pipe
+  Pipe,
+  Socket
 };
 
 enum HandleRights : uint32_t {
@@ -39,6 +40,7 @@ struct HandleEntry {
   void* object;
   HandleRetainFn retain;
   HandleReleaseFn release;
+  bool closeOnExec;
 };
 
 class HandleTable {
@@ -51,8 +53,8 @@ public:
   HandleTable();
   ~HandleTable();
 
-  uint64_t allocate(HandleType type, uint32_t rights, void* object, HandleRetainFn retain, HandleReleaseFn release);
-  uint64_t allocateAt(uint64_t handle, HandleType type, uint32_t rights, void* object, HandleRetainFn retain, HandleReleaseFn release);
+  uint64_t allocate(HandleType type, uint32_t rights, void* object, HandleRetainFn retain, HandleReleaseFn release, bool closeOnExec = false);
+  uint64_t allocateAt(uint64_t handle, HandleType type, uint32_t rights, void* object, HandleRetainFn retain, HandleReleaseFn release, bool closeOnExec = false);
   bool close(uint64_t handle);
   bool close(uint64_t handle, HandleType expectedType);
   void closeAll();
@@ -65,6 +67,9 @@ public:
   uint64_t duplicate(uint64_t handle, HandleType expectedType);
   bool duplicateTo(uint64_t oldHandle, uint64_t newHandle);
   bool duplicateTo(uint64_t oldHandle, uint64_t newHandle, HandleType expectedType);
+  bool getCloseOnExec(uint64_t handle, bool* enabled) const;
+  bool setCloseOnExec(uint64_t handle, bool enabled);
+  void closeOnExecHandles();
 
   static uint64_t encodeHandle(HandleType type, int slot);
   static bool decodeHandle(uint64_t handle, HandleType* type, int* slot);

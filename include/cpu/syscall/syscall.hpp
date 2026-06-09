@@ -14,6 +14,52 @@ struct OSInfo {
     uint64_t buildnum;
 };
 
+struct ProcInfoEntry {
+    uint32_t pid;
+    uint32_t parentPID;
+    uint32_t uid;
+    uint32_t gid;
+    uint32_t sessionID;
+    uint32_t state;
+    uint32_t priority;
+    uint32_t flags;
+    int32_t exitCode;
+    char name[64];
+};
+
+enum StorageInfoFlags : uint32_t {
+    StorageInfoPresent = 1 << 0,
+    StorageInfoReadable = 1 << 1,
+    StorageInfoWritable = 1 << 2,
+    StorageInfoMounted = 1 << 3,
+    StorageInfoFormatted = 1 << 4,
+};
+
+struct StorageInfo {
+    uint64_t totalSize;
+    uint32_t sectorSize;
+    uint32_t flags;
+    int32_t mountError;
+    uint32_t reserved;
+    char deviceName[32];
+    char fsType[16];
+    char mountPath[64];
+};
+
+struct SigActionInfo {
+    uint64_t handler;
+    uint64_t mask;
+    uint64_t flags;
+    uint64_t restorer;
+};
+
+struct SignalStackInfo {
+    uint64_t sp;
+    uint64_t size;
+    uint32_t flags;
+    uint32_t reserved;
+};
+
 struct LoginInfo {
     char     username[32];
     char     password[64];
@@ -42,6 +88,12 @@ struct Stat {
     uint64_t st_atime;
     uint64_t st_mtime;
     uint64_t st_ctime;
+};
+
+struct PollFD {
+    int64_t fd;
+    int16_t events;
+    int16_t revents;
 };
 
 struct UserInfo {
@@ -344,7 +396,79 @@ enum class SyscallNumber : uint64_t {
     GPUResourceAssignUUID,
     GPUSubmit3D,
     GPUWaitFence,
+    GetUnixTime,
+    SerialWrite,
+    Fcntl,
+    Mprotect,
+    Poll,
+    Truncate,
+    Rename,
+    Chmod,
+    Utime,
+    Fstat,
+    Link,
+    Symlink,
+    Readlink,
+    Lstat,
+    Sigprocmask,
+    Socket,
+    Bind,
+    Connect,
+    Listen,
+    Accept,
+    Send,
+    Recv,
+    Shutdown,
+    GetSockOpt,
+    SetSockOpt,
+    StorageInfo,
+    StorageFormat,
+    StorageMount,
+    Sigaction,
+    Sigaltstack,
+    ThreadSignal,
+    SetThreadPointer,
 };
+
+enum MemoryProtection : uint64_t {
+    MemoryProtRead = 1ULL << 0,
+    MemoryProtWrite = 1ULL << 1,
+    MemoryProtExecute = 1ULL << 2,
+};
+
+enum SyscallErrno : int {
+    SysErrNoEntry = 2,
+    SysErrInterrupted = 4,
+    SysErrBadFile = 9,
+    SysErrNoChild = 10,
+    SysErrAgain = 11,
+    SysErrNoMemory = 12,
+    SysErrAccess = 13,
+    SysErrExists = 17,
+    SysErrCrossDevice = 18,
+    SysErrNotDirectory = 20,
+    SysErrIsDirectory = 21,
+    SysErrInvalid = 22,
+    SysErrNoSpace = 28,
+    SysErrPipe = 29,
+    SysErrBrokenPipe = 32,
+    SysErrRange = 34,
+    SysErrNameTooLong = 36,
+    SysErrNoSys = 38,
+    SysErrNotEmpty = 39,
+    SysErrLoop = 40,
+    SysErrNotSocket = 88,
+    SysErrProtoOpt = 92,
+    SysErrProtocolNotSupported = 93,
+    SysErrOperationNotSupported = 95,
+    SysErrAddressFamilyNotSupported = 97,
+    SysErrAddressInUse = 98,
+    SysErrNotConnected = 107,
+};
+
+constexpr uint64_t syscall_error(SyscallErrno error) {
+    return static_cast<uint64_t>(-static_cast<int64_t>(error));
+}
 
 struct SyscallFrame {
     uint64_t rax;
@@ -387,25 +511,37 @@ public:
 private:
     uint64_t sys_exit(uint64_t code);
     uint64_t sys_write(uint64_t fileHandle, uint64_t buf, uint64_t count);
+    uint64_t sys_serial_write(uint64_t buf, uint64_t count);
     uint64_t sys_read(uint64_t fileHandle, uint64_t buf, uint64_t count);
     uint64_t sys_open(uint64_t path, uint64_t flags, uint64_t mode);
     uint64_t sys_close(uint64_t handle);
     uint64_t sys_getpid();
     uint64_t sys_fork();
     uint64_t sys_exec(uint64_t path, uint64_t argv, uint64_t envp);
-    uint64_t sys_wait(uint64_t pid, uint64_t status);
+    uint64_t sys_wait(uint64_t pid, uint64_t status, uint64_t options);
     uint64_t sys_kill(uint64_t pid, uint64_t sig);
     uint64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot);
     uint64_t sys_munmap(uint64_t addr, uint64_t length);
+    uint64_t sys_mprotect(uint64_t addr, uint64_t length, uint64_t prot);
     uint64_t sys_yield();
     uint64_t sys_sleep(uint64_t ms);
     uint64_t sys_gettime();
+    uint64_t sys_getunixtime();
     uint64_t sys_clear();
     uint64_t sys_fb_info(uint64_t info_ptr);
     uint64_t sys_fb_map();
     uint64_t sys_signal(uint64_t sig, uint64_t handler);
     uint64_t sys_sigreturn();
+    uint64_t sys_sigprocmask(uint64_t how, uint64_t set, uint64_t oldset);
+    uint64_t sys_sigaction(uint64_t sig, uint64_t act, uint64_t oldact);
+    uint64_t sys_sigaltstack(uint64_t stack, uint64_t oldstack);
+    uint64_t sys_thread_signal(uint64_t handle, uint64_t sig);
+    uint64_t sys_set_thread_pointer(uint64_t pointer);
     uint64_t sys_osinfo(uint64_t info_ptr);
+    uint64_t sys_procinfo(uint64_t entriesPtr, uint64_t capacity, uint64_t totalPtr);
+    uint64_t sys_storage_info(uint64_t infoPtr);
+    uint64_t sys_storage_format();
+    uint64_t sys_storage_mount();
 
     uint64_t sys_login(uint64_t);
     uint64_t sys_logout(uint64_t);
@@ -422,9 +558,30 @@ private:
     uint64_t sys_rmdir(uint64_t path);
     uint64_t sys_unlink(uint64_t path);
     uint64_t sys_stat(uint64_t path, uint64_t statbuf);
+    uint64_t sys_fstat(uint64_t handle, uint64_t statbuf);
+    uint64_t sys_lstat(uint64_t path, uint64_t statbuf);
     uint64_t sys_dup(uint64_t handle);
     uint64_t sys_dup2(uint64_t oldHandle, uint64_t newHandle);
     uint64_t sys_pipe(uint64_t pipeHandles);
+    uint64_t sys_fcntl(uint64_t handle, uint64_t command, uint64_t value);
+    uint64_t sys_poll(uint64_t fds, uint64_t nfds);
+    uint64_t sys_truncate(uint64_t target, uint64_t size, uint64_t byHandle);
+    uint64_t sys_rename(uint64_t oldPath, uint64_t newPath);
+    uint64_t sys_chmod(uint64_t target, uint64_t mode, uint64_t byHandle);
+    uint64_t sys_utime(uint64_t target, uint64_t atime, uint64_t mtime, uint64_t byHandle);
+    uint64_t sys_link(uint64_t oldPath, uint64_t newPath);
+    uint64_t sys_symlink(uint64_t target, uint64_t linkPath);
+    uint64_t sys_readlink(uint64_t path, uint64_t buffer, uint64_t size);
+    uint64_t sys_socket(uint64_t domain, uint64_t type, uint64_t protocol);
+    uint64_t sys_bind(uint64_t socketHandle, uint64_t address, uint64_t addressLength);
+    uint64_t sys_connect(uint64_t socketHandle, uint64_t address, uint64_t addressLength);
+    uint64_t sys_listen(uint64_t socketHandle, uint64_t backlog);
+    uint64_t sys_accept(uint64_t socketHandle, uint64_t address, uint64_t addressLength);
+    uint64_t sys_send(uint64_t socketHandle, uint64_t buffer, uint64_t length, uint64_t flags);
+    uint64_t sys_recv(uint64_t socketHandle, uint64_t buffer, uint64_t length, uint64_t flags);
+    uint64_t sys_shutdown(uint64_t socketHandle, uint64_t how);
+    uint64_t sys_getsockopt(uint64_t socketHandle, uint64_t level, uint64_t optionName, uint64_t optionValue, uint64_t optionLength);
+    uint64_t sys_setsockopt(uint64_t socketHandle, uint64_t level, uint64_t optionName, uint64_t optionValue, uint64_t optionLength);
     uint64_t sys_getppid();
     uint64_t sys_spawn(uint64_t path, uint64_t argv, uint64_t envp);
     uint64_t sys_thread_create(uint64_t entry, uint64_t arg, uint64_t stackSize);

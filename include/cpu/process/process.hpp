@@ -29,16 +29,38 @@ struct ProcessContext {
 };
 
 #define NSIG 32
+#define SIGHUP 1
+#define SIGINT 2
+#define SIGQUIT 3
+#define SIGILL 4
+#define SIGABRT 6
+#define SIGFPE 8
 #define SIGKILL 9
+#define SIGUSR1 10
 #define SIGSEGV 11
+#define SIGUSR2 12
+#define SIGPIPE 13
+#define SIGALRM 14
 #define SIGTERM 15
+#define SIGCHLD 17
+
+#define SA_ONSTACK 0x08000000
+#define SA_RESTART 0x10000000
+#define SS_ONSTACK 1
+#define SS_DISABLE 2
 
 typedef void (*sighandler_t)(int);
 
 struct SignalHandler {
   sighandler_t handlers[NSIG];
+  uint64_t masks[NSIG];
+  uint64_t flags[NSIG];
+  uint64_t restorers[NSIG];
   uint64_t pending;
   uint64_t blocked;
+  uint64_t altStackSp;
+  uint64_t altStackSize;
+  uint32_t altStackFlags;
 };
 
 class GDT;
@@ -113,6 +135,8 @@ public:
 
   uint64_t getSavedUserRSP() const { return savedUserRSP; }
   void setSavedUserRSP(uint64_t rsp) { savedUserRSP = rsp; }
+  uint64_t getUserFsBase() const { return userFsBase; }
+  void setUserFsBase(uint64_t base) { userFsBase = base; }
 
   bool isSleeping() const { return sleeping; }
   uint64_t getSleepDeadlineMs() const { return sleepDeadlineMs; }
@@ -131,6 +155,7 @@ public:
   SignalHandler *getSignalHandler() { return &signalHandler; }
   void sendSignal(int sig);
   void handlePendingSignals();
+  bool hasDeliverableSignal() const;
 
   uint64_t getMmapBase() const;
   uint64_t reserveMmapRegion(uint64_t size);
@@ -139,15 +164,20 @@ public:
   ThreadObject *getThreadObject() { return threadObject; }
   const ThreadObject *getThreadObject() const { return threadObject; }
   void setThreadObject(ThreadObject *object) { threadObject = object; }
+  bool replaceImageFrom(Process *image);
 
   // File descriptor management
   uint64_t allocateFD(FileDescriptor *fd);
   uint64_t allocateFD(FileDescriptor *fd, uint32_t rights);
+  uint64_t allocateFD(FileDescriptor *fd, uint32_t rights, bool closeOnExec);
   FileDescriptor *getFD(uint64_t fileHandle);
   FileDescriptor *getFD(uint64_t fileHandle, uint32_t requiredRights);
   void closeFD(uint64_t fileHandle);
   uint64_t duplicateFD(uint64_t fileHandle);
   bool duplicateFDTo(uint64_t oldFileHandle, uint64_t newFileHandle);
+  bool getHandleCloseOnExec(uint64_t handle, bool *enabled) const;
+  bool setHandleCloseOnExec(uint64_t handle, bool enabled);
+  void closeOnExecHandles();
 
   // Typed handle management
   uint64_t allocateHandle(HandleType type, uint32_t rights, void *object, HandleRetainFn retain, HandleReleaseFn release);
@@ -209,6 +239,7 @@ private:
   FPUState *fpuState;
   bool validUserState;
   uint64_t savedUserRSP;
+  uint64_t userFsBase;
   uint64_t sleepDeadlineMs;
   bool sleeping;
   SignalHandler signalHandler;

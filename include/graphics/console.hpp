@@ -15,6 +15,7 @@ private:
     Pair<uint64_t, uint64_t> savedCursorPointer { 0, 0 };
     bool useVirtIO;
     bool copyScrollEnabled;
+    bool framebufferOutputEnabled;
     
     enum class AnsiState {
         NORMAL,
@@ -53,6 +54,7 @@ private:
     void advance();
     void newLine();
     void scroll();
+    void clearRect(uint64_t x, uint64_t y, uint64_t w, uint64_t h);
     void flushIfNeeded();
     void lock();
     void unlock();
@@ -121,6 +123,7 @@ public:
     void setBackgroundColor(Color color);
     void setVirtIO(bool enabled) { useVirtIO = enabled; }
     void setCopyScrollEnabled(bool enabled) { copyScrollEnabled = enabled; }
+    void setFramebufferOutputEnabled(bool enabled) { framebufferOutputEnabled = enabled; }
     iFramebuffer* getFramebuffer() { return framebuffer; }
 
     template<typename... Args>
