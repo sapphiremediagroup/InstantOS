@@ -198,6 +198,7 @@ uint64_t* PMM::s_bitmap      = nullptr;
 uint64_t  PMM::s_bitmapSize  = 0;
 uint64_t  PMM::s_totalFrames = 0;
 uint64_t  PMM::s_usedFrames  = 0;
+uint64_t  PMM::s_usableFrames = 0;
 bool      PMM::s_initialized = false;
 
 // ── Bit-manipulation helpers ──────────────────────────────────────────────
@@ -219,6 +220,7 @@ void PMM::Initialize(const MemoryMap& map, uint64_t kernelBase, uint64_t kernelS
     s_bitmapSize = 0;
     s_totalFrames = 0;
     s_usedFrames = 0;
+    s_usableFrames = 0;
     s_initialized = false;
 
     g_nullReservation = {0, 0, "null-page guard"};
@@ -329,6 +331,7 @@ void PMM::Initialize(const MemoryMap& map, uint64_t kernelBase, uint64_t kernelS
             if (TestFrame(frame)) {
                 ClearFrame(frame);
                 s_usedFrames--;
+                s_usableFrames++;
             }
         }
     }
@@ -533,9 +536,16 @@ void PMM::DumpReservations() {
 uint64_t PMM::TotalFrames()    { return s_totalFrames; }
 uint64_t PMM::UsedFrames()     { return s_usedFrames; }
 uint64_t PMM::FreeFrameCount() { return s_totalFrames - s_usedFrames; }
+uint64_t PMM::UsableFrames()   { return s_usableFrames; }
+uint64_t PMM::UsedUsableFrames() {
+    uint64_t freeFrames = FreeFrameCount();
+    return freeFrames >= s_usableFrames ? 0 : s_usableFrames - freeFrames;
+}
 
 uint64_t PMM::TotalMemory()    { return s_totalFrames * PAGE_SIZE; }
 uint64_t PMM::FreeMemory()     { return FreeFrameCount() * PAGE_SIZE; }
 uint64_t PMM::UsedMemory()     { return s_usedFrames * PAGE_SIZE; }
+uint64_t PMM::UsableMemory()   { return UsableFrames() * PAGE_SIZE; }
+uint64_t PMM::UsedUsableMemory() { return UsedUsableFrames() * PAGE_SIZE; }
 
 bool     PMM::IsInitialized()  { return s_initialized; }

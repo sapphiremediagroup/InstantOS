@@ -167,10 +167,10 @@ uint64_t Syscall::sys_osinfo(uint64_t info_ptr) {
 
     char buf[16];
     memset(buf, 0, sizeof(buf));
-    uitoa(PMM::TotalMemory() / (1024 * 1024), buf, sizeof(buf));
+    uitoa(PMM::UsableMemory() / (1024 * 1024), buf, sizeof(buf));
     strncpy(info.maxRamGB, buf, sizeof(info.maxRamGB) - 1);
     
-    uint64_t usedBytes = PMM::UsedMemory();
+    uint64_t usedBytes = PMM::UsedUsableMemory();
     uint64_t usedMB = usedBytes / (1024 * 1024);
     char buf2[16];
     memset(buf2, 0, sizeof(buf2));

@@ -45,10 +45,14 @@ public:
     static uint64_t TotalFrames();         // Total tracked frames
     static uint64_t UsedFrames();          // Currently allocated frames
     static uint64_t FreeFrameCount();      // Currently free frames
+    static uint64_t UsableFrames();        // Frames originally available for allocation
+    static uint64_t UsedUsableFrames();    // Usable frames currently not free
 
     static uint64_t TotalMemory();         // Total tracked bytes
     static uint64_t FreeMemory();          // Free bytes
     static uint64_t UsedMemory();          // Used bytes
+    static uint64_t UsableMemory();        // Usable physical RAM bytes
+    static uint64_t UsedUsableMemory();    // Used usable physical RAM bytes
 
     static bool IsInitialized();
 
@@ -63,6 +67,7 @@ private:
     static uint64_t  s_bitmapSize;      // Number of uint64_t entries
     static uint64_t  s_totalFrames;     // Highest frame tracked
     static uint64_t  s_usedFrames;      // Number of frames currently marked used
+    static uint64_t  s_usableFrames;    // Frames from bootloader Free regions
     static bool      s_initialized;
 
     // Internal helpers
