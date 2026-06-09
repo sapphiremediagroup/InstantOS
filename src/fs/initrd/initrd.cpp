@@ -1,10 +1,22 @@
 #include <fs/initrd/initrd.hpp>
 #include <common/string.hpp>
+#include <graphics/console.hpp>
 
 constexpr uint32_t INITRD_MAGIC = 0x44524E49;
 static constexpr uint64_t INITRD_DIRECTORY_INODE_BASE = 0x8000000000000000ULL;
 
-InitrdFS::InitrdFS(void* data, size_t size) : FileSystem("initrd"), data(data), dataSize(size), header(nullptr), rootNode(nullptr) {
+InitrdFS::InitrdFS(void* data, size_t size, const char* prefix)
+    : FileSystem("initrd"), data(data), dataSize(size), header(nullptr), rootNode(nullptr) {
+    rootPrefix[0] = '\0';
+    if (prefix) {
+        size_t i = 0;
+        while (prefix[i] && i < sizeof(rootPrefix) - 1) {
+            rootPrefix[i] = prefix[i];
+            i++;
+        }
+        rootPrefix[i] = '\0';
+    }
+
     if (data && size >= sizeof(InitrdHeader)) {
         header = static_cast<InitrdHeader*>(data);
         if (header->magic != INITRD_MAGIC) {
@@ -23,6 +35,11 @@ InitrdFS::InitrdFS(void* data, size_t size) : FileSystem("initrd"), data(data), 
     ops.mkdir = nullptr;
     ops.unlink = nullptr;
     ops.rmdir = nullptr;
+    ops.truncate = nullptr;
+    ops.rename = nullptr;
+    ops.chmod = nullptr;
+    ops.utime = nullptr;
+    ops.link = nullptr;
 }
 
 InitrdFS::~InitrdFS() {
@@ -57,14 +74,42 @@ int InitrdFS::nodeClose(VNode* node) {
 }
 
 int64_t InitrdFS::nodeRead(VNode* node, void* buffer, uint64_t size, uint64_t offset) {
-    if (!node || !buffer) return -1;
+    if (!node || !buffer) {
+        Console::get().drawText("[initrd] read invalid node/buffer node=");
+        Console::get().drawHex(reinterpret_cast<uint64_t>(node));
+        Console::get().drawText(" buffer=");
+        Console::get().drawHex(reinterpret_cast<uint64_t>(buffer));
+        Console::get().drawText("\n");
+        return -1;
+    }
     
     InitrdFS* fs = static_cast<InitrdFS*>(node->getFS());
-    if (!fs || !fs->header) return -1;
-    if (node->getType() != FileType::Regular) return -1;
+    if (!fs || !fs->header) {
+        Console::get().drawText("[initrd] read missing fs/header fs=");
+        Console::get().drawHex(reinterpret_cast<uint64_t>(fs));
+        Console::get().drawText(" header=");
+        Console::get().drawHex(fs ? reinterpret_cast<uint64_t>(fs->header) : 0);
+        Console::get().drawText("\n");
+        return -1;
+    }
+    if (node->getType() != FileType::Regular) {
+        Console::get().drawText("[initrd] read non-regular type=");
+        Console::get().drawNumber(static_cast<int64_t>(node->getType()));
+        Console::get().drawText(" inode=");
+        Console::get().drawNumber(static_cast<int64_t>(node->getInode()));
+        Console::get().drawText("\n");
+        return -1;
+    }
     
     uint64_t inode = node->getInode();
-    if (inode == 0 || inode > fs->header->fileCount) return -1;
+    if (inode == 0 || inode > fs->header->fileCount) {
+        Console::get().drawText("[initrd] read bad inode inode=");
+        Console::get().drawNumber(static_cast<int64_t>(inode));
+        Console::get().drawText(" file_count=");
+        Console::get().drawNumber(static_cast<int64_t>(fs->header->fileCount));
+        Console::get().drawText("\n");
+        return -1;
+    }
     
     InitrdFile* file = &fs->header->files[inode - 1];
     
@@ -201,8 +246,13 @@ VNode* InitrdFS::nodeLookup(VNode* node, const char* name) {
 }
 
 const char* InitrdFS::nodePathPrefix(VNode* node) {
-    if (!node || node->getInode() == 0) {
+    if (!node) {
         return "";
+    }
+
+    if (node->getInode() == 0) {
+        InitrdFS* fs = static_cast<InitrdFS*>(node->getFS());
+        return fs ? fs->rootPrefix : "";
     }
 
     const char* prefix = static_cast<const char*>(node->getData());

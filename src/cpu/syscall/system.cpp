@@ -7,8 +7,11 @@
 #include <memory/vmm.hpp>
 #include <memory/heap.hpp>
 #include <graphics/console.hpp>
+#include <graphics/gpu.hpp>
 #include <graphics/virtio_gpu.hpp>
 #include <common/string.hpp>
+#include <time/time.hpp>
+#include <fs/storage/storage.hpp>
 #include <cpuid.h>
 
 size_t strncpyToUser(char* user_dest, const char* kernel_src, size_t max_len) {
@@ -84,7 +87,7 @@ bool currentProcessOwnsFramebuffer() {
         return false;
     }
 
-    return strcmp(current->getName(), "/bin/graphics-compositor.exe") == 0;
+    return strcmp(current->getName(), "/bin/graphics-compositor") == 0;
 }
 
 bool mapFramebufferIntoCurrentProcess(iFramebuffer* fb, uint64_t* userBase) {
@@ -182,8 +185,29 @@ uint64_t Syscall::sys_osinfo(uint64_t info_ptr) {
     return copyToUser(info_ptr, &info, sizeof(OSInfo)) ? 0 : (uint64_t)-1;
 }
 
+uint64_t Syscall::sys_storage_info(uint64_t infoPtr) {
+    if (!isValidUserPointer(infoPtr, sizeof(StorageInfo))) {
+        return syscall_error(SysErrInvalid);
+    }
+
+    StorageInfo info = KernelStorage::snapshot();
+    return copyToUser(infoPtr, &info, sizeof(info)) ? 0 : syscall_error(SysErrInvalid);
+}
+
+uint64_t Syscall::sys_storage_format() {
+    return KernelStorage::formatFat32() == 0 ? 0 : syscall_error(SysErrInvalid);
+}
+
+uint64_t Syscall::sys_storage_mount() {
+    return KernelStorage::mountFat32() == 0 ? 0 : syscall_error(SysErrInvalid);
+}
+
 uint64_t Syscall::sys_gettime() {
     return Timer::get().getMilliseconds();
+}
+
+uint64_t Syscall::sys_getunixtime() {
+    return time_get_unix();
 }
 
 uint64_t Syscall::sys_clear() {
@@ -246,14 +270,12 @@ uint64_t Syscall::sys_fb_map() {
 uint64_t Syscall::sys_fb_flush(uint64_t x, uint64_t y, uint64_t w, uint64_t h) {
     if (!currentProcessOwnsFramebuffer()) return (uint64_t)-1;
 
-    VirtIOGPUDriver& gpu = VirtIOGPUDriver::get();
+    GPU& gpu = GPU::get();
     if (gpu.isInitialized()) {
-        return gpu.flush(
-            static_cast<uint32_t>(x),
-            static_cast<uint32_t>(y),
-            static_cast<uint32_t>(w),
-            static_cast<uint32_t>(h)
-        ) ? 0 : (uint64_t)-1;
+        return gpu.flush(static_cast<uint32_t>(x),
+                         static_cast<uint32_t>(y),
+                         static_cast<uint32_t>(w),
+                         static_cast<uint32_t>(h)) ? 0 : (uint64_t)-1;
     }
 
     return 0;
@@ -330,8 +352,8 @@ uint64_t Syscall::sys_gpu_context_create(uint64_t createPtr) {
     const bool ok = request.capsetId != 0
         ? gpu.createContextWithCapset(&ctxId, request.capsetId, request.debugName,
                                       request.contextInit, request.ringIdx, request.useRingIdx != 0)
-        : gpu.createContext(&ctxId, request.debugName, request.contextInit,
-                            request.ringIdx, request.useRingIdx != 0);
+        : GPU::get().createContext(&ctxId, request.debugName,
+                                   request.contextInit, request.ringIdx, request.useRingIdx != 0);
     if (!ok) {
         return static_cast<uint64_t>(-1);
     }
@@ -341,7 +363,7 @@ uint64_t Syscall::sys_gpu_context_create(uint64_t createPtr) {
 }
 
 uint64_t Syscall::sys_gpu_context_destroy(uint64_t ctxId) {
-    return VirtIOGPUDriver::get().destroyContext(static_cast<uint32_t>(ctxId)) ? 0 : static_cast<uint64_t>(-1);
+    return GPU::get().destroyContext(static_cast<uint32_t>(ctxId)) ? 0 : static_cast<uint64_t>(-1);
 }
 
 uint64_t Syscall::sys_gpu_resource_create_3d(uint64_t createPtr) {
@@ -430,14 +452,21 @@ uint64_t Syscall::sys_gpu_submit_3d(uint64_t submitPtr) {
         return static_cast<uint64_t>(-1);
     }
 
-    const bool ok = VirtIOGPUDriver::get().submit3D(request.ctxId, kernelCommands, request.size);
+    GPUCommand command = {};
+    GPUCommandResult result = {};
+    command.type = GPUCommandType::Submit3D;
+    command.contextId = request.ctxId;
+    command.data = kernelCommands;
+    command.size = request.size;
+
+    const bool ok = GPU::get().submitCommand(command, &result);
     kfree(kernelCommands);
 
     const VirtIOGPUCommandStatus status = VirtIOGPUDriver::get().getLastCommandStatus();
     request.transportOk = ok ? 1 : 0;
     request.responseOk = status.responseOk ? 1 : 0;
-    request.responseType = status.responseType;
-    request.submittedFence = status.submittedFence;
+    request.responseType = result.status ? result.status : status.responseType;
+    request.submittedFence = result.value64 ? result.value64 : status.submittedFence;
     request.completedFence = status.completedFence;
 
     return copyToUser(submitPtr, &request, sizeof(request)) ? 0 : static_cast<uint64_t>(-1);
@@ -456,7 +485,7 @@ uint64_t Syscall::sys_gpu_wait_fence(uint64_t waitPtr) {
     const uint64_t spinLimit = request.timeoutIterations != 0 ? request.timeoutIterations : 1000000ULL;
     uint64_t completedFence = 0;
     uint32_t responseType = 0;
-    const bool ok = VirtIOGPUDriver::get().waitForFence(request.fenceId, spinLimit, &completedFence, &responseType);
+    const bool ok = GPU::get().waitForFence(request.fenceId, spinLimit, &completedFence, &responseType);
 
     request.completed = ok ? 1 : 0;
     request.completedFence = completedFence;

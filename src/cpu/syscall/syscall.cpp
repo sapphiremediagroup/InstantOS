@@ -21,6 +21,7 @@ extern "C" uint64_t userRSP = 0;
 extern "C" uint64_t kernelStackTop = 0;
 
 extern "C" void saveSyscallState(uint64_t* stack);
+extern "C" void restoreSyscallState(uint64_t* stack, uint64_t result);
 
 extern "C" __attribute__((naked)) void syscallEntry()
 {
@@ -65,7 +66,11 @@ extern "C" __attribute__((naked)) void syscallEntry()
         "call syscallHandler\n\t"
         "add rsp, 0x38\n\t"
 
-        "mov [rbp + 14*8], rax\n\t"
+        "mov rcx, rbp\n\t"
+        "mov rdx, rax\n\t"
+        "sub rsp, 0x28\n\t"
+        "call restoreSyscallState\n\t"
+        "add rsp, 0x28\n\t"
         "mov rsp, rbp\n\t"
 
         "pop r15\n\t"
@@ -136,11 +141,13 @@ uint64_t Syscall::handle(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
         case OSInfo:
             return sys_osinfo(arg1);
         case ProcInfo:
-            return 0;
+            return sys_procinfo(arg1, arg2, arg3);
         case Exit:
             return sys_exit(arg1);
         case Write:
             return sys_write(arg1, arg2, arg3);
+        case SerialWrite:
+            return sys_serial_write(arg1, arg2);
         case Read:
             return sys_read(arg1, arg2, arg3);
         case Open:
@@ -154,13 +161,15 @@ uint64_t Syscall::handle(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
         case Exec:
             return sys_exec(arg1, arg2, arg3);
         case Wait:
-            return sys_wait(arg1, arg2);
+            return sys_wait(arg1, arg2, arg3);
         case Kill:
             return sys_kill(arg1, arg2);
         case Mmap:
             return sys_mmap(arg1, arg2, arg3);
         case Munmap:
             return sys_munmap(arg1, arg2);
+        case Mprotect:
+            return sys_mprotect(arg1, arg2, arg3);
         case Yield:
             return sys_yield();
         case Sleep:
@@ -177,6 +186,36 @@ uint64_t Syscall::handle(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
             return sys_signal(arg1, arg2);
         case SigReturn:
             return sys_sigreturn();
+        case Sigprocmask:
+            return sys_sigprocmask(arg1, arg2, arg3);
+        case Sigaction:
+            return sys_sigaction(arg1, arg2, arg3);
+        case Sigaltstack:
+            return sys_sigaltstack(arg1, arg2);
+        case ThreadSignal:
+            return sys_thread_signal(arg1, arg2);
+        case SetThreadPointer:
+            return sys_set_thread_pointer(arg1);
+        case Socket:
+            return sys_socket(arg1, arg2, arg3);
+        case Bind:
+            return sys_bind(arg1, arg2, arg3);
+        case Connect:
+            return sys_connect(arg1, arg2, arg3);
+        case Listen:
+            return sys_listen(arg1, arg2);
+        case Accept:
+            return sys_accept(arg1, arg2, arg3);
+        case Send:
+            return sys_send(arg1, arg2, arg3, arg4);
+        case Recv:
+            return sys_recv(arg1, arg2, arg3, arg4);
+        case Shutdown:
+            return sys_shutdown(arg1, arg2);
+        case GetSockOpt:
+            return sys_getsockopt(arg1, arg2, arg3, arg4, arg5);
+        case SetSockOpt:
+            return sys_setsockopt(arg1, arg2, arg3, arg4, arg5);
         case Login:
             return sys_login(arg1);
         case Logout:
@@ -205,12 +244,34 @@ uint64_t Syscall::handle(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
             return sys_unlink(arg1);
         case Stat:
             return sys_stat(arg1, arg2);
+        case Fstat:
+            return sys_fstat(arg1, arg2);
+        case Link:
+            return sys_link(arg1, arg2);
+        case Symlink:
+            return sys_symlink(arg1, arg2);
+        case Readlink:
+            return sys_readlink(arg1, arg2, arg3);
+        case Lstat:
+            return sys_lstat(arg1, arg2);
         case Dup:
             return sys_dup(arg1);
         case Dup2:
             return sys_dup2(arg1, arg2);
         case Pipe:
             return sys_pipe(arg1);
+        case Fcntl:
+            return sys_fcntl(arg1, arg2, arg3);
+        case Poll:
+            return sys_poll(arg1, arg2);
+        case Truncate:
+            return sys_truncate(arg1, arg2, arg3);
+        case Rename:
+            return sys_rename(arg1, arg2);
+        case Chmod:
+            return sys_chmod(arg1, arg2, arg3);
+        case Utime:
+            return sys_utime(arg1, arg2, arg3, arg4);
         case Getppid:
             return sys_getppid();
         case Spawn:
@@ -267,6 +328,20 @@ uint64_t Syscall::handle(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
             return sys_service_register(arg1, arg2);
         case ServiceConnect:
             return sys_service_connect(arg1);
+        case NetGetMAC:
+            return sys_net_get_mac(arg1);
+        case NetSend:
+            return sys_net_send(arg1, arg2);
+        case NetRecv:
+            return sys_net_recv(arg1, arg2);
+        case NetLinkStatus:
+            return sys_net_link_status();
+        case NetPing:
+            return sys_net_ping(arg1, arg2, arg3);
+        case NetProcessPackets:
+            return sys_net_process_packets();
+        case NetGetPingReply:
+            return sys_net_get_ping_reply(arg1);
         case ThreadCreate:
             return sys_thread_create(arg1, arg2, arg3);
         case ThreadExit:
@@ -293,8 +368,16 @@ uint64_t Syscall::handle(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
             return sys_gpu_submit_3d(arg1);
         case GPUWaitFence:
             return sys_gpu_wait_fence(arg1);
+        case GetUnixTime:
+            return sys_getunixtime();
+        case StorageInfo:
+            return sys_storage_info(arg1);
+        case StorageFormat:
+            return sys_storage_format();
+        case StorageMount:
+            return sys_storage_mount();
         default:
-            return (uint64_t)-1;
+            return syscall_error(SysErrNoSys);
     }
 }
 
@@ -398,6 +481,13 @@ extern "C" uint64_t syscallHandler(uint64_t syscall_num, uint64_t arg1, uint64_t
     Debug::beginSyscallTrace(current, syscall_num, arg1, arg2, arg3, arg4, arg5);
     uint64_t result = Syscall::get().handle(syscall_num, arg1, arg2, arg3, arg4, arg5);
     Debug::endSyscallTrace(current);
+
+    if (current && static_cast<SyscallNumber>(syscall_num) != SyscallNumber::SigReturn) {
+        current->getContext()->rax = result;
+        if (current->hasValidUserState()) {
+            current->handlePendingSignals();
+        }
+    }
 
     if (current && current->userFpuState) {
         CPU::restoreExtendedState(current->userFpuState);

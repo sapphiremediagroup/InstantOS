@@ -25,6 +25,8 @@ constexpr uint32_t kControlQueueIndex = 0;
 constexpr uint32_t kCursorQueueIndex = 1;
 constexpr uint16_t kQueueSize = 64;
 constexpr uint64_t kCommandTimeout = 1000000ULL;
+constexpr uint32_t kPreferredFramebufferWidth = 1280;
+constexpr uint32_t kPreferredFramebufferHeight = 720;
 
 static void virtio_barrier() {
     asm volatile("" ::: "memory");
@@ -286,10 +288,10 @@ bool VirtIOGPUDriver::initialize() {
     if (!getDisplayInfo()) {
         if (fallbackWidth != 0 && fallbackHeight != 0) {
             Console::get().drawText("[VGPU:init] getDisplayInfo failed, forcing boot fallback\n");
-            maxWidth = fallbackWidth;
-            maxHeight = fallbackHeight;
-            currentWidth = fallbackWidth;
-            currentHeight = fallbackHeight;
+            maxWidth = kPreferredFramebufferWidth;
+            maxHeight = kPreferredFramebufferHeight;
+            currentWidth = kPreferredFramebufferWidth;
+            currentHeight = kPreferredFramebufferHeight;
         } else {
             Console::get().drawText("[VGPU:init] getDisplayInfo failed\n");
             return false;
@@ -616,8 +618,14 @@ bool VirtIOGPUDriver::getDisplayInfo() {
         if (mode.enabled && mode.r.width > 0 && mode.r.height > 0) {
             maxWidth = mode.r.width;
             maxHeight = mode.r.height;
-            currentWidth = mode.r.width;
-            currentHeight = mode.r.height;
+            currentWidth = kPreferredFramebufferWidth;
+            currentHeight = kPreferredFramebufferHeight;
+            if (maxWidth < currentWidth) {
+                maxWidth = currentWidth;
+            }
+            if (maxHeight < currentHeight) {
+                maxHeight = currentHeight;
+            }
             return true;
         }
     }
@@ -626,17 +634,23 @@ bool VirtIOGPUDriver::getDisplayInfo() {
         Console::get().drawText("[VGPU:init] using pmodes fallback\n");
         maxWidth = pmodeFallbackWidth;
         maxHeight = pmodeFallbackHeight;
-        currentWidth = pmodeFallbackWidth;
-        currentHeight = pmodeFallbackHeight;
+        currentWidth = kPreferredFramebufferWidth;
+        currentHeight = kPreferredFramebufferHeight;
+        if (maxWidth < currentWidth) {
+            maxWidth = currentWidth;
+        }
+        if (maxHeight < currentHeight) {
+            maxHeight = currentHeight;
+        }
         return true;
     }
 
     if (fallbackWidth != 0 && fallbackHeight != 0) {
         Console::get().drawText("[VGPU:init] using boot fallback mode\n");
-        maxWidth = fallbackWidth;
-        maxHeight = fallbackHeight;
-        currentWidth = fallbackWidth;
-        currentHeight = fallbackHeight;
+        maxWidth = kPreferredFramebufferWidth;
+        maxHeight = kPreferredFramebufferHeight;
+        currentWidth = kPreferredFramebufferWidth;
+        currentHeight = kPreferredFramebufferHeight;
         return true;
     }
 
@@ -1722,32 +1736,12 @@ void VirtIOGPUDriver::processControlQueueCompletions() {
 }
 
 bool VirtIOGPUDriver::awaitFence(FenceWaiter& waiter) {
-    Process* current = Scheduler::get().getCurrentProcess();
-    if (current && waiter.ownerPID == current->getPID() && irqRegistered) {
-        while (waiter.used && !waiter.completed) {
-            processControlQueueCompletions();
-            if (waiter.completed) {
-                break;
-            }
-            current->setState(ProcessState::Blocked);
-            Scheduler::get().scheduleFromSyscall();
-            processControlQueueCompletions();
-        }
-
-        return waiter.completed && waiter.transportOk;
-    }
-
     for (uint64_t i = 0; i < kCommandTimeout; ++i) {
         processControlQueueCompletions();
         if (!waiter.used || waiter.completed) {
             return waiter.completed && waiter.transportOk;
         }
-
-        if (irqRegistered && isrCfg && interrupts_enabled()) {
-            cpu_wait_for_interrupt();
-        } else {
-            cpu_pause();
-        }
+        cpu_pause();
     }
 
     return false;

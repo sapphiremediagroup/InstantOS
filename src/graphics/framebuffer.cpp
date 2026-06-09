@@ -13,6 +13,10 @@ void iFramebuffer::clear(Color color) {
     buffer.clear(color);
 }
 
+void iFramebuffer::fillRect(uint64_t x, uint64_t y, uint64_t w, uint64_t h, Color color) {
+    buffer.fillRect(x, y, w, h, color);
+}
+
 void iFramebuffer::clearGradient(Color c1, Color c2) {
     uint64_t w = getWidth();
     uint64_t h = getHeight();

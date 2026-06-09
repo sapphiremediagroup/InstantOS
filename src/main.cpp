@@ -8,6 +8,7 @@
 #include "fs/ahci/detect.hpp"
 #include "fs/fat32/fat32.hpp"
 #include "fs/ramfs/ramfs.hpp"
+#include <fs/storage/storage.hpp>
 #include <fs/initrd/initrd.hpp>
 #include <iboot/memory.hpp>
 #include <cpu/gdt/gdt.hpp>
@@ -17,11 +18,13 @@
 #include <memory/heap.hpp>
 #include <memory/vmm.hpp>
 #include <graphics/framebuffer.hpp>
+#include <graphics/gpu.hpp>
 #include <graphics/console.hpp>
 #include <cpu/acpi/acpi.hpp>
 #include <cpu/apic/apic.hpp>
 #include <cpu/apic/pic.hpp>
 #include <cpu/cpuid.hpp>
+#include <common/string.hpp>
 #include <debug/diag.hpp>
 #include <drivers/hid/i2c_hid.hpp>
 #include <drivers/usb/ohci.hpp>
@@ -33,10 +36,150 @@
 unsigned long long runtimeBase;
 
 namespace {
+#if !defined(INSTANTOS_DEBUG) && !defined(INPUT_PROBE_ONLY)
+#define INSTANTOS_BOOT_SPINNER 1
+#endif
+
 struct TableRegister {
     uint16_t limit;
     uint64_t base;
 } __attribute__((packed));
+
+#ifdef INSTANTOS_BOOT_SPINNER
+class BootSpinner {
+public:
+    explicit BootSpinner(iFramebuffer& framebufferVal)
+        : framebuffer(framebufferVal), frame(0) {}
+
+    void start() {
+        Console::get().setFramebufferOutputEnabled(false);
+        render();
+    }
+
+    void step() {
+        ++frame;
+        render();
+    }
+
+    void finish() {
+        framebuffer.clear(0);
+        flushIfNeeded();
+        Console::get().setFramebufferOutputEnabled(true);
+    }
+
+private:
+    static constexpr int kDotCount = 12;
+    static constexpr int kRadius = 34;
+    static constexpr int kDotRadius = 4;
+    static constexpr int kClearRadius = kRadius + kDotRadius + 4;
+
+    iFramebuffer& framebuffer;
+    uint32_t frame;
+
+    void fillCircle(int centerX, int centerY, int radius, Color color) {
+        static constexpr int kSubpixelScale = 8;
+        static constexpr int kSampleCount = 16;
+        static constexpr int kSampleOffsets[4] = { -3, -1, 1, 3 };
+        const int scaledRadius = radius * kSubpixelScale;
+        const int scaledRadiusSquared = scaledRadius * scaledRadius;
+        const int extent = radius + 1;
+
+        for (int y = -extent; y <= extent; ++y) {
+            for (int x = -extent; x <= extent; ++x) {
+                int coverage = 0;
+                for (int sampleY = 0; sampleY < 4; ++sampleY) {
+                    for (int sampleX = 0; sampleX < 4; ++sampleX) {
+                        const int scaledX = x * kSubpixelScale + kSampleOffsets[sampleX];
+                        const int scaledY = y * kSubpixelScale + kSampleOffsets[sampleY];
+                        if (scaledX * scaledX + scaledY * scaledY <= scaledRadiusSquared) {
+                            ++coverage;
+                        }
+                    }
+                }
+
+                if (coverage == 0) {
+                    continue;
+                }
+
+                const int pixelX = centerX + x;
+                const int pixelY = centerY + y;
+                if (pixelX >= 0 && pixelY >= 0) {
+                    const Color blended(
+                        static_cast<uint8_t>((color.r * coverage) / kSampleCount),
+                        static_cast<uint8_t>((color.g * coverage) / kSampleCount),
+                        static_cast<uint8_t>((color.b * coverage) / kSampleCount)
+                    );
+                    framebuffer.putPixel(static_cast<uint64_t>(pixelX),
+                                         static_cast<uint64_t>(pixelY),
+                                         blended);
+                }
+            }
+        }
+    }
+
+    Color dotColor(int age) const {
+        const uint8_t value = static_cast<uint8_t>(80 + ((kDotCount - age) * 175) / kDotCount);
+        return Color(value, value, value);
+    }
+
+    void clearArea(int centerX, int centerY) {
+        for (int y = -kClearRadius; y <= kClearRadius; ++y) {
+            for (int x = -kClearRadius; x <= kClearRadius; ++x) {
+                const int pixelX = centerX + x;
+                const int pixelY = centerY + y;
+                if (pixelX >= 0 && pixelY >= 0) {
+                    framebuffer.putPixel(static_cast<uint64_t>(pixelX),
+                                         static_cast<uint64_t>(pixelY),
+                                         0);
+                }
+            }
+        }
+    }
+
+    void render() {
+        static constexpr int offsets[kDotCount][2] = {
+            { 0, -34 }, { 17, -29 }, { 29, -17 }, { 34, 0 },
+            { 29, 17 }, { 17, 29 }, { 0, 34 }, { -17, 29 },
+            { -29, 17 }, { -34, 0 }, { -29, -17 }, { -17, -29 },
+        };
+
+        const int centerX = static_cast<int>(framebuffer.getWidth() / 2);
+        const int centerY = static_cast<int>(framebuffer.getHeight() / 2);
+        clearArea(centerX, centerY);
+
+        const int active = static_cast<int>(frame % kDotCount);
+        for (int i = 0; i < kDotCount; ++i) {
+            int age = active - i;
+            if (age < 0) {
+                age += kDotCount;
+            }
+            fillCircle(centerX + offsets[i][0],
+                       centerY + offsets[i][1],
+                       kDotRadius,
+                       dotColor(age));
+        }
+
+        flushIfNeeded();
+    }
+
+    void flushIfNeeded() {
+        VirtIOGPUDriver& gpu = VirtIOGPUDriver::get();
+        if (gpu.isInitialized()) {
+            gpu.flush(0, 0, framebuffer.getWidth(), framebuffer.getHeight());
+        }
+    }
+};
+
+BootSpinner* activeBootSpinner = nullptr;
+
+void tickBootSpinner() {
+    if (activeBootSpinner) {
+        activeBootSpinner->step();
+    }
+}
+#else
+void tickBootSpinner() {}
+#endif
 
 void drawHexLine(const char* label, uint64_t value) {
     Console::get().drawText(label);
@@ -107,6 +250,9 @@ bool waitForKeyboardProbe(uint32_t iterations) {
             return true;
         }
         pollInputBackends();
+        if ((i % 50000) == 0) {
+            tickBootSpinner();
+        }
         asm volatile("pause");
     }
     return hasAnyKeyboard();
@@ -178,6 +324,9 @@ void waitForKeyboardBeforeBoot() {
     uint32_t polls = 0;
     while (!hasAnyKeyboard()) {
         pollInputBackends();
+        if ((polls % 50000) == 0) {
+            tickBootSpinner();
+        }
         if (++polls == 2000000) {
             drawKeyboardStatus("[input] still waiting:");
             drawKeyboardFailureHints();
@@ -295,6 +444,7 @@ void launchInitrdService(const char* binaryPath) {
     if (process) {
         Scheduler::get().addProcess(process);
     }
+    tickBootSpinner();
 }
 }
 
@@ -366,14 +516,36 @@ extern "C" void InstantOS(BootInfo* bootInfo) {
     Console::get().setBackgroundColor(0);
     Console::get().setTextColor(0xFFFFFF);
     fb.clear(0);
+#ifdef INSTANTOS_BOOT_SPINNER
+    BootSpinner bootSpinner(fb);
+    activeBootSpinner = &bootSpinner;
+    bootSpinner.start();
+#endif
 
     GDT::get().initialize();
+#ifdef INSTANTOS_BOOT_SPINNER
+    bootSpinner.step();
+#endif
     
     if (!CPU::initialize()) {
         while (1) {
             asm("hlt");
         }
     }
+    memory_init_acceleration();
+    if (!memory_validate_acceleration()) {
+        Console::get().drawText("Memory acceleration: [ ");
+        Console::get().setTextColor(0xFF0000);
+        Console::get().drawText("FAIL");
+        Console::get().setTextColor(0xFFFFFF);
+        Console::get().drawText(" ]\n");
+        while (1) {
+            asm("hlt");
+        }
+    }
+#ifdef INSTANTOS_BOOT_SPINNER
+    bootSpinner.step();
+#endif
     
     PMM::Initialize(bootInfo->memoryMap, bootInfo->kernelBase, bootInfo->kernelSize);
     if (bootInfo->framebuffer.base && bootInfo->framebuffer.size) {
@@ -396,8 +568,14 @@ extern "C" void InstantOS(BootInfo* bootInfo) {
         Console::get().drawNumber(static_cast<int64_t>(initrdPages));
         Console::get().drawText("\n");
     }
+#ifdef INSTANTOS_BOOT_SPINNER
+    bootSpinner.step();
+#endif
     
     VMM::Initialize();
+#ifdef INSTANTOS_BOOT_SPINNER
+    bootSpinner.step();
+#endif
     
     size_t heapSize = 0x1000000; // 16 MiB initial heap
     uint64_t heapPages = (heapSize + PMM::PAGE_SIZE - 1) / PMM::PAGE_SIZE;
@@ -413,6 +591,9 @@ extern "C" void InstantOS(BootInfo* bootInfo) {
         }
     }
     heap_init(heapBase, heapSize);
+#ifdef INSTANTOS_BOOT_SPINNER
+    bootSpinner.step();
+#endif
 
     if(!ACPI::get().initialize(bootInfo->rsdp)) {
         Console::get().drawText("ACPI: [ ");
@@ -421,6 +602,9 @@ extern "C" void InstantOS(BootInfo* bootInfo) {
         Console::get().setTextColor(0xFFFFFF);
         Console::get().drawText(" ]\n");
     }
+#ifdef INSTANTOS_BOOT_SPINNER
+    bootSpinner.step();
+#endif
 
     IDT::get();
     PIC::disable();
@@ -432,6 +616,9 @@ extern "C" void InstantOS(BootInfo* bootInfo) {
         Console::get().setTextColor(0xFFFFFF);
         Console::get().drawText(" ]\n");
     }
+#ifdef INSTANTOS_BOOT_SPINNER
+    bootSpinner.step();
+#endif
     
     APICManager& apic = APICManager::get();
     uint8_t targetCore = static_cast<uint8_t>(LAPIC::get().getId());
@@ -440,6 +627,9 @@ extern "C" void InstantOS(BootInfo* bootInfo) {
     apic.mapIRQ(IRQ_TIMER, VECTOR_TIMER, targetCore);
     drawTextLine("[BOOT] after mapIRQ timer");
     Scheduler::get().initialize();
+#ifdef INSTANTOS_BOOT_SPINNER
+    bootSpinner.step();
+#endif
     
     ISR::registerIRQ(VECTOR_TIMER, &Timer::get());
     if (!time_init()) {
@@ -462,32 +652,39 @@ extern "C" void InstantOS(BootInfo* bootInfo) {
     drawTextLine("[BOOT] after mapIRQ mouse");
     USBInput::get().initialize();
     I2CHIDController::get().initialize();
+#ifdef INSTANTOS_BOOT_SPINNER
+    bootSpinner.step();
+#endif
 
 #ifndef INPUT_PROBE_ONLY
     waitForKeyboardBeforeBoot();
+#endif
+#ifdef INSTANTOS_BOOT_SPINNER
+    bootSpinner.step();
 #endif
 
 #ifdef INPUT_PROBE_ONLY
     runInputProbeOnly();
 #endif
 
+    GPU& gpu = GPU::get();
     VirtIOGPUDriver& virtioGpu = VirtIOGPUDriver::get();
     Console::get().drawText("[BOOT] framebuffer fallback=");
     Console::get().drawNumber(static_cast<int64_t>(fb.getWidth()));
     Console::get().drawText("x");
     Console::get().drawNumber(static_cast<int64_t>(fb.getHeight()));
     Console::get().drawText("\n");
-    virtioGpu.setFallbackDisplayMode(static_cast<uint32_t>(fb.getWidth()),
-                                     static_cast<uint32_t>(fb.getHeight()));
-    if (virtioGpu.initialize()) {
+    if (gpu.initialize(&fb) && gpu.getActiveBackendKind() == GPUBackendKind::VirtIO) {
         uint32_t gpuWidth = 0;
         uint32_t gpuHeight = 0;
         virtioGpu.getMode(&gpuWidth, &gpuHeight);
-        fb.switchToVirtIO(virtioGpu.getFramebuffer(), gpuWidth, gpuHeight, virtioGpu.getPitch());
         Console::get().setVirtIO(true);
         Console::get().setCopyScrollEnabled(true);
         fb.clear(0);
-        virtioGpu.flush(0, 0, gpuWidth, gpuHeight);
+        gpu.flush(0, 0, gpuWidth, gpuHeight);
+#ifdef INSTANTOS_BOOT_SPINNER
+        bootSpinner.step();
+#endif
         Console::get().drawText("[BOOT] VirtIO GPU: [ OK ]\n");
         Console::get().drawText("[BOOT] VirtIO GPU IRQ mode: ");
         Console::get().drawText(virtioIrqModeName(virtioGpu.getIRQMode()));
@@ -506,8 +703,14 @@ extern "C" void InstantOS(BootInfo* bootInfo) {
     } else {
         Console::get().drawText("[BOOT] VirtIO GPU: unavailable, using boot framebuffer\n");
     }
+#ifdef INSTANTOS_BOOT_SPINNER
+    bootSpinner.step();
+#endif
     
     Syscall::get().initialize();
+#ifdef INSTANTOS_BOOT_SPINNER
+    bootSpinner.step();
+#endif
 
     TableRegister gdtr = {};
     TableRegister idtr = {};
@@ -522,9 +725,13 @@ extern "C" void InstantOS(BootInfo* bootInfo) {
     UserManager::get().initialize();
     SessionManager::get().initialize();
     VFS::get().initialize();
+#ifdef INSTANTOS_BOOT_SPINNER
+    bootSpinner.step();
+#endif
 
     SATABlockDevice* device = nullptr;
     FAT32FS* fs = nullptr;
+    KernelStorage::reset();
     Console::get().drawText("\033[2Jdetecting ahci\n");
     auto controller = AHCIDetector::detectAndInitialize();
     if (controller) {
@@ -532,9 +739,11 @@ extern "C" void InstantOS(BootInfo* bootInfo) {
         if (port && port->isActive()) {
             static SATABlockDevice _device(port);
             device = &_device;
+            KernelStorage::setDevice("ahci0", device, device->getSize(), 512, true, true);
             static FAT32FS _fs(device);
             fs = &_fs;
             int mountResult = VFS::get().mount(fs, "/");
+            KernelStorage::setMount("/", "fat32", mountResult);
             if(mountResult != 0){
                 Console::get().drawText("Filesystem mounted: [ ");
                 Console::get().setTextColor(0xFF0000);
@@ -543,6 +752,7 @@ extern "C" void InstantOS(BootInfo* bootInfo) {
                 Console::get().drawText(" ]\n");
             }
         } else {
+            KernelStorage::setMount("/", "fat32", -1);
             Console::get().drawText("AHCI Port: [ ");
             Console::get().setTextColor(0xFF0000);
             Console::get().drawText("FAIL");
@@ -550,22 +760,27 @@ extern "C" void InstantOS(BootInfo* bootInfo) {
             Console::get().drawText(" ]\n");
         }
     } else {
+        KernelStorage::setMount("/", "fat32", -1);
         Console::get().drawText("AHCI: [ ");
         Console::get().setTextColor(0xFF0000);
         Console::get().drawText("FAIL");
         Console::get().setTextColor(0xFFFFFF);
         Console::get().drawText(" ]\n");
     }
+#ifdef INSTANTOS_BOOT_SPINNER
+    bootSpinner.step();
+#endif
     
     
     if (bootInfo->initrdBase && bootInfo->initrdSize) {
         Console::get().drawText("Mounting initrdfs...\n");
 
-        static InitrdFS initrdfs(
+        static InitrdFS binInitrdfs(
             reinterpret_cast<void*>(bootInfo->initrdBase),
-            bootInfo->initrdSize
+            bootInfo->initrdSize,
+            "bin"
         );
-        int mountResult = VFS::get().mount(&initrdfs, "/bin");
+        int mountResult = VFS::get().mount(&binInitrdfs, "/bin");
         Console::get().drawText("InitrdFS at /bin: [ ");
         Console::get().setTextColor(mountResult == 0 ? 0x49ceee : 0xFF0000);
         Console::get().drawText(mountResult == 0 ? "OK" : "FAIL");
@@ -573,18 +788,36 @@ extern "C" void InstantOS(BootInfo* bootInfo) {
         Console::get().drawText(" ]\n");
 
         if (mountResult == 0) {
-            Debug::initializeKernelSymbols();
-            // graphics-compositor takes over the framebuffer, so login starts it after authentication.
-            launchInitrdService("/bin/input-manager.exe");
-            launchInitrdService("/bin/storage-manager.exe");
-            launchInitrdService("/bin/process-manager.exe");
-            launchInitrdService("/bin/font-manager.exe");
-            launchInitrdService("/bin/session-manager.exe");
-            launchInitrdService("/bin/login.exe");
+            static InitrdFS libInitrdfs(
+                reinterpret_cast<void*>(bootInfo->initrdBase),
+                bootInfo->initrdSize,
+                "lib"
+            );
+            int libMountResult = VFS::get().mount(&libInitrdfs, "/lib");
+            Console::get().drawText("InitrdFS at /lib: [ ");
+            Console::get().setTextColor(libMountResult == 0 ? 0x49ceee : 0xFF0000);
+            Console::get().drawText(libMountResult == 0 ? "OK" : "FAIL");
+            Console::get().setTextColor(0xFFFFFF);
+            Console::get().drawText(" ]\n");
+
+            if (libMountResult == 0) {
+                Debug::initializeKernelSymbols();
+                // graphics-compositor takes over the framebuffer, so login starts it after authentication.
+                launchInitrdService("/bin/input-manager");
+                launchInitrdService("/bin/storage-manager");
+                launchInitrdService("/bin/process-manager");
+                launchInitrdService("/bin/font-manager");
+                launchInitrdService("/bin/session-manager");
+                launchInitrdService("/bin/login");
+            }
         }
     } else {
         Console::get().drawText("No initrd found\n");
     }
+#ifdef INSTANTOS_BOOT_SPINNER
+    bootSpinner.finish();
+    activeBootSpinner = nullptr;
+#endif
 
     asm volatile("sti");
 

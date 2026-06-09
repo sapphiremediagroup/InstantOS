@@ -10,21 +10,21 @@ HandleTable::~HandleTable() {
     closeAll();
 }
 
-uint64_t HandleTable::allocate(HandleType type, uint32_t rights, void* object, HandleRetainFn retain, HandleReleaseFn release) {
+uint64_t HandleTable::allocate(HandleType type, uint32_t rights, void* object, HandleRetainFn retain, HandleReleaseFn release, bool closeOnExec) {
     if (type == HandleType::None || !object) {
         return static_cast<uint64_t>(-1);
     }
 
     for (int slot = FirstAllocHandle; slot < MaxHandles; slot++) {
         if (entries[slot].type == HandleType::None) {
-            return allocateAt(encodeHandle(type, slot), type, rights, object, retain, release);
+            return allocateAt(encodeHandle(type, slot), type, rights, object, retain, release, closeOnExec);
         }
     }
 
     return static_cast<uint64_t>(-1);
 }
 
-uint64_t HandleTable::allocateAt(uint64_t handle, HandleType type, uint32_t rights, void* object, HandleRetainFn retain, HandleReleaseFn release) {
+uint64_t HandleTable::allocateAt(uint64_t handle, HandleType type, uint32_t rights, void* object, HandleRetainFn retain, HandleReleaseFn release, bool closeOnExec) {
     HandleType handleType = HandleType::None;
     int slot = -1;
     if (!decodeHandle(handle, &handleType, &slot) || handleType != type || type == HandleType::None || !object) {
@@ -40,6 +40,7 @@ uint64_t HandleTable::allocateAt(uint64_t handle, HandleType type, uint32_t righ
     entries[slot].object = object;
     entries[slot].retain = retain;
     entries[slot].release = release;
+    entries[slot].closeOnExec = closeOnExec;
 
     return handle;
 }
@@ -161,6 +162,7 @@ bool HandleTable::duplicateTo(uint64_t oldHandle, uint64_t newHandle) {
     entries[newSlot].object = entry->object;
     entries[newSlot].retain = entry->retain;
     entries[newSlot].release = entry->release;
+    entries[newSlot].closeOnExec = false;
     return true;
 }
 
@@ -183,6 +185,34 @@ bool HandleTable::duplicateTo(uint64_t oldHandle, uint64_t newHandle, HandleType
     return duplicateTo(oldHandle, newHandle);
 }
 
+bool HandleTable::getCloseOnExec(uint64_t handle, bool* enabled) const {
+    const HandleEntry* entry = get(handle);
+    if (!entry || !enabled) {
+        return false;
+    }
+
+    *enabled = entry->closeOnExec;
+    return true;
+}
+
+bool HandleTable::setCloseOnExec(uint64_t handle, bool enabled) {
+    HandleEntry* entry = get(handle);
+    if (!entry) {
+        return false;
+    }
+
+    entry->closeOnExec = enabled;
+    return true;
+}
+
+void HandleTable::closeOnExecHandles() {
+    for (int slot = FirstAllocHandle; slot < MaxHandles; slot++) {
+        if (entries[slot].type != HandleType::None && entries[slot].closeOnExec) {
+            close(encodeHandle(entries[slot].type, slot));
+        }
+    }
+}
+
 uint64_t HandleTable::encodeHandle(HandleType type, int slot) {
     if (type == HandleType::None || slot < FirstAllocHandle || slot >= MaxHandles) {
         return static_cast<uint64_t>(-1);
@@ -195,7 +225,7 @@ bool HandleTable::decodeHandle(uint64_t handle, HandleType* type, int* slot) {
     uint64_t rawType = handle >> TypeShift;
     uint64_t rawSlot = handle & SlotMask;
     if (rawType == static_cast<uint64_t>(HandleType::None) ||
-        rawType > static_cast<uint64_t>(HandleType::Pipe) ||
+        rawType > static_cast<uint64_t>(HandleType::Socket) ||
         rawSlot < FirstAllocHandle ||
         rawSlot >= MaxHandles) {
         return false;
@@ -220,6 +250,7 @@ void HandleTable::clearEntry(int slot) {
     entries[slot].object = nullptr;
     entries[slot].retain = nullptr;
     entries[slot].release = nullptr;
+    entries[slot].closeOnExec = false;
 }
 
 void HandleTable::releaseEntry(HandleEntry& entry) {

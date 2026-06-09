@@ -1,7 +1,7 @@
 #include <graphics/console.hpp>
 #include <graphics/font.hpp>
 #include <cpu/cereal/cereal.hpp>
-#include <graphics/virtio_gpu.hpp>
+#include <graphics/gpu.hpp>
 #include <common/string.hpp>
 
 inline constexpr Color Color::Rosewater(245, 224, 220);
@@ -43,6 +43,7 @@ Console::Console(){
     writeLock = 0;
     useVirtIO = false;
     copyScrollEnabled = false;
+    framebufferOutputEnabled = true;
 
     resetAnsiState();
 }
@@ -176,10 +177,17 @@ void Console::handleCursorMovement(char command) {
     }
 }
 
+void Console::clearRect(uint64_t x, uint64_t y, uint64_t w, uint64_t h) {
+    if (!framebuffer || w == 0 || h == 0) {
+        return;
+    }
+    framebuffer->fillRect(x, y, w, h, backgroundColor);
+}
+
 void Console::handleEraseSequence(char command) {
     int n = parseAnsiParam(0, 0);
     uint64_t startX, startY, endX, endY;
-    
+
     switch (command) {
         case 'J':
             if (n == 0) {
@@ -203,39 +211,38 @@ void Console::handleEraseSequence(char command) {
                 return;
             }
             
-            for (uint64_t y = startY; y < endY; y++) {
-                for (uint64_t x = (y == startY ? startX : 0); 
-                     x < (y == endY - 1 ? endX : framebuffer->getWidth()); x++) {
-                    framebuffer->putPixel(x, y, backgroundColor);
-                }
+            if (startY == endY) {
+                break;
+            }
+
+            if (startY + 1 == endY) {
+                clearRect(startX, startY, endX - startX, 1);
+                break;
+            }
+
+            clearRect(startX, startY, framebuffer->getWidth() - startX, 1);
+            if (endY > startY + 1) {
+                clearRect(0, startY + 1, framebuffer->getWidth(), endY - startY - 1);
+            }
+            if (endX > 0) {
+                clearRect(0, endY - 1, endX, 1);
             }
             break;
             
         case 'K':
             if (n == 0) {
-                for (uint64_t x = posX; x < framebuffer->getWidth(); x++) {
-                    for (uint64_t y = posY; y < posY + 16; y++) {
-                        framebuffer->putPixel(x, y, backgroundColor);
-                    }
-                }
+                clearRect(posX, posY, framebuffer->getWidth() - posX, 16);
             } else if (n == 1) {
-                for (uint64_t x = 0; x <= posX; x++) {
-                    for (uint64_t y = posY; y < posY + 16; y++) {
-                        framebuffer->putPixel(x, y, backgroundColor);
-                    }
-                }
+                clearRect(0, posY, posX + 1, 16);
             } else if (n == 2) {
-                for (uint64_t x = 0; x < framebuffer->getWidth(); x++) {
-                    for (uint64_t y = posY; y < posY + 16; y++) {
-                        framebuffer->putPixel(x, y, backgroundColor);
-                    }
-                }
+                clearRect(0, posY, framebuffer->getWidth(), 16);
             }
             break;
     }
 }
 
 void Console::executeAnsiSequence(char finalByte) {
+    
     switch (finalByte) {
         case 'm':
             if (ansiParamCount == 0) {
@@ -266,6 +273,7 @@ void Console::executeAnsiSequence(char finalByte) {
 }
 
 void Console::handleAnsiChar(char c) {
+    
     switch (ansiState) {
         case AnsiState::NORMAL:
             if (c == '\x1b') {
@@ -397,6 +405,7 @@ void Console::toString(char* ptr, uint64_t num, int radix){
 }
 
 void Console::drawChar(const char c){
+    
     if ((unsigned char)c < 0x20 || (unsigned char)c > 0x7F) return;
 
     const uint8_t* glyph = font_8x16[c - 0x20];
@@ -427,18 +436,21 @@ void Console::drawChar(const char c){
 }
 
 void Console::drawNumber(int64_t str){
+    
     char hi[512];
     toString(hi, str, 10);
     drawText(hi);
 }
 
 void Console::drawHex(uint64_t str){
+    
     char hi[512];
     toString(hi, str, 16);
     drawText(hi);
 }
 
 void Console::advance() {
+    
     posX += 8;
     if (posX >= framebuffer->getWidth()) {
         newLine();
@@ -446,31 +458,24 @@ void Console::advance() {
 }
 
 void Console::newLine() {
+    
     posX = 0;
     posY += 16;
 
-    // Check if current line position is off-screen
     if (posY >= framebuffer->getHeight()) {
         scroll();
     } else if (!copyScrollEnabled) {
-        uint64_t pitchPixels = framebuffer->getPitch();
-        uint64_t pitchBytes = pitchPixels * sizeof(uint32_t);
         uint64_t height = framebuffer->getHeight();
-        uint8_t* fb = (uint8_t*)framebuffer->getRaw();
         uint64_t clearEnd = posY + 16;
         if (clearEnd > height) {
             clearEnd = height;
         }
-        for (uint64_t y = posY; y < clearEnd; y++) {
-            uint32_t* row = (uint32_t*)(fb + y * pitchBytes);
-            for (uint64_t x = 0; x < pitchPixels; x++) {
-                row[x] = backgroundColor;
-            }
-        }
+        clearRect(0, posY, framebuffer->getWidth(), clearEnd - posY);
     }
 }
 
 void Console::scroll(){
+    
     uint64_t scrollHeight = 16; // Always scroll by one character line (16 pixels)
     uint64_t pitchPixels = framebuffer->getPitch();
     uint64_t pitchBytes = pitchPixels * sizeof(uint32_t);
@@ -479,12 +484,7 @@ void Console::scroll(){
 
     if (!copyScrollEnabled) {
         posY = 0;
-        for (uint64_t y = 0; y < scrollHeight && y < height; y++) {
-            uint32_t* row = (uint32_t*)(fb + y * pitchBytes);
-            for (uint64_t x = 0; x < pitchPixels; x++) {
-                row[x] = backgroundColor;
-            }
-        }
+        clearRect(0, 0, framebuffer->getWidth(), scrollHeight < height ? scrollHeight : height);
         return;
     }
 
@@ -500,29 +500,28 @@ void Console::scroll(){
 
     // Clear the bottom line
     uint64_t clearStart = height > scrollHeight ? height - scrollHeight : 0;
-    for (uint64_t y = clearStart; y < height; y++) {
-        uint32_t* row = (uint32_t*)(fb + y * pitchBytes);
-        for (uint64_t x = 0; x < pitchPixels; x++) {
-            row[x] = backgroundColor;
-        }
-    }
+    clearRect(0, clearStart, framebuffer->getWidth(), height - clearStart);
 
     // After scrolling, cursor should be at the bottom line
     posY = clearStart;
 }
 
 void Console::flushIfNeeded() {
+    
     if (!useVirtIO || !framebuffer) {
         return;
     }
 
-    VirtIOGPUDriver& gpu = VirtIOGPUDriver::get();
+    GPU& gpu = GPU::get();
     if (gpu.isInitialized()) {
-        gpu.flush(0, 0, framebuffer->getWidth(), framebuffer->getHeight());
+        gpu.flush(0, 0,
+                  static_cast<uint32_t>(framebuffer->getWidth()),
+                  static_cast<uint32_t>(framebuffer->getHeight()));
     }
 }
 
 void Console::drawText(const char* str){
+    
     if (!str) return;
 
     lock();
@@ -532,21 +531,28 @@ void Console::drawText(const char* str){
 }
 
 void Console::lock() {
+    
     while (__sync_lock_test_and_set(&writeLock, 1)) {
         __asm__ volatile("pause" ::: "memory");
     }
 }
 
 void Console::unlock() {
+    
     __sync_lock_release(&writeLock);
 }
 
 void Console::writeCharUnlocked(char c) {
+    
     Cereal::get().write(c);
+    if (!framebufferOutputEnabled) {
+        return;
+    }
     handleAnsiChar(c);
 }
 
 void Console::drawTextUnlocked(const char* str) {
+    
     if (!str) return;
 
     while (*str) {
@@ -556,18 +562,21 @@ void Console::drawTextUnlocked(const char* str) {
 }
 
 void Console::drawNumberUnlocked(int64_t val) {
+    
     char buf[512];
     toString(buf, val, 10);
     drawTextUnlocked(buf);
 }
 
 void Console::drawUnsignedNumberUnlocked(uint64_t val) {
+    
     char buf[512];
     toString(buf, val, 10);
     drawTextUnlocked(buf);
 }
 
 void Console::drawHexUnlocked(uint64_t val) {
+    
     char buf[512];
     toString(buf, val, 16);
     drawTextUnlocked(buf);

@@ -43,6 +43,31 @@ static bool is_heap_table(PageTable* table) {
     return addr >= base && addr + sizeof(PageTable) <= base + size;
 }
 
+static void free_table(PageTable* table) {
+    if (!table) {
+        return;
+    }
+
+    if (is_heap_table(table)) {
+        kfree(table);
+    } else {
+        PMM::FreeFrame(reinterpret_cast<uint64_t>(table));
+    }
+}
+
+static bool is_table_empty(PageTable* table) {
+    if (!table) {
+        return true;
+    }
+
+    for (uint64_t i = 0; i < 512; i++) {
+        if (table->entries[i] & Present) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static PageTable* clone_table_if_needed(uint64_t& parentEntry) {
     if (!(parentEntry & Present) || (parentEntry & LargePage)) {
         return reinterpret_cast<PageTable*>(parentEntry & ADDR_MASK);
@@ -216,6 +241,19 @@ void VMM::UnmapPage(uint64_t virtualAddr) {
     uint64_t pti = PTIndex(virtualAddr);
     pt->entries[pti] = 0;
 
+    if (is_table_empty(pt)) {
+        pd->entries[pdi] = 0;
+        free_table(pt);
+    }
+    if (is_table_empty(pd)) {
+        pdpt->entries[pdpti] = 0;
+        free_table(pd);
+    }
+    if (is_table_empty(pdpt)) {
+        pml4->entries[pml4i] = 0;
+        free_table(pdpt);
+    }
+
     InvalidatePage(virtualAddr);
 }
 
@@ -359,6 +397,54 @@ void VMM::MapRangeInto(PageTable* pml4, uint64_t virtualBase, uint64_t physBase,
         MapPageInto(pml4, virtualBase + i * PAGE_SIZE, physBase + i * PAGE_SIZE, flags);
 }
 
+bool VMM::ProtectPageIn(PageTable* pml4, uint64_t virtualAddr, uint64_t flags) {
+    if (!pml4) return false;
+
+    virtualAddr &= ~0xFFFULL;
+
+    uint64_t pml4i = PML4Index(virtualAddr);
+    if (!(pml4->entries[pml4i] & Present)) return false;
+    auto* pdpt = clone_table_if_needed(pml4->entries[pml4i]);
+    if (!pdpt) return false;
+
+    uint64_t pdpti = PDPTIndex(virtualAddr);
+    if (!(pdpt->entries[pdpti] & Present)) return false;
+    if (!(pdpt->entries[pdpti] & LargePage)) {
+        if (!clone_table_if_needed(pdpt->entries[pdpti])) return false;
+    }
+    if (pdpt->entries[pdpti] & LargePage) {
+        if (!splitLargePdptEntry(pdpt, pdpti)) return false;
+    }
+    auto* pd = reinterpret_cast<PageTable*>(pdpt->entries[pdpti] & ADDR_MASK);
+
+    uint64_t pdi = PDIndex(virtualAddr);
+    if (!(pd->entries[pdi] & Present)) return false;
+    if (!(pd->entries[pdi] & LargePage)) {
+        if (!clone_table_if_needed(pd->entries[pdi])) return false;
+    }
+    if (pd->entries[pdi] & LargePage) {
+        if (!splitLargePdEntry(pd, pdi)) return false;
+    }
+    auto* pt = reinterpret_cast<PageTable*>(pd->entries[pdi] & ADDR_MASK);
+
+    uint64_t pti = PTIndex(virtualAddr);
+    if (!(pt->entries[pti] & Present)) return false;
+
+    const uint64_t phys = pt->entries[pti] & ADDR_MASK;
+    pt->entries[pti] = phys | (flags & ~ADDR_MASK) | Present;
+    InvalidatePage(virtualAddr);
+    return true;
+}
+
+bool VMM::ProtectRangeIn(PageTable* pml4, uint64_t virtualBase, uint64_t pageCount, uint64_t flags) {
+    for (uint64_t i = 0; i < pageCount; i++) {
+        if (!ProtectPageIn(pml4, virtualBase + i * PAGE_SIZE, flags)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 void VMM::UnmapPageFrom(PageTable* pml4, uint64_t virtualAddr) {
     if (!pml4) return;
 
@@ -391,6 +477,19 @@ void VMM::UnmapPageFrom(PageTable* pml4, uint64_t virtualAddr) {
 
     uint64_t pti = PTIndex(virtualAddr);
     pt->entries[pti] = 0;
+
+    if (is_table_empty(pt)) {
+        pd->entries[pdi] = 0;
+        free_table(pt);
+    }
+    if (is_table_empty(pd)) {
+        pdpt->entries[pdpti] = 0;
+        free_table(pd);
+    }
+    if (is_table_empty(pdpt)) {
+        pml4->entries[pml4i] = 0;
+        free_table(pdpt);
+    }
 }
 
 void VMM::UnmapRangeFrom(PageTable* pml4, uint64_t virtualBase, uint64_t pageCount) {
@@ -399,43 +498,92 @@ void VMM::UnmapRangeFrom(PageTable* pml4, uint64_t virtualBase, uint64_t pageCou
     }
 }
 
+namespace {
+void freeMappedFrames(uint64_t entry, int level) {
+    if (!(entry & Present)) {
+        return;
+    }
+
+    if (level == 3 && (entry & LargePage)) {
+        PMM::FreeFrames(entry & 0x000FFFFFC0000000ULL, 512 * 512);
+        return;
+    }
+
+    if (level == 2 && (entry & LargePage)) {
+        PMM::FreeFrames(entry & 0x000FFFFFFFE00000ULL, 512);
+        return;
+    }
+
+    if (level == 1) {
+        PMM::FreeFrame(entry & ADDR_MASK);
+    }
+}
+
+void freePrivateTable(PageTable* table, uint64_t kernelEntry, int level) {
+    if (!table || level <= 0) {
+        return;
+    }
+
+    PageTable* kernelTable = nullptr;
+    if ((kernelEntry & Present) && !(kernelEntry & LargePage)) {
+        kernelTable = reinterpret_cast<PageTable*>(kernelEntry & ADDR_MASK);
+    }
+
+    for (int i = 0; i < 512; ++i) {
+        const uint64_t entry = table->entries[i];
+        if (!(entry & Present)) {
+            continue;
+        }
+
+        const uint64_t baseline = kernelTable ? kernelTable->entries[i] : 0;
+        if (entry == baseline) {
+            continue;
+        }
+
+        if (level == 1 || (entry & LargePage)) {
+            freeMappedFrames(entry, level);
+            continue;
+        }
+
+        uint64_t childKernelEntry = 0;
+        if ((baseline & Present) && !(baseline & LargePage)) {
+            childKernelEntry = baseline;
+        }
+
+        auto* child = reinterpret_cast<PageTable*>(entry & ADDR_MASK);
+        freePrivateTable(child, childKernelEntry, level - 1);
+        free_table(child);
+    }
+}
+}
+
 void VMM::FreeAddressSpace(PageTable* pml4) {
     if (!pml4) return;
 
+    PageTable* kernelPml4 = s_pml4;
+
     for (int i = 0; i < 256; i++) {
-        if (pml4->entries[i] & Present) {
-            auto* pdpt = reinterpret_cast<PageTable*>(pml4->entries[i] & ADDR_MASK);
-            for (int j = 0; j < 512; j++) {
-                if (pdpt->entries[j] & Present) {
-                    if (pdpt->entries[j] & LargePage) {
-                        // 1GB large page
-                        PMM::FreeFrames(pdpt->entries[j] & ADDR_MASK, 512 * 512);
-                    } else {
-                        auto* pd = reinterpret_cast<PageTable*>(pdpt->entries[j] & ADDR_MASK);
-                        for (int k = 0; k < 512; k++) {
-                            if (pd->entries[k] & Present) {
-                                if (pd->entries[k] & LargePage) {
-                                    // 2MB large page
-                                    PMM::FreeFrames(pd->entries[k] & ADDR_MASK, 512);
-                                } else {
-                                    auto* pt = reinterpret_cast<PageTable*>(pd->entries[k] & ADDR_MASK);
-                                    for (int l = 0; l < 512; l++) {
-                                        if (pt->entries[l] & Present) {
-                                            PMM::FreeFrame(pt->entries[l] & ADDR_MASK);
-                                        }
-                                    }
-                                    PMM::FreeFrame(reinterpret_cast<uint64_t>(pt));
-                                }
-                            }
-                        }
-                        PMM::FreeFrame(reinterpret_cast<uint64_t>(pd));
-                    }
-                }
-            }
-            PMM::FreeFrame(reinterpret_cast<uint64_t>(pdpt));
+        const uint64_t entry = pml4->entries[i];
+        if (!(entry & Present)) {
+            continue;
         }
+
+        const uint64_t baseline = kernelPml4 ? kernelPml4->entries[i] : 0;
+        if (entry == baseline) {
+            continue;
+        }
+
+        if (entry & LargePage) {
+            freeMappedFrames(entry, 4);
+            continue;
+        }
+
+        auto* pdpt = reinterpret_cast<PageTable*>(entry & ADDR_MASK);
+        freePrivateTable(pdpt, baseline, 3);
+        free_table(pdpt);
     }
-    PMM::FreeFrame(reinterpret_cast<uint64_t>(pml4));
+
+    free_table(pml4);
 }
 
 void VMM::SetAddressSpace(PageTable* pml4) {

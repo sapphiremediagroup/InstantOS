@@ -312,6 +312,7 @@ const char* syscallName(uint64_t number) {
         case SyscallNumber::Rmdir: return "Rmdir";
         case SyscallNumber::Unlink: return "Unlink";
         case SyscallNumber::Stat: return "Stat";
+        case SyscallNumber::Fstat: return "Fstat";
         case SyscallNumber::Dup: return "Dup";
         case SyscallNumber::Dup2: return "Dup2";
         case SyscallNumber::Pipe: return "Pipe";
@@ -363,6 +364,37 @@ const char* syscallName(uint64_t number) {
         case SyscallNumber::GPUResourceAssignUUID: return "GPUResourceAssignUUID";
         case SyscallNumber::GPUSubmit3D: return "GPUSubmit3D";
         case SyscallNumber::GPUWaitFence: return "GPUWaitFence";
+        case SyscallNumber::GetUnixTime: return "GetUnixTime";
+        case SyscallNumber::SerialWrite: return "SerialWrite";
+        case SyscallNumber::Fcntl: return "Fcntl";
+        case SyscallNumber::Mprotect: return "Mprotect";
+        case SyscallNumber::Poll: return "Poll";
+        case SyscallNumber::Truncate: return "Truncate";
+        case SyscallNumber::Rename: return "Rename";
+        case SyscallNumber::Chmod: return "Chmod";
+        case SyscallNumber::Utime: return "Utime";
+        case SyscallNumber::Link: return "Link";
+        case SyscallNumber::Symlink: return "Symlink";
+        case SyscallNumber::Readlink: return "Readlink";
+        case SyscallNumber::Lstat: return "Lstat";
+        case SyscallNumber::Sigprocmask: return "Sigprocmask";
+        case SyscallNumber::Sigaction: return "Sigaction";
+        case SyscallNumber::Sigaltstack: return "Sigaltstack";
+        case SyscallNumber::ThreadSignal: return "ThreadSignal";
+        case SyscallNumber::SetThreadPointer: return "SetThreadPointer";
+        case SyscallNumber::Socket: return "Socket";
+        case SyscallNumber::Bind: return "Bind";
+        case SyscallNumber::Connect: return "Connect";
+        case SyscallNumber::Listen: return "Listen";
+        case SyscallNumber::Accept: return "Accept";
+        case SyscallNumber::Send: return "Send";
+        case SyscallNumber::Recv: return "Recv";
+        case SyscallNumber::Shutdown: return "Shutdown";
+        case SyscallNumber::GetSockOpt: return "GetSockOpt";
+        case SyscallNumber::SetSockOpt: return "SetSockOpt";
+        case SyscallNumber::StorageInfo: return "StorageInfo";
+        case SyscallNumber::StorageFormat: return "StorageFormat";
+        case SyscallNumber::StorageMount: return "StorageMount";
     }
 
     return "Unknown";
@@ -383,6 +415,7 @@ const char* handleTypeName(HandleType type) {
         case HandleType::GpuContext: return "GpuContext";
         case HandleType::Font: return "Font";
         case HandleType::Pipe: return "Pipe";
+        case HandleType::Socket: return "Socket";
     }
 
     return "Unknown";

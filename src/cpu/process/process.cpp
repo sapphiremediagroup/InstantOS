@@ -1,9 +1,9 @@
 #include <cpu/process/process.hpp>
 #include <memory/heap.hpp>
-#include <memory/pmm.hpp>
 #include <memory/vmm.hpp>
 #include <cpu/gdt/gdt.hpp>
 #include <cpu/syscall/syscall.hpp>
+#include <cpu/process/scheduler.hpp>
 #include <cpu/cpuid.hpp>
 #include <fs/vfs/vfs.hpp>
 #include <ipc/ipc.hpp>
@@ -13,6 +13,29 @@ extern "C" void enterUsermode(uint64_t entry, uint64_t stack);
 
 constexpr uint64_t USER_STACK_TOP = 0x00007FFFFFFFE000;
 constexpr size_t USER_STACK_PAGES = 32;
+
+namespace {
+struct UserSignalFrame {
+    uint64_t rip;
+    uint64_t rsp;
+    uint64_t blocked;
+    uint64_t rax;
+    uint64_t rdi;
+    uint64_t rsi;
+    uint64_t rdx;
+    uint64_t rcx;
+    uint64_t r8;
+    uint64_t r9;
+    uint64_t r10;
+    uint64_t r11;
+    uint64_t rflags;
+    uint64_t altStackFlags;
+};
+
+bool defaultIgnoredSignal(int sig) {
+    return sig == SIGCHLD;
+}
+}
 
 struct ProcessSharedState {
     PageTable* pageTable;
@@ -67,15 +90,14 @@ bool initializeAddressSpace(ProcessSharedState* state) {
         return false;
     }
 
-    state->pageTable = reinterpret_cast<PageTable*>(PMM::AllocFrame());
+    state->pageTable = VMM::AllocTable();
     if (!state->pageTable) {
         return false;
     }
 
-    memset(state->pageTable, 0, PAGE_SIZE);
     PageTable* kPml4 = VMM::GetKernelAddressSpace();
     if (!kPml4) {
-        PMM::FreeFrame(reinterpret_cast<uint64_t>(state->pageTable));
+        VMM::FreeAddressSpace(state->pageTable);
         state->pageTable = nullptr;
         return false;
     }
@@ -87,14 +109,17 @@ bool initializeAddressSpace(ProcessSharedState* state) {
     for (int i = 0; i < 256; i++) {
         if (kPml4->entries[i] & Present) {
             auto* srcPdpt = reinterpret_cast<PageTable*>(kPml4->entries[i] & ADDR_MASK);
-            uint64_t newFrame = PMM::AllocFrame();
-            if (newFrame) {
-                auto* newPdpt = reinterpret_cast<PageTable*>(newFrame);
-                for (int j = 0; j < 512; j++) {
-                    newPdpt->entries[j] = srcPdpt->entries[j];
-                }
-                state->pageTable->entries[i] = newFrame | (kPml4->entries[i] & ~ADDR_MASK);
+            PageTable* newPdpt = VMM::AllocTable();
+            if (!newPdpt) {
+                VMM::FreeAddressSpace(state->pageTable);
+                state->pageTable = nullptr;
+                return false;
             }
+
+            for (int j = 0; j < 512; j++) {
+                newPdpt->entries[j] = srcPdpt->entries[j];
+            }
+            state->pageTable->entries[i] = reinterpret_cast<uint64_t>(newPdpt) | (kPml4->entries[i] & ~ADDR_MASK);
         }
     }
 
@@ -106,7 +131,7 @@ Process::Process(uint32_t pid)
     : sharedState(nullptr), sessionID(0), uid(0), gid(0), pid(pid), parentPID(0), exitCode(0),
       state(ProcessState::Ready), priority(ProcessPriority::Normal), kernelStack(0), userStack(0),
       userStackBase(0), userStackSize(0), fpuState(nullptr), userFpuState(nullptr), validUserState(false), savedUserRSP(0),
-      sleepDeadlineMs(0), sleeping(false),
+      userFsBase(0), sleepDeadlineMs(0), sleeping(false),
       threadObject(nullptr) {
     next = nullptr;
     allNext = nullptr;
@@ -123,9 +148,15 @@ Process::Process(uint32_t pid)
 
     for (int i = 0; i < NSIG; i++) {
         signalHandler.handlers[i] = nullptr;
+        signalHandler.masks[i] = 0;
+        signalHandler.flags[i] = 0;
+        signalHandler.restorers[i] = 0;
     }
     signalHandler.pending = 0;
     signalHandler.blocked = 0;
+    signalHandler.altStackSp = 0;
+    signalHandler.altStackSize = 0;
+    signalHandler.altStackFlags = SS_DISABLE;
 
     sharedState = new ProcessSharedState();
     if (!sharedState || !initializeAddressSpace(sharedState)) {
@@ -191,7 +222,7 @@ Process::Process(uint32_t pid, Process* sharedFrom, uint64_t stackSize)
     : sharedState(nullptr), sessionID(0), uid(0), gid(0), pid(pid), parentPID(0), exitCode(0),
       state(ProcessState::Ready), priority(ProcessPriority::Normal), kernelStack(0), userStack(0),
       userStackBase(0), userStackSize(0), fpuState(nullptr), validUserState(false), savedUserRSP(0),
-      sleepDeadlineMs(0), sleeping(false),
+      userFsBase(0), sleepDeadlineMs(0), sleeping(false),
       threadObject(nullptr) {
     next = nullptr;
     allNext = nullptr;
@@ -208,12 +239,29 @@ Process::Process(uint32_t pid, Process* sharedFrom, uint64_t stackSize)
 
     for (int i = 0; i < NSIG; i++) {
         signalHandler.handlers[i] = nullptr;
+        signalHandler.masks[i] = 0;
+        signalHandler.flags[i] = 0;
+        signalHandler.restorers[i] = 0;
     }
     signalHandler.pending = 0;
     signalHandler.blocked = 0;
+    signalHandler.altStackSp = 0;
+    signalHandler.altStackSize = 0;
+    signalHandler.altStackFlags = SS_DISABLE;
 
     if (!sharedFrom || !sharedFrom->sharedState || !sharedFrom->sharedState->pageTable) {
         return;
+    }
+
+    const SignalHandler* parentSignals = sharedFrom->getSignalHandler();
+    if (parentSignals) {
+        for (int i = 0; i < NSIG; i++) {
+            signalHandler.handlers[i] = parentSignals->handlers[i];
+            signalHandler.masks[i] = parentSignals->masks[i];
+            signalHandler.flags[i] = parentSignals->flags[i];
+            signalHandler.restorers[i] = parentSignals->restorers[i];
+        }
+        signalHandler.blocked = parentSignals->blocked;
     }
 
     sharedState = sharedFrom->sharedState;
@@ -321,6 +369,49 @@ uint64_t Process::reserveMmapRegion(uint64_t size) {
     return base;
 }
 
+bool Process::replaceImageFrom(Process* image) {
+    if (!image || !sharedState || !image->sharedState || !image->sharedState->pageTable) {
+        return false;
+    }
+
+    PageTable* oldPageTable = sharedState->pageTable;
+    const uint64_t oldMmapBase = sharedState->mmapBase;
+    const uint64_t oldUserStackBase = userStackBase;
+    const uint64_t oldUserStackSize = userStackSize;
+    const uint64_t oldUserStack = userStack;
+
+    sharedState->pageTable = image->sharedState->pageTable;
+    sharedState->mmapBase = image->sharedState->mmapBase;
+    userStackBase = image->userStackBase;
+    userStackSize = image->userStackSize;
+    userStack = image->userStack;
+
+    image->sharedState->pageTable = oldPageTable;
+    image->sharedState->mmapBase = oldMmapBase;
+    image->userStackBase = oldUserStackBase;
+    image->userStackSize = oldUserStackSize;
+    image->userStack = oldUserStack;
+
+    context.cr3 = reinterpret_cast<uint64_t>(sharedState->pageTable) & ADDR_MASK;
+    context.xstate = reinterpret_cast<uint64_t>(fpuState);
+    validUserState = false;
+    savedUserRSP = 0;
+    userFsBase = 0;
+    exitCode = 0;
+    signalHandler.pending = 0;
+    signalHandler.blocked = 0;
+    for (int i = 0; i < NSIG; ++i) {
+        signalHandler.handlers[i] = nullptr;
+        signalHandler.masks[i] = 0;
+        signalHandler.flags[i] = 0;
+        signalHandler.restorers[i] = 0;
+    }
+    signalHandler.altStackSp = 0;
+    signalHandler.altStackSize = 0;
+    signalHandler.altStackFlags = SS_DISABLE;
+    return true;
+}
+
 void Process::jumpToUsermode(uint64_t entry, GDT* gdt) {
     VMM::SetAddressSpace(getPageTable());
 
@@ -339,6 +430,15 @@ void Process::jumpToUsermode(uint64_t entry, GDT* gdt) {
 void Process::sendSignal(int sig) {
     if (sig < 0 || sig >= NSIG) return;
     signalHandler.pending |= (1ULL << sig);
+    if (state == ProcessState::Blocked) {
+        Scheduler::get().wakeProcess(this);
+    }
+}
+
+bool Process::hasDeliverableSignal() const {
+    uint64_t deliverable = signalHandler.pending & ~signalHandler.blocked;
+    deliverable |= signalHandler.pending & (1ULL << SIGKILL);
+    return deliverable != 0;
 }
 
 void Process::handlePendingSignals() {
@@ -357,19 +457,59 @@ void Process::handlePendingSignals() {
         }
 
         sighandler_t handler = signalHandler.handlers[sig];
+        if (handler == reinterpret_cast<sighandler_t>(1)) {
+            continue;
+        }
         if (!handler) {
+            if (defaultIgnoredSignal(sig)) {
+                continue;
+            }
             state = ProcessState::Terminated;
             exitCode = 128 + sig;
             return;
         }
 
-        context.rsp -= 128;
-        context.rsp &= ~0xFULL;
+        uint64_t frameStack = context.rsp;
+        const bool useAltStack =
+            (signalHandler.flags[sig] & SA_ONSTACK) != 0 &&
+            (signalHandler.altStackFlags & (SS_DISABLE | SS_ONSTACK)) == 0 &&
+            signalHandler.altStackSp != 0 &&
+            signalHandler.altStackSize >= 2048;
+        const uint32_t oldAltStackFlags = signalHandler.altStackFlags;
+        if (useAltStack) {
+            frameStack = signalHandler.altStackSp + signalHandler.altStackSize;
+            signalHandler.altStackFlags |= SS_ONSTACK;
+        }
 
-        uint64_t* stack = reinterpret_cast<uint64_t*>(context.rsp);
-        stack[0] = context.rip;
+        frameStack = (frameStack - sizeof(UserSignalFrame) - 16) & ~0xFULL;
+        frameStack += 8;
+
+        const uint64_t oldBlocked = signalHandler.blocked;
+        signalHandler.blocked |= signalHandler.masks[sig] | (1ULL << sig);
+        if (sig == SIGKILL) {
+            signalHandler.blocked &= ~(1ULL << SIGKILL);
+        }
+
+        uint64_t* stack = reinterpret_cast<uint64_t*>(frameStack);
+        stack[0] = signalHandler.restorers[sig] ? signalHandler.restorers[sig] : context.rip;
+        auto* frame = reinterpret_cast<UserSignalFrame*>(frameStack + sizeof(uint64_t));
+        frame->rip = context.rip;
+        frame->rsp = context.rsp;
+        frame->blocked = oldBlocked;
+        frame->rax = context.rax;
+        frame->rdi = context.rdi;
+        frame->rsi = context.rsi;
+        frame->rdx = context.rdx;
+        frame->rcx = context.rcx;
+        frame->r8 = context.r8;
+        frame->r9 = context.r9;
+        frame->r10 = context.r10;
+        frame->r11 = context.r11;
+        frame->rflags = context.rflags;
+        frame->altStackFlags = oldAltStackFlags;
 
         context.rip = reinterpret_cast<uint64_t>(handler);
+        context.rsp = frameStack;
         context.rdi = sig;
 
         break;
@@ -382,6 +522,12 @@ uint64_t Process::allocateFD(FileDescriptor* fd) {
 
 uint64_t Process::allocateFD(FileDescriptor* fd, uint32_t rights) {
     return allocateHandle(HandleType::File, rights, fd, retainFileHandle, releaseFileHandle);
+}
+
+uint64_t Process::allocateFD(FileDescriptor* fd, uint32_t rights, bool closeOnExec) {
+    return sharedState
+        ? sharedState->handleTable.allocate(HandleType::File, rights, fd, retainFileHandle, releaseFileHandle, closeOnExec)
+        : static_cast<uint64_t>(-1);
 }
 
 FileDescriptor* Process::getFD(uint64_t fileHandle) {
@@ -402,6 +548,20 @@ uint64_t Process::duplicateFD(uint64_t fileHandle) {
 
 bool Process::duplicateFDTo(uint64_t oldFileHandle, uint64_t newFileHandle) {
     return sharedState && sharedState->handleTable.duplicateTo(oldFileHandle, newFileHandle, HandleType::File);
+}
+
+bool Process::getHandleCloseOnExec(uint64_t handle, bool* enabled) const {
+    return sharedState && sharedState->handleTable.getCloseOnExec(handle, enabled);
+}
+
+bool Process::setHandleCloseOnExec(uint64_t handle, bool enabled) {
+    return sharedState && sharedState->handleTable.setCloseOnExec(handle, enabled);
+}
+
+void Process::closeOnExecHandles() {
+    if (sharedState) {
+        sharedState->handleTable.closeOnExecHandles();
+    }
 }
 
 uint64_t Process::allocateHandle(HandleType type, uint32_t rights, void* object, HandleRetainFn retain, HandleReleaseFn release) {

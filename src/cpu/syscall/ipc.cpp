@@ -19,6 +19,7 @@ constexpr uint32_t kConnectedQueueRights =
     HandleRightRead | HandleRightWrite | HandleRightSignal | HandleRightWait | HandleRightDuplicate;
 constexpr uint32_t kServiceHandleRights =
     HandleRightRead | HandleRightWrite | HandleRightSignal | HandleRightWait | HandleRightDuplicate;
+WindowInfo gWindowListScratch[IPCManager::MaxWindows];
 
 void traceStr(const char* text) {
     Cereal::get().write(text);
@@ -115,7 +116,7 @@ bool copyIPCMessageToUser(uint64_t userPtr, const IPCMessage& message) {
 }
 
 bool isCompositorProcess(Process* process) {
-    return process && strcmp(process->getName(), "/bin/graphics-compositor.exe") == 0;
+    return process && strcmp(process->getName(), "/bin/graphics-compositor") == 0;
 }
 
 ServiceObject* resolveServiceHandle(Process* process, uint64_t handle, uint32_t requiredRights) {
@@ -434,22 +435,15 @@ uint64_t Syscall::sys_window_list(uint64_t entriesPtr, uint64_t capacity) {
         return static_cast<uint64_t>(-1);
     }
 
-    WindowInfo* entries = new WindowInfo[capacity];
-    if (!entries) {
-        return static_cast<uint64_t>(-1);
-    }
-
-    memset(entries, 0, static_cast<size_t>(capacity) * sizeof(WindowInfo));
-    const size_t count = IPCManager::get().listWindows(entries, static_cast<size_t>(capacity));
+    memset(gWindowListScratch, 0, sizeof(gWindowListScratch));
+    const size_t count = IPCManager::get().listWindows(gWindowListScratch, static_cast<size_t>(capacity));
 
     for (size_t i = 0; i < count; i++) {
-        if (!copyToUser(entriesPtr + (i * sizeof(WindowInfo)), &entries[i], sizeof(entries[i]))) {
-            delete[] entries;
+        if (!copyToUser(entriesPtr + (i * sizeof(WindowInfo)), &gWindowListScratch[i], sizeof(gWindowListScratch[i]))) {
             return static_cast<uint64_t>(-1);
         }
     }
 
-    delete[] entries;
     return count;
 }
 
@@ -504,7 +498,7 @@ uint64_t Syscall::sys_queue_create() {
         return static_cast<uint64_t>(-1);
     }
 
-    if (strcmp(current->getName(), "/bin/input-manager.exe") == 0) {
+    if (strcmp(current->getName(), "/bin/input-manager") == 0) {
         traceStr("[ipc:input] sys_queue_create begin");
         traceProcess(current);
         traceStr("\n");
@@ -512,7 +506,7 @@ uint64_t Syscall::sys_queue_create() {
 
     MessageQueueObject* queue = IPCManager::get().createQueue();
     if (!queue) {
-        if (strcmp(current->getName(), "/bin/input-manager.exe") == 0) {
+        if (strcmp(current->getName(), "/bin/input-manager") == 0) {
             traceStr("[ipc:input] sys_queue_create createQueue failed");
             traceProcess(current);
             traceStr("\n");
@@ -529,12 +523,12 @@ uint64_t Syscall::sys_queue_create() {
     );
     if (handleValue == static_cast<uint64_t>(-1)) {
         queue->release();
-        if (strcmp(current->getName(), "/bin/input-manager.exe") == 0) {
+        if (strcmp(current->getName(), "/bin/input-manager") == 0) {
             traceStr("[ipc:input] sys_queue_create allocateHandle failed");
             traceProcess(current);
             traceStr("\n");
         }
-    } else if (strcmp(current->getName(), "/bin/input-manager.exe") == 0) {
+    } else if (strcmp(current->getName(), "/bin/input-manager") == 0) {
         traceStr("[ipc:input] sys_queue_create ok handle=");
         traceHex(handleValue);
         traceProcess(current);
@@ -588,7 +582,7 @@ uint64_t Syscall::sys_queue_receive(uint64_t handle, uint64_t messagePtr, uint64
     ServiceObject* inputService = resolveInputManagerServiceHandle(current, handle, HandleRightRead);
     auto* queue = resolveQueueHandle(current, handle, HandleRightRead);
     if (!queue) {
-        if (inputService || strcmp(current->getName(), "/bin/login.exe") == 0) {
+        if (inputService || strcmp(current->getName(), "/bin/login") == 0) {
             traceStr("[ipc:queue] receive invalid handle=");
             traceHex(handle);
             traceProcess(current);

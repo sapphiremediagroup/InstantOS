@@ -592,6 +592,7 @@ const char* completion_code_name(uint32_t code) {
 
 void log_event(const XHCITransferRequestBlock& trb) {
     const uint32_t type = trb_type(trb);
+    return;
     log_str("[usb:xhci] event type=");
     log_dec(type);
     log_str("(");
@@ -611,6 +612,7 @@ void log_event(const XHCITransferRequestBlock& trb) {
 }
 
 void log_command_completion(uint64_t commandPhys, uint32_t code, uint8_t slotId) {
+    return;
     log_str("[usb:xhci] command completion trb=");
     log_hex(commandPhys);
     log_str(" cc=");
@@ -699,12 +701,10 @@ bool claim_bios_ownership(uint64_t mmioBase, const XHCICapabilityRegisters& caps
                 legsup = mmio_read32(mmioBase, extOffset);
                 if ((legsup & XHCI_USBLEGSUP_BIOS_OWNED) == 0) {
                     mmio_write32(mmioBase, extOffset + 4, 0);
-                    log_str("[usb:xhci] BIOS ownership released\n");
                     return true;
                 }
             }
 
-            log_str("[usb:xhci] BIOS ownership handoff timeout\n");
             return false;
         }
         if (next == 0) {

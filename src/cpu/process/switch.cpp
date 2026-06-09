@@ -78,7 +78,6 @@ extern "C" __attribute__((naked)) void processTrampoline() {
         "push 0x23\n"
         "push rax\n"
         "xor rax, rax\n"
-        "xor rbx, rbx\n"
         "xor rcx, rcx\n"
         "xor rdx, rdx\n"
         "xor rsi, rsi\n"
@@ -100,6 +99,8 @@ extern "C" __attribute__((naked)) void processTrampoline() {
         "jne 1f\n"
         "swapgs\n"
         "1:\n"
+        "mov rcx, [rbx]\n"
+        "lea rdx, [rbx + 8]\n"
         "iretq\n"
         ".att_syntax prefix\n"
     );

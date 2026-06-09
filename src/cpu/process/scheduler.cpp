@@ -13,6 +13,7 @@
 namespace {
 constexpr uint64_t kUserCodeSelector = 0x23;
 constexpr uint64_t kUserDataSelector = 0x1B;
+constexpr uint32_t kMsrFsBase = 0xC0000100;
 constexpr uint32_t kMsrKernelGsBase = 0xC0000102;
 constexpr bool kTraceContextSwitches = true;
 
@@ -63,6 +64,10 @@ uint64_t processCR3(Process* process) {
     }
 
     return process->getContext()->cr3 & ADDR_MASK;
+}
+
+void loadThreadPointer(Process* process) {
+    wrmsr(kMsrFsBase, process ? process->getUserFsBase() : 0);
 }
 
 void prepareInterruptReturnToUser(InterruptFrame* frame) {
@@ -350,6 +355,7 @@ void Scheduler::schedule() {
     currentProcess = nextProcess;
     currentProcess->setState(ProcessState::Running);
     currentProcess->getContext()->cr3 = processCR3(currentProcess);
+    loadThreadPointer(currentProcess);
     
     // If it's a regular process, it's already removed from the ready queue head by getNextProcess
     // or specifically handled by round-robin logic there.
@@ -383,7 +389,10 @@ void Scheduler::schedule() {
         switchContext(nullptr, nextProcess->getContext());
     }
     if (oldProcess && oldProcess->getState() == ProcessState::Terminated) {
-        removeProcess(oldProcess->getPID());
+        wakeParentOf(oldProcess);
+        if (oldProcess->isThread() || oldProcess->getParentPID() == 0) {
+            removeProcess(oldProcess->getPID());
+        }
     }
 }
 
@@ -399,6 +408,10 @@ void Scheduler::schedule(InterruptFrame* frame) {
 
     if (oldProcess && oldProcess->getFPUState()) {
         CPU::saveExtendedState(oldProcess->getFPUState());
+    }
+
+    if (oldProcess && oldProcess->getState() == ProcessState::Terminated) {
+        wakeParentOf(oldProcess);
     }
     
     // Save current state if it's a user process
@@ -475,6 +488,7 @@ void Scheduler::schedule(InterruptFrame* frame) {
     currentProcess = nextProcess;
     currentProcess->setState(ProcessState::Running);
     currentProcess->getContext()->cr3 = processCR3(currentProcess);
+    loadThreadPointer(currentProcess);
 
     if (nextProcess->getFPUState()) {
         CPU::restoreExtendedState(nextProcess->getFPUState());
@@ -551,6 +565,17 @@ void Scheduler::wakeProcess(Process* process) {
     }
 }
 
+void Scheduler::wakeParentOf(Process* process) {
+    if (!process || process->getParentPID() == 0) {
+        return;
+    }
+
+    Process* parent = getProcessByPID(process->getParentPID());
+    if (parent && parent->getState() == ProcessState::Blocked) {
+        wakeProcess(parent);
+    }
+}
+
 void Scheduler::wakeExpiredSleepers(uint64_t nowMs) {
     Process* process = allProcessesHead;
     while (process) {
@@ -595,5 +620,37 @@ Process* Scheduler::getProcessByPID(uint32_t pid) {
         }
         current = current->allNext;
     }
+    return nullptr;
+}
+
+Process* Scheduler::findChild(uint32_t parentPID, int64_t pid, bool terminatedOnly, bool* hasMatchingChild) {
+    if (hasMatchingChild) {
+        *hasMatchingChild = false;
+    }
+
+    Process* current = allProcessesHead;
+    while (current) {
+        if (!current->isThread() && current->getParentPID() == parentPID) {
+            bool pidMatches = false;
+            if (pid == -1) {
+                pidMatches = true;
+            } else if (pid == 0) {
+                pidMatches = true;
+            } else if (pid > 0 && current->getPID() == static_cast<uint32_t>(pid)) {
+                pidMatches = true;
+            }
+
+            if (pidMatches) {
+                if (hasMatchingChild) {
+                    *hasMatchingChild = true;
+                }
+                if (!terminatedOnly || current->getState() == ProcessState::Terminated) {
+                    return current;
+                }
+            }
+        }
+        current = current->allNext;
+    }
+
     return nullptr;
 }

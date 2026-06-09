@@ -15,6 +15,11 @@ FAT32FS::FAT32FS(BlockDevice* device) : FileSystem("fat32"), device(device), roo
     ops.mkdir = nodeMkdir;
     ops.unlink = nodeUnlink;
     ops.rmdir = nodeRmdir;
+    ops.truncate = nullptr;
+    ops.rename = nullptr;
+    ops.chmod = nullptr;
+    ops.utime = nullptr;
+    ops.link = nullptr;
 }
 
 FAT32FS::~FAT32FS() {

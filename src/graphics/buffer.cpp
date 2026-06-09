@@ -36,7 +36,26 @@ void Buffer::putPixel(uint64_t x, uint64_t y, Color color) {
 }
 
 void Buffer::clear(Color color) {
-    memset32(address, color, height * width);
+    fillRect(0, 0, width, height, color);
+}
+
+void Buffer::fillRect(uint64_t x, uint64_t y, uint64_t w, uint64_t h, Color color) {
+    if (x >= width || y >= height || w == 0 || h == 0) {
+        return;
+    }
+
+    if (x + w > width) {
+        w = width - x;
+    }
+    if (y + h > height) {
+        h = height - y;
+    }
+
+    uint32_t* row = address + y * pitch + x;
+    for (uint64_t rowIndex = 0; rowIndex < h; ++rowIndex) {
+        memset32(row, color, w);
+        row += pitch;
+    }
 }
 
 uint64_t Buffer::getWidth() {

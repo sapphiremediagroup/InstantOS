@@ -9,6 +9,16 @@
 namespace {
 constexpr uint64_t kSharedMapFlags = Present | ReadWrite | UserSuper | NoExecute;
 
+uint64_t saveInterruptFlagsAndDisable() {
+    uint64_t flags = 0;
+    asm volatile("pushfq; pop %0; cli" : "=r"(flags) :: "memory");
+    return flags;
+}
+
+void restoreInterruptFlags(uint64_t flags) {
+    asm volatile("push %0; popfq" :: "r"(flags) : "memory", "cc");
+}
+
 void traceStr(const char* text) {
     Cereal::get().write(text);
 }
@@ -435,10 +445,12 @@ void MessageQueueObject::release() {
 }
 
 bool MessageQueueObject::enqueue(const IPCMessageHeader& header, const void* payload) {
+    const uint64_t irqFlags = saveInterruptFlagsAndDisable();
     while (__atomic_test_and_set(&lock_flag, __ATOMIC_ACQUIRE)) { asm volatile("pause"); }
 
     if (count >= MaxMessages || header.size > MaxPayloadSize) {
         __atomic_clear(&lock_flag, __ATOMIC_RELEASE);
+        restoreInterruptFlags(irqFlags);
         return false;
     }
 
@@ -450,14 +462,17 @@ bool MessageQueueObject::enqueue(const IPCMessageHeader& header, const void* pay
     count++;
 
     __atomic_clear(&lock_flag, __ATOMIC_RELEASE);
+    restoreInterruptFlags(irqFlags);
     return true;
 }
 
 bool MessageQueueObject::dequeue(Message* outMessage) {
+    const uint64_t irqFlags = saveInterruptFlagsAndDisable();
     while (__atomic_test_and_set(&lock_flag, __ATOMIC_ACQUIRE)) { asm volatile("pause"); }
 
     if (!outMessage || count == 0) {
         __atomic_clear(&lock_flag, __ATOMIC_RELEASE);
+        restoreInterruptFlags(irqFlags);
         return false;
     }
 
@@ -466,6 +481,7 @@ bool MessageQueueObject::dequeue(Message* outMessage) {
     count--;
 
     __atomic_clear(&lock_flag, __ATOMIC_RELEASE);
+    restoreInterruptFlags(irqFlags);
     return true;
 }
 
@@ -943,16 +959,6 @@ ServiceObject* IPCManager::connectService(const char* name) {
     for (size_t i = 0; i < MaxServices; i++) {
         if (services[i].used && services[i].service &&
             strncmp(services[i].service->getName(), name, MaxServiceName) == 0) {
-            if (isInputManagerName(name)) {
-                traceServiceName("[ipc:service] connect found name=", name);
-                traceStr(" slot=");
-                traceDec(i);
-                traceStr(" owner=");
-                traceDec(services[i].service->getOwnerPID());
-                traceStr(" pending=");
-                traceDec(services[i].service->getQueue() ? services[i].service->getQueue()->pendingCount() : 0);
-                traceStr("\n");
-            }
             return services[i].service;
         }
     }
@@ -1006,20 +1012,6 @@ bool IPCManager::postServiceEvent(const char* name, const void* payload, uint64_
             traceStr("\n");
         }
         return false;
-    }
-
-    if (isInputManagerName(name)) {
-        traceServiceName("[ipc:input] post queued service=", name);
-        traceStr(" size=");
-        traceDec(size);
-        traceStr(" pending=");
-        traceDec(beforeCount);
-        traceStr("->");
-        traceDec(service->getQueue()->pendingCount());
-        if (size >= sizeof(Event)) {
-            traceInputEvent(*reinterpret_cast<const Event*>(payload));
-        }
-        traceStr("\n");
     }
 
     wakeQueueWaiters();
