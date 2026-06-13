@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <drivers/virtio/virtio.hpp>
+#include <drivers/net/net_device.hpp>
 
 // VirtIO Network Device ID
 constexpr uint16_t VIRTIO_NET_DEVICE_ID_LEGACY = 0x1000;  // Legacy VirtIO Network
@@ -37,23 +38,28 @@ constexpr size_t VIRTIO_NET_BUFFER_SIZE = sizeof(VirtIONetHdr) + VIRTIO_NET_MTU;
 constexpr size_t VIRTIO_NET_RX_BUFFERS = 32;
 constexpr size_t VIRTIO_NET_TX_BUFFERS = 64;
 
-class VirtIONetDriver {
+class VirtIONetDriver : public NetDevice {
 public:
     static VirtIONetDriver& get();
     
-    bool initialize();
-    bool isInitialized() const { return initialized; }
-    bool isAvailable() const { return deviceFound; }
+    bool initialize() override;
+    bool isInitialized() const override { return initialized; }
+    bool isAvailable() const override { return deviceFound; }
     
     // MAC address
-    void getMacAddress(uint8_t* mac);
+    void getMacAddress(uint8_t* mac) override;
     
     // Send/receive
-    bool sendPacket(const void* data, size_t len);
-    int receivePacket(void* buffer, size_t maxLen);
+    bool sendPacket(const void* data, size_t len) override;
+    int receivePacket(void* buffer, size_t maxLen) override;
     
     // Status
-    bool isLinkUp() const;
+    bool isLinkUp() const override;
+
+    const char* name() const override { return "virtio-net"; }
+
+    // Paravirtualized NIC: prefer over emulated physical cards.
+    int probePriority() const override { return 10; }
     
 private:
     VirtIONetDriver();

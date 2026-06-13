@@ -1,5 +1,5 @@
 #include <cpu/syscall/syscall.hpp>
-#include <drivers/virtio/virtio_net.hpp>
+#include <drivers/net/net_device.hpp>
 #include <common/string.hpp>
 
 bool socketDeliverUdpDatagram(uint16_t srcPort, uint32_t srcIpNetworkOrder, uint16_t dstPort, const uint8_t* payload, uint64_t length);
@@ -201,7 +201,7 @@ bool lookupArp(uint32_t ip, uint8_t* mac) {
     return false;
 }
 
-bool sendArpRequest(VirtIONetDriver& net, uint32_t targetIp) {
+bool sendArpRequest(NetDevice& net, uint32_t targetIp) {
     uint8_t localMac[6] {};
     net.getMacAddress(localMac);
 
@@ -222,7 +222,7 @@ bool sendArpRequest(VirtIONetDriver& net, uint32_t targetIp) {
     return net.sendPacket(frame, sizeof(frame));
 }
 
-bool sendArpReply(VirtIONetDriver& net, const ArpPacket& request) {
+bool sendArpReply(NetDevice& net, const ArpPacket& request) {
     uint8_t localMac[6] {};
     net.getMacAddress(localMac);
 
@@ -244,7 +244,7 @@ bool sendArpReply(VirtIONetDriver& net, const ArpPacket& request) {
     return net.sendPacket(frame, sizeof(frame));
 }
 
-bool sendIcmpEcho(VirtIONetDriver& net, uint32_t destIp, const uint8_t* destMac, uint16_t id, uint16_t seq) {
+bool sendIcmpEcho(NetDevice& net, uint32_t destIp, const uint8_t* destMac, uint16_t id, uint16_t seq) {
     uint8_t localMac[6] {};
     net.getMacAddress(localMac);
 
@@ -279,7 +279,7 @@ bool sendIcmpEcho(VirtIONetDriver& net, uint32_t destIp, const uint8_t* destMac,
 }
 
 bool sendUdpFrame(
-    VirtIONetDriver& net,
+    NetDevice& net,
     uint32_t destIp,
     const uint8_t* destMac,
     uint16_t srcPort,
@@ -287,14 +287,14 @@ bool sendUdpFrame(
     const uint8_t* payload,
     size_t payloadLength
 ) {
-    if ((!payload && payloadLength != 0) || payloadLength > VIRTIO_NET_MTU - sizeof(EthernetHeader) - sizeof(Ipv4Header) - sizeof(UdpHeader)) {
+    if ((!payload && payloadLength != 0) || payloadLength > NET_DEVICE_MTU - sizeof(EthernetHeader) - sizeof(Ipv4Header) - sizeof(UdpHeader)) {
         return false;
     }
 
     uint8_t localMac[6] {};
     net.getMacAddress(localMac);
 
-    uint8_t frame[VIRTIO_NET_MTU] {};
+    uint8_t frame[NET_DEVICE_MTU] {};
     auto* eth = reinterpret_cast<EthernetHeader*>(frame);
     auto* ip = reinterpret_cast<Ipv4Header*>(frame + sizeof(EthernetHeader));
     auto* udp = reinterpret_cast<UdpHeader*>(frame + sizeof(EthernetHeader) + sizeof(Ipv4Header));
@@ -325,7 +325,7 @@ bool sendUdpFrame(
 }
 
 uint16_t tcpChecksum(uint32_t srcIpNetworkOrder, uint32_t dstIpNetworkOrder, const TcpHeader* tcp, size_t tcpLength) {
-    uint8_t buffer[sizeof(TcpPseudoHeader) + VIRTIO_NET_MTU] {};
+    uint8_t buffer[sizeof(TcpPseudoHeader) + NET_DEVICE_MTU] {};
     auto* pseudo = reinterpret_cast<TcpPseudoHeader*>(buffer);
     pseudo->srcIp = srcIpNetworkOrder;
     pseudo->dstIp = dstIpNetworkOrder;
@@ -336,7 +336,7 @@ uint16_t tcpChecksum(uint32_t srcIpNetworkOrder, uint32_t dstIpNetworkOrder, con
 }
 
 bool sendTcpFrame(
-    VirtIONetDriver& net,
+    NetDevice& net,
     uint32_t destIp,
     const uint8_t* destMac,
     uint16_t srcPort,
@@ -347,14 +347,14 @@ bool sendTcpFrame(
     const uint8_t* payload,
     size_t payloadLength
 ) {
-    if ((!payload && payloadLength != 0) || payloadLength > VIRTIO_NET_MTU - sizeof(EthernetHeader) - sizeof(Ipv4Header) - sizeof(TcpHeader)) {
+    if ((!payload && payloadLength != 0) || payloadLength > NET_DEVICE_MTU - sizeof(EthernetHeader) - sizeof(Ipv4Header) - sizeof(TcpHeader)) {
         return false;
     }
 
     uint8_t localMac[6] {};
     net.getMacAddress(localMac);
 
-    uint8_t frame[VIRTIO_NET_MTU] {};
+    uint8_t frame[NET_DEVICE_MTU] {};
     auto* eth = reinterpret_cast<EthernetHeader*>(frame);
     auto* ip = reinterpret_cast<Ipv4Header*>(frame + sizeof(EthernetHeader));
     auto* tcp = reinterpret_cast<TcpHeader*>(frame + sizeof(EthernetHeader) + sizeof(Ipv4Header));
@@ -387,7 +387,7 @@ bool sendTcpFrame(
     return net.sendPacket(frame, sizeof(EthernetHeader) + sizeof(Ipv4Header) + tcpLength);
 }
 
-void handleArp(VirtIONetDriver& net, const uint8_t* packet, size_t length) {
+void handleArp(NetDevice& net, const uint8_t* packet, size_t length) {
     if (length < sizeof(EthernetHeader) + sizeof(ArpPacket)) {
         return;
     }
@@ -411,7 +411,7 @@ void handleArp(VirtIONetDriver& net, const uint8_t* packet, size_t length) {
     }
 }
 
-void handleIpv4(VirtIONetDriver& net, const uint8_t* packet, size_t length) {
+void handleIpv4(NetDevice& net, const uint8_t* packet, size_t length) {
     if (length < sizeof(EthernetHeader) + sizeof(Ipv4Header)) {
         return;
     }
@@ -505,10 +505,60 @@ void handleIpv4(VirtIONetDriver& net, const uint8_t* packet, size_t length) {
     gLastPingReply.reserved = 0;
     gHasPingReply = true;
 }
+
+// Drain and dispatch all currently-available received frames.  Returns the
+// number of frames processed.  Shared by the NetProcessPackets syscall and the
+// internal synchronous ARP-resolution wait below.
+uint64_t pumpPackets(NetDevice& net) {
+    uint64_t processed = 0;
+    for (;;) {
+        uint8_t packet[NET_DEVICE_MTU];
+        const int length = net.receivePacket(packet, sizeof(packet));
+        if (length <= 0) {
+            break;
+        }
+        processed++;
+        if (static_cast<size_t>(length) < sizeof(EthernetHeader)) {
+            continue;
+        }
+        const auto* eth = reinterpret_cast<const EthernetHeader*>(packet);
+        const uint16_t etherType = fromNetwork16(eth->etherType);
+        if (etherType == kEtherTypeArp) {
+            handleArp(net, packet, static_cast<size_t>(length));
+        } else if (etherType == kEtherTypeIpv4) {
+            handleIpv4(net, packet, static_cast<size_t>(length));
+        }
+    }
+    return processed;
+}
+
+// Resolve the destination MAC for `dstIp`, sending an ARP request and pumping
+// the receive path until the reply arrives.  Returns true if `dstMac` was
+// filled.  This makes outbound sends synchronous with respect to ARP so a
+// single send() does not spuriously fail with EAGAIN on a cold ARP cache
+// (which the mlibc resolver and most blocking callers do not retry).
+bool resolveArpBlocking(NetDevice& net, uint32_t dstIp, uint8_t* dstMac) {
+    if (lookupArp(dstIp, dstMac)) {
+        return true;
+    }
+    constexpr int kArpAttempts = 50;  // ~500ms worst case at 10ms/attempt
+    for (int attempt = 0; attempt < kArpAttempts; ++attempt) {
+        sendArpRequest(net, dstIp);
+        // Spin briefly pumping RX so the ARP reply gets processed.
+        for (int spin = 0; spin < 20000; ++spin) {
+            pumpPackets(net);
+            if (lookupArp(dstIp, dstMac)) {
+                return true;
+            }
+            asm volatile("pause");
+        }
+    }
+    return lookupArp(dstIp, dstMac);
+}
 }
 
 uint64_t netSendUdpDatagram(uint16_t srcPort, const uint8_t* dstAddress, uint64_t dstAddressLength, uint64_t buffer, uint64_t length) {
-    if (!dstAddress || dstAddressLength < 8 || length > VIRTIO_NET_MTU - sizeof(EthernetHeader) - sizeof(Ipv4Header) - sizeof(UdpHeader)) {
+    if (!dstAddress || dstAddressLength < 8 || length > NET_DEVICE_MTU - sizeof(EthernetHeader) - sizeof(Ipv4Header) - sizeof(UdpHeader)) {
         return syscall_error(SysErrInvalid);
     }
 
@@ -521,19 +571,20 @@ uint64_t netSendUdpDatagram(uint16_t srcPort, const uint8_t* dstAddress, uint64_
         return syscall_error(SysErrInvalid);
     }
 
-    uint8_t payload[VIRTIO_NET_MTU] {};
+    uint8_t payload[NET_DEVICE_MTU] {};
     if (length != 0 && !Syscall::copyFromUser(payload, buffer, static_cast<size_t>(length))) {
         return syscall_error(SysErrInvalid);
     }
 
-    VirtIONetDriver& net = VirtIONetDriver::get();
-    if (!net.initialize()) {
+    NetDevice* netDev = NetDeviceRegistry::active();
+    if (!netDev) {
         return syscall_error(SysErrNoEntry);
     }
+    NetDevice& net = *netDev;
 
     uint8_t dstMac[6] {};
-    if (!lookupArp(dstIp, dstMac)) {
-        return sendArpRequest(net, dstIp) ? syscall_error(SysErrAgain) : syscall_error(SysErrNoEntry);
+    if (!resolveArpBlocking(net, dstIp, dstMac)) {
+        return syscall_error(SysErrAgain);
     }
 
     return sendUdpFrame(net, dstIp, dstMac, srcPort, dstPort, payload, static_cast<size_t>(length))
@@ -554,10 +605,11 @@ uint64_t netStartTcpConnect(uint16_t srcPort, const uint8_t* dstAddress, uint64_
         return syscall_error(SysErrInvalid);
     }
 
-    VirtIONetDriver& net = VirtIONetDriver::get();
-    if (!net.initialize()) {
+    NetDevice* netDev = NetDeviceRegistry::active();
+    if (!netDev) {
         return syscall_error(SysErrNoEntry);
     }
+    NetDevice& net = *netDev;
     uint8_t dstMac[6] {};
     if (!lookupArp(dstIp, dstMac)) {
         return sendArpRequest(net, dstIp) ? syscall_error(SysErrAgain) : syscall_error(SysErrNoEntry);
@@ -568,7 +620,7 @@ uint64_t netStartTcpConnect(uint16_t srcPort, const uint8_t* dstAddress, uint64_
 }
 
 uint64_t netSendTcpPayload(uint16_t srcPort, const uint8_t* dstAddress, uint64_t dstAddressLength, uint32_t seq, uint32_t ack, uint64_t buffer, uint64_t length) {
-    if (!dstAddress || dstAddressLength < 8 || srcPort == 0 || length > VIRTIO_NET_MTU - sizeof(EthernetHeader) - sizeof(Ipv4Header) - sizeof(TcpHeader)) {
+    if (!dstAddress || dstAddressLength < 8 || srcPort == 0 || length > NET_DEVICE_MTU - sizeof(EthernetHeader) - sizeof(Ipv4Header) - sizeof(TcpHeader)) {
         return syscall_error(SysErrInvalid);
     }
 
@@ -581,15 +633,16 @@ uint64_t netSendTcpPayload(uint16_t srcPort, const uint8_t* dstAddress, uint64_t
         return syscall_error(SysErrInvalid);
     }
 
-    uint8_t payload[VIRTIO_NET_MTU] {};
+    uint8_t payload[NET_DEVICE_MTU] {};
     if (length != 0 && !Syscall::copyFromUser(payload, buffer, static_cast<size_t>(length))) {
         return syscall_error(SysErrInvalid);
     }
 
-    VirtIONetDriver& net = VirtIONetDriver::get();
-    if (!net.initialize()) {
+    NetDevice* netDev = NetDeviceRegistry::active();
+    if (!netDev) {
         return syscall_error(SysErrNoEntry);
     }
+    NetDevice& net = *netDev;
     uint8_t dstMac[6] {};
     if (!lookupArp(dstIp, dstMac)) {
         return sendArpRequest(net, dstIp) ? syscall_error(SysErrAgain) : syscall_error(SysErrNoEntry);
@@ -601,27 +654,29 @@ uint64_t netSendTcpPayload(uint16_t srcPort, const uint8_t* dstAddress, uint64_t
 
 uint64_t Syscall::sys_net_get_mac(uint64_t macPtr) {
     uint8_t mac[6] {};
-    VirtIONetDriver& net = VirtIONetDriver::get();
-    if (!net.initialize()) {
+    NetDevice* netDev = NetDeviceRegistry::active();
+    if (!netDev) {
         return syscall_error(SysErrNoEntry);
     }
+    NetDevice& net = *netDev;
     net.getMacAddress(mac);
     return copyToUser(macPtr, mac, sizeof(mac)) ? 0 : syscall_error(SysErrInvalid);
 }
 
 uint64_t Syscall::sys_net_send(uint64_t data, uint64_t len) {
-    if (len == 0 || len > VIRTIO_NET_MTU) {
+    if (len == 0 || len > NET_DEVICE_MTU) {
         return syscall_error(SysErrInvalid);
     }
-    uint8_t packet[VIRTIO_NET_MTU];
+    uint8_t packet[NET_DEVICE_MTU];
     if (!copyFromUser(packet, data, static_cast<size_t>(len))) {
         return syscall_error(SysErrInvalid);
     }
 
-    VirtIONetDriver& net = VirtIONetDriver::get();
-    if (!net.initialize()) {
+    NetDevice* netDev = NetDeviceRegistry::active();
+    if (!netDev) {
         return syscall_error(SysErrNoEntry);
     }
+    NetDevice& net = *netDev;
     return net.sendPacket(packet, static_cast<size_t>(len)) ? len : syscall_error(SysErrAgain);
 }
 
@@ -630,13 +685,14 @@ uint64_t Syscall::sys_net_recv(uint64_t buffer, uint64_t maxlen) {
         return syscall_error(SysErrInvalid);
     }
 
-    VirtIONetDriver& net = VirtIONetDriver::get();
-    if (!net.initialize()) {
+    NetDevice* netDev = NetDeviceRegistry::active();
+    if (!netDev) {
         return syscall_error(SysErrNoEntry);
     }
+    NetDevice& net = *netDev;
 
-    uint8_t packet[VIRTIO_NET_MTU];
-    const size_t capacity = maxlen < VIRTIO_NET_MTU ? static_cast<size_t>(maxlen) : VIRTIO_NET_MTU;
+    uint8_t packet[NET_DEVICE_MTU];
+    const size_t capacity = maxlen < NET_DEVICE_MTU ? static_cast<size_t>(maxlen) : NET_DEVICE_MTU;
     const int received = net.receivePacket(packet, capacity);
     if (received < 0) {
         return syscall_error(SysErrAgain);
@@ -647,10 +703,11 @@ uint64_t Syscall::sys_net_recv(uint64_t buffer, uint64_t maxlen) {
 }
 
 uint64_t Syscall::sys_net_link_status() {
-    VirtIONetDriver& net = VirtIONetDriver::get();
-    if (!net.initialize()) {
+    NetDevice* netDev = NetDeviceRegistry::active();
+    if (!netDev) {
         return 0;
     }
+    NetDevice& net = *netDev;
     return net.isLinkUp() ? 1 : 0;
 }
 
@@ -660,10 +717,11 @@ uint64_t Syscall::sys_net_ping(uint64_t destIp, uint64_t id, uint64_t seq) {
         return syscall_error(SysErrInvalid);
     }
 
-    VirtIONetDriver& net = VirtIONetDriver::get();
-    if (!net.initialize()) {
+    NetDevice* netDev = NetDeviceRegistry::active();
+    if (!netDev) {
         return syscall_error(SysErrNoEntry);
     }
+    NetDevice& net = *netDev;
 
     uint8_t targetMac[6] {};
     if (lookupArp(targetIp, targetMac)) {
@@ -680,31 +738,11 @@ uint64_t Syscall::sys_net_ping(uint64_t destIp, uint64_t id, uint64_t seq) {
 }
 
 uint64_t Syscall::sys_net_process_packets() {
-    VirtIONetDriver& net = VirtIONetDriver::get();
-    if (!net.initialize()) {
+    NetDevice* netDev = NetDeviceRegistry::active();
+    if (!netDev) {
         return syscall_error(SysErrNoEntry);
     }
-
-    uint64_t processed = 0;
-    for (;;) {
-        uint8_t packet[VIRTIO_NET_MTU];
-        const int length = net.receivePacket(packet, sizeof(packet));
-        if (length <= 0) {
-            break;
-        }
-        processed++;
-        if (static_cast<size_t>(length) < sizeof(EthernetHeader)) {
-            continue;
-        }
-        const auto* eth = reinterpret_cast<const EthernetHeader*>(packet);
-        const uint16_t etherType = fromNetwork16(eth->etherType);
-        if (etherType == kEtherTypeArp) {
-            handleArp(net, packet, static_cast<size_t>(length));
-        } else if (etherType == kEtherTypeIpv4) {
-            handleIpv4(net, packet, static_cast<size_t>(length));
-        }
-    }
-    return processed;
+    return pumpPackets(*netDev);
 }
 
 uint64_t Syscall::sys_net_get_ping_reply(uint64_t replyPtr) {

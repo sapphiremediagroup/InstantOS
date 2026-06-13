@@ -2,6 +2,7 @@
 #include <cpu/acpi/pci.hpp>
 #include <common/string.hpp>
 #include <memory/pmm.hpp>
+#include <drivers/net/net_device.hpp>
 
 namespace {
 constexpr uint16_t PCI_VENDOR_ID_REG = 0x00;
