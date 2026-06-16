@@ -34,8 +34,11 @@ cp -R "$ILIBCXX_DIR/include/." "$TCC_SYSROOT/include/"
 cp "$CRT0_OBJECT" "$TCC_SYSROOT/lib/crt0.o"
 ln -sf crt0.o "$TCC_SYSROOT/lib/crt1.o"
 ln -sf crt0.o "$TCC_SYSROOT/lib/Scrt1.o"
-"$CC" --target=x86_64-unknown-elf -ffreestanding -fPIC -c "$ROOT/tools/tcc/empty-crt.c" -o "$TCC_SYSROOT/lib/crti.o"
-cp "$TCC_SYSROOT/lib/crti.o" "$TCC_SYSROOT/lib/crtn.o"
+# crti.o and crtn.o must carry DISTINCT symbol names: tcc's internal linker
+# rejects a repeated symbol across input objects even when it is local, so the
+# placeholder symbol name is parameterized per object via -D__INSTANT_CRT_SYM.
+"$CC" --target=x86_64-unknown-elf -ffreestanding -fPIC -D__INSTANT_CRT_SYM=__instant_tcc_crti -c "$ROOT/tools/tcc/empty-crt.c" -o "$TCC_SYSROOT/lib/crti.o"
+"$CC" --target=x86_64-unknown-elf -ffreestanding -fPIC -D__INSTANT_CRT_SYM=__instant_tcc_crtn -c "$ROOT/tools/tcc/empty-crt.c" -o "$TCC_SYSROOT/lib/crtn.o"
 
 cp "$LIBINSTANT" "$TCC_SYSROOT/lib/libinstant.so"
 ln -sf libinstant.so "$TCC_SYSROOT/lib/libc.so"

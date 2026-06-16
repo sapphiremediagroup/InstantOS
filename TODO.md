@@ -157,14 +157,14 @@ on InstantOS. Smoke harnesses: `tools/run-bash-smoke.sh`, `tools/run-pty-smoke.s
   - [x] Cross-build `tcc` from the host as a native InstantOS user app before attempting self-hosting.
   - [x] Add a C-compatible CRT object for C programs that export unmangled `main`.
   - [x] Package `/bin/tcc` and `/bin/tcc-hello.c` into initrd when `INSTANTOS_ENABLE_TCC=ON`.
-  - [ ] Patch or configure `tcc` to emit InstantOS-compatible ELF executables and dynamic-linker metadata.
+  - [x] Patch or configure `tcc` to emit InstantOS-compatible ELF executables and dynamic-linker metadata.
   - [x] Build or package `libtcc1.a` without executing target binaries on the host.
-  - [ ] Add the minimum missing libc/POSIX APIs needed by `tcc` and its runtime helpers.
+  - [x] Add the minimum missing libc/POSIX APIs needed by `tcc` and its runtime helpers.
     - [x] Add initial APIs found by the TCC build: `sys/time.h`, `gettimeofday`, `inttypes.h`, `fprintf`, `fputs`, `fdopen`, `execvp`, integer parsers, and basic local time.
-  - [ ] Support compiler output files, temporary files, include path lookup, and executable permissions on the InstantOS filesystem.
+  - [x] Support compiler output files, temporary files, include path lookup, and executable permissions on the InstantOS filesystem.
   - [x] Package a small C sysroot into the initrd or persistent disk image for in-OS compilation.
-  - [ ] Validate `tcc hello.c -o hello` inside InstantOS and run the produced binary.
-  - [ ] Add smoke tests for preprocessing, compile-only, link, and run workflows.
+  - [x] Validate `tcc hello.c -o hello` inside InstantOS and run the produced binary. (`tools/run-tcc-smoke.sh`)
+  - [x] Add smoke tests for preprocessing, compile-only, link, and run workflows. (`tools/run-tcc-smoke.sh`)
   - [ ] Attempt building `tcc` inside InstantOS only after hosted `tcc` can build and run simple programs reliably.
 
 ## Hardware Acceleration

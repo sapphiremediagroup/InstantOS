@@ -56,18 +56,38 @@ cmake --build build --target iso
 This currently produces `build/tcc`, an InstantOS PIE executable using
 `/lib/ld-instantos.so`, and `build/tcc-sysroot/lib/tcc/libtcc1.a`.
 
+## Status
+
+`tcc hello.c -o hello && ./hello` works **inside InstantOS** as of 2026-06-16.
+`tools/run-tcc-smoke.sh` boots a headless QEMU image (tcc + sysroot + bash over a
+PTY) and asserts the full ladder: `tcc -v` -> `-E` -> `-c` -> link -> run.
+
+Three fixes were needed to get from "host-built tcc" to "runs in-OS":
+
+1. **`ld-instantos` glibc SONAME aliases.** tcc's `DT_NEEDED` lists `libm.so.6`
+   (Makefile `LIBS=-lm`), which has no standalone file here. `loadDependency()`
+   in `outside/iUserApps/ld-instantos/src/main.cpp` now aliases `libm.so.6` (and
+   `libc.so.6`/`libpthread.so.0`/`libdl.so.2`/`librt.so.1`) to `libinstant.so`,
+   which already exports the math symbols. Without it: `[ld-instantos] stat failed`
+   and the process never starts (exit 127).
+2. **`int64_t` redefinition.** ilibcxx `<stdint.h>` used a `long long` fallback when
+   `__INT64_TYPE__` was undefined, but tcc's private `<stddef.h>` defines `int64_t`
+   as `long` on LP64. The fixed-width typedefs are now wrapped in the shared
+   `__int8_t_defined` guard and the 64-bit fallback selects `long` on LP64.
+3. **Distinct CRT placeholder symbols.** `crti.o` and `crtn.o` were the same object
+   (`cp`), so tcc's internal linker saw `__instant_tcc_empty_crt` "defined twice"
+   (it collides on a repeated name even when local, unlike lld). `tools/tcc/empty-crt.c`
+   now takes `-D__INSTANT_CRT_SYM=...` and the sysroot build compiles the two objects
+   with distinct names.
+
+Run it with: `tools/run-tcc-smoke.sh`
+
 ## Next Work
 
-- Add an InstantOS target backend/configuration patch for TinyCC.
-- Validate the packaged `/lib/tcc/include` sysroot from inside InstantOS.
-- Validate that TCC's default linker path can find `/lib/crt1.o`, `/lib/crti.o`, `/lib/crtn.o`, `/lib/tcc/libtcc1.a`, and `/lib/libc.so`.
-- Make TCC emit `/lib/ld-instantos.so` as the ELF interpreter by default.
-- Make `-lc` resolve to `libinstant.so` or a future mlibc libc.
-- Add a link mode equivalent to the current user app link flags: PIE, `_start`,
-  SysV hash, no build-id, and `-z max-page-size=0x1000`.
-- Package a minimal writable test workspace in InstantOS and validate:
-
-```sh
-tcc hello.c -o hello
-./hello
-```
+- Add the InstantOS target backend/configuration patch upstream (currently the
+  host build wrapper supplies the link recipe; tcc's own defaults are configured
+  via `--elfinterp`/`--crtprefix`/`--libpaths`).
+- Exercise larger programs (multiple translation units, more of libc) and grow
+  the SONAME alias table / sysdeps as new dependencies surface.
+- Attempt building `tcc` inside InstantOS (self-hosting) now that hosted `tcc`
+  compiles and runs simple programs reliably.
