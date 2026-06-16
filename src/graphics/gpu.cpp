@@ -1,5 +1,6 @@
 #include <graphics/gpu.hpp>
 #include <graphics/virtio_gpu.hpp>
+#include <graphics/intel_gen9.hpp>
 
 namespace {
 
@@ -166,8 +167,83 @@ private:
     }
 };
 
+// Intel HD Graphics 530 / Skylake (Gen9) backend. Presents the
+// firmware-initialised Intel display engine as a linear scanout framebuffer.
+// It only activates on real Intel Gen9 hardware (PCI 0x8086 SKL ids); under
+// QEMU (which has no Intel iGPU) probe() returns false and the GPU manager
+// falls through to virtio-gpu / the software framebuffer, so the default path
+// is unchanged.
+class IntelGen9GPUBackend : public GPUBackend {
+public:
+    const char* name() const override { return "intel-gen9"; }
+    GPUBackendKind kind() const override { return GPUBackendKind::IntelGen9; }
+    bool probe() override { return intel_gen9::IntelGen9Driver::get().probe(); }
+
+    bool initialize(iFramebuffer& framebufferVal) override {
+        framebuffer = &framebufferVal;
+        intel_gen9::IntelGen9Driver& driver = intel_gen9::IntelGen9Driver::get();
+        // Inherit-firmware path: the recovered scanout IS the boot framebuffer,
+        // so the console keeps drawing into the same surface. No re-point needed.
+        return driver.initialize(framebufferVal);
+    }
+
+    bool submitCommand(const GPUCommand& command, GPUCommandResult* result) override {
+        intel_gen9::IntelGen9Driver& driver = intel_gen9::IntelGen9Driver::get();
+        if (!driver.isInitialized()) {
+            setResult(result, false, 1);
+            return false;
+        }
+        switch (command.type) {
+            case GPUCommandType::Nop:
+                setResult(result, true);
+                return true;
+            case GPUCommandType::Flush: {
+                const bool ok = driver.flush(command.x, command.y, command.width, command.height);
+                setResult(result, ok, ok ? 0 : 2);
+                return ok;
+            }
+            case GPUCommandType::SetMode:
+                // Only the already-inherited mode is supported; anything else is
+                // refused gracefully (no crash, no corruption).
+                if (command.width == driver.getWidth() &&
+                    command.height == driver.getHeight() &&
+                    (command.bpp == 0 || command.bpp == 32)) {
+                    setResult(result, true);
+                    return true;
+                }
+                setResult(result, false, 3);
+                return false;
+            default:
+                // 3D/context/fence: not supported on the Gen9 display-only path.
+                setResult(result, false, 4);
+                return false;
+        }
+    }
+
+    void* getFramebuffer() override { return intel_gen9::IntelGen9Driver::get().getFramebuffer(); }
+    uint32_t getWidth() const override { return intel_gen9::IntelGen9Driver::get().getWidth(); }
+    uint32_t getHeight() const override { return intel_gen9::IntelGen9Driver::get().getHeight(); }
+    uint32_t getPitch() const override { return intel_gen9::IntelGen9Driver::get().getPitch(); }
+    uint32_t getFramebufferSize() const override { return intel_gen9::IntelGen9Driver::get().getFramebufferSize(); }
+    bool isHardwareAccelerated() const override { return false; }
+
+private:
+    iFramebuffer* framebuffer = nullptr;
+
+    void setResult(GPUCommandResult* result, bool ok, uint32_t status = 0) {
+        if (!result) {
+            return;
+        }
+        result->ok = ok;
+        result->status = status;
+        result->value32 = 0;
+        result->value64 = 0;
+    }
+};
+
 FramebufferGPUBackend framebufferBackend;
 VirtIOGPUBackend virtioBackend;
+IntelGen9GPUBackend intelGen9Backend;
 
 }
 
@@ -324,6 +400,7 @@ void GPU::registerBuiltinBackends() {
     }
 
     registerBackend(&virtioBackend);
+    registerBackend(&intelGen9Backend);
     registerBackend(&framebufferBackend);
     builtinsRegistered = true;
 }

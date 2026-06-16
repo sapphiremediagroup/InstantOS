@@ -7,6 +7,7 @@
 enum class GPUBackendKind : uint32_t {
     Framebuffer = 0,
     VirtIO = 1,
+    IntelGen9 = 2,
     Custom = 0x80000000U
 };
 

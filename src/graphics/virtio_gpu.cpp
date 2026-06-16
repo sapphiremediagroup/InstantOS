@@ -224,6 +224,8 @@ VirtIOGPUDriver::VirtIOGPUDriver()
       resourceBlobSupported(false),
       resourceUUIDSupported(false),
       blobScanoutActive(false),
+      venusCapsetFound(false),
+      venusCapsetVersion(0),
       bus(0),
       device(0),
       function(0),
@@ -310,37 +312,17 @@ bool VirtIOGPUDriver::initialize() {
     }
 
     if (!attachBacking()) {
-        if (!blobScanoutActive) {
-            Console::get().drawText("[VGPU:init] attachBacking failed\n");
-            destroyFramebufferResource();
-            releaseFramebufferMemory();
-            return false;
-        }
-        Console::get().drawText("[VGPU:init] blob attachBacking skipped\n");
-    }
-
-    if (!blobScanoutActive && !setScanout()) {
-        Console::get().drawText("[VGPU:init] legacy setScanout failed\n");
+        Console::get().drawText("[VGPU:init] attachBacking failed\n");
         destroyFramebufferResource();
         releaseFramebufferMemory();
         return false;
     }
 
-    if (blobScanoutActive && !setScanout()) {
-        Console::get().drawText("[VGPU:init] blob setScanout failed, falling back\n");
+    if (!setScanout()) {
+        Console::get().drawText("[VGPU:init] setScanout failed\n");
         destroyFramebufferResource();
         releaseFramebufferMemory();
-        if (!createResource(false)) {
-            Console::get().drawText("[VGPU:init] fallback createResource failed\n");
-            releaseFramebufferMemory();
-            return false;
-        }
-        if (!attachBacking() || !setScanout()) {
-            Console::get().drawText("[VGPU:init] fallback scanout path failed\n");
-            destroyFramebufferResource();
-            releaseFramebufferMemory();
-            return false;
-        }
+        return false;
     }
 
     flush(0, 0, currentWidth, currentHeight);
@@ -672,24 +654,19 @@ bool VirtIOGPUDriver::createResource(bool allowBlobScanout) {
     fbSize = currentWidth * currentHeight * 4;
     blobScanoutActive = false;
 
-    if (allowBlobScanout && resourceBlobSupported && hostVisibleShmBase && hostVisibleShmLength >= fbSize) {
-        void* mapping = nullptr;
-        uint32_t blobResourceId = 0;
-        if (allocateHostVisibleBlob(fbSize, &blobResourceId, &mapping)) {
-            framebuffer = mapping;
-            resourceId = blobResourceId;
-            memset(framebuffer, 0, fbSize);
-            blobScanoutActive = true;
-            if (ResourceRecord* record = findResourceRecord(resourceId)) {
-                record->guestPtr = framebuffer;
-                record->guestLength = fbSize;
-                framebufferPhys = record->guestPhys;
-            } else {
-                framebufferPhys = 0;
-            }
-            return true;
-        }
-    }
+    // Blob-based scanout is intentionally not used at boot.
+    //
+    // A SET_SCANOUT_BLOB source must be backed by a host dmabuf the display can
+    // present:
+    //   - BLOB_MEM_GUEST blobs are plain guest RAM (no dmabuf) -> QEMU rejects
+    //     SET_SCANOUT_BLOB with ERR_UNSPEC ("resource not backed by dmabuf").
+    //   - BLOB_MEM_HOST3D blobs ARE dmabuf-backed, but the renderer only creates
+    //     them inside a 3D (virgl/venus) context, which does not exist during
+    //     early GPU bring-up.
+    // The classic 2D resource path (RESOURCE_CREATE_2D + ATTACH_BACKING +
+    // SET_SCANOUT + per-flush TRANSFER_TO_HOST_2D) works on every virtio-gpu
+    // variant and is what drives the display, so we use it unconditionally.
+    (void)allowBlobScanout;
 
     const uint64_t pages = (static_cast<uint64_t>(fbSize) + PMM::PAGE_SIZE - 1) / PMM::PAGE_SIZE;
     framebufferPhys = PMM::AllocFrames(pages);
@@ -996,6 +973,66 @@ bool VirtIOGPUDriver::runVirglProbe(VirtIOGPUVirglProbeResult* result) {
            localResult.resourceAttachOk &&
            localResult.submitTransportOk &&
            localResult.fenceCompleted;
+}
+
+bool VirtIOGPUDriver::detectVenusCapset(VirtIOGPUVenusCapset* outCapset) {
+    venusCapsetFound = false;
+    venusCapsetVersion = 0;
+
+    // The Venus capset rides on the virtio-gpu 3D plane: without VIRGL feature
+    // negotiation there are no capsets to enumerate.
+    if (!virglSupported) {
+        return false;
+    }
+
+    VirtIOGPUCapsetInfo venusInfo = {};
+    bool found = false;
+    for (uint32_t i = 0; i < numCapsets; ++i) {
+        VirtIOGPUCapsetInfo info = {};
+        if (!getCapsetInfo(i, &info)) {
+            continue;
+        }
+        if (info.capset_id == VIRTIO_GPU_CAPSET_VENUS) {
+            venusInfo = info;
+            found = true;
+            break;
+        }
+    }
+
+    if (!found || venusInfo.capset_max_size == 0) {
+        return false;
+    }
+
+    // Fetch the capset payload and parse the Venus header. We clamp the copy to
+    // our struct so an unexpectedly large capset cannot overflow guest memory.
+    VirtIOGPUVenusCapset parsed = {};
+    const uint32_t fetchSize = venusInfo.capset_max_size;
+    uint8_t* buffer = reinterpret_cast<uint8_t*>(kmalloc(fetchSize));
+    if (!buffer) {
+        return false;
+    }
+    memset(buffer, 0, fetchSize);
+
+    uint32_t actualSize = 0;
+    const bool fetched = getCapset(VIRTIO_GPU_CAPSET_VENUS, venusInfo.capset_max_version,
+                                   buffer, fetchSize, &actualSize);
+    if (fetched) {
+        const uint32_t copyBytes =
+            actualSize < sizeof(parsed) ? actualSize : static_cast<uint32_t>(sizeof(parsed));
+        memcpy(&parsed, buffer, copyBytes);
+    }
+    kfree(buffer);
+
+    if (!fetched) {
+        return false;
+    }
+
+    venusCapsetFound = true;
+    venusCapsetVersion = venusInfo.capset_max_version;
+    if (outCapset) {
+        *outCapset = parsed;
+    }
+    return true;
 }
 
 bool VirtIOGPUDriver::createContext(uint32_t* ctxId, const char* debugName, uint32_t contextInit,
@@ -1453,6 +1490,60 @@ bool VirtIOGPUDriver::allocateHostVisibleBlob(uint64_t size, uint32_t* outResour
         record->guestPtr = guestPtr;
         record->guestPhys = guestPhys;
         record->guestLength = static_cast<uint32_t>(pages * PMM::PAGE_SIZE);
+    }
+    return true;
+}
+
+bool VirtIOGPUDriver::allocateContextBlob(uint32_t ctxId, uint64_t size, uint32_t* outResourceId,
+                                          void** outPtr, uint64_t* outLength) {
+    // CS/reply shmem uses blob_id 0 (the generic host-allocated case).
+    return allocateContextBlobWithId(ctxId, size, 0, outResourceId, outPtr, outLength);
+}
+
+bool VirtIOGPUDriver::allocateContextBlobWithId(uint32_t ctxId, uint64_t size, uint64_t blobId,
+                                                uint32_t* outResourceId, void** outPtr,
+                                                uint64_t* outLength) {
+    if (!resourceBlobSupported || ctxId == 0 || size == 0 || !outResourceId || !outPtr) {
+        return false;
+    }
+    if (!requireContextRecord(ctxId)) {
+        return false;
+    }
+    // Host-visible window is required: the renderer allocates the backing store
+    // (HOST3D) and the guest maps it through the SHM region.
+    if (!hostVisibleShmBase || hostVisibleShmLength == 0) {
+        return false;
+    }
+
+    // HOST3D blob: the host renderer owns the storage and the guest maps it.
+    // blob_id 0 is the generic CS/reply shmem case (see Mesa
+    // virtgpu_init_shmem_blob_mem); a non-zero blob_id equal to a VkDeviceMemory
+    // object id makes the host back the blob with that Vulkan device memory.
+    VirtIOGPUResourceCreateBlob request = {};
+    request.hdr.ctx_id = ctxId;
+    request.blob_mem = VIRTIO_GPU_BLOB_MEM_HOST3D;
+    request.blob_flags = VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE;
+    request.nr_entries = 0;
+    request.blob_id = blobId;
+    request.size = size;
+
+    uint32_t resourceIdValue = 0;
+    if (!createBlobResource(request, &resourceIdValue, 0, 0)) {
+        return false;
+    }
+
+    // Map the host-allocated blob into the guest-visible SHM window.
+    void* mapped = nullptr;
+    if (!mapBlobResource(resourceIdValue, &mapped) || !mapped) {
+        unrefResource(resourceIdValue);
+        return false;
+    }
+    memset(mapped, 0, size);
+
+    *outResourceId = resourceIdValue;
+    *outPtr = mapped;
+    if (outLength) {
+        *outLength = size;
     }
     return true;
 }

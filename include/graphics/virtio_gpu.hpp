@@ -76,6 +76,8 @@ constexpr uint32_t VIRTIO_GPU_MAX_SCANOUTS = 16;
 constexpr uint32_t VIRTIO_GPU_CONTEXT_NAME_MAX = 64;
 constexpr uint32_t VIRTIO_GPU_CAPSET_VIRGL = 1;
 constexpr uint32_t VIRTIO_GPU_CAPSET_VIRGL2 = 2;
+// Capset 4 = Vulkan over virtio-gpu (Mesa "Venus", VK_MESA_venus_protocol).
+constexpr uint32_t VIRTIO_GPU_CAPSET_VENUS = 4;
 constexpr uint8_t VIRTIO_GPU_SHM_ID_HOST_VISIBLE = 1;
 
 constexpr uint32_t VIRTIO_GPU_CONTEXT_INIT_CAPSET_ID_MASK = 0x000000FFU;
@@ -318,6 +320,21 @@ struct VirtIOGPUCommandStatus {
     uint32_t usedLength;
 };
 
+// Payload of the Venus capset (capset id 4), version 0.
+// Mirrors Mesa's "struct virgl_renderer_capset_venus". The guest uses these
+// fields to confirm the host renderer speaks a compatible Venus wire protocol
+// before bringing up a Venus context.
+struct VirtIOGPUVenusCapset {
+    uint32_t wire_format_version;
+    uint32_t vk_xml_version;
+    uint32_t vk_ext_command_serialization_spec_version;
+    uint32_t vk_mesa_venus_protocol_spec_version;
+    uint32_t supports_blob_id_0;
+    // Remaining words are reserved/optional across versions; keep a small tail
+    // so a slightly larger capset can be received without overflowing.
+    uint32_t reserved[11];
+};
+
 struct VirtIOGPUVirglProbeResult {
     bool capsetInfoOk;
     bool capsetFetchOk;
@@ -396,6 +413,12 @@ public:
     bool supportsContextInit() const { return contextInitSupported; }
     bool supportsBlobResources() const { return resourceBlobSupported; }
     bool supportsResourceUUID() const { return resourceUUIDSupported; }
+    // True once the Venus (Vulkan) capset has been found during enumeration.
+    bool supportsVenus() const { return venusCapsetFound; }
+    uint32_t getVenusCapsetVersion() const { return venusCapsetVersion; }
+    // Enumerate device capsets and, if present, cache the Venus capset (id 4).
+    // Returns true if a Venus capset was found and its payload parsed.
+    bool detectVenusCapset(VirtIOGPUVenusCapset* outCapset = nullptr);
     bool isUsingBlobScanout() const { return blobScanoutActive; }
     void setFallbackDisplayMode(uint32_t width, uint32_t height);
     uint32_t getNumCapsets() const { return numCapsets; }
@@ -456,6 +479,19 @@ public:
     bool allocateHostVisibleBlob(uint64_t size, uint32_t* outResourceId, void** outPtr,
                                  uint64_t* outOffset = nullptr, uint32_t* outMapInfo = nullptr,
                                  uint32_t blobFlags = VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE);
+    // Creates a host-allocated (BLOB_MEM_HOST3D, blob_id 0) blob within a
+    // specific 3D context and maps it into the guest host-visible window.
+    // Required for Venus command/reply stream resources, which the host
+    // renderer only tracks when created inside the owning context. Returns the
+    // mapped guest pointer and the usable length.
+    bool allocateContextBlob(uint32_t ctxId, uint64_t size, uint32_t* outResourceId, void** outPtr,
+                             uint64_t* outLength);
+    // Like allocateContextBlob but with a caller-supplied blob_id. Venus uses a
+    // non-zero blob_id equal to a VkDeviceMemory object id so the host backs the
+    // blob with that device memory (enabling CPU-visible mapping of Vulkan
+    // memory). blob_id 0 is the generic CS/reply case.
+    bool allocateContextBlobWithId(uint32_t ctxId, uint64_t size, uint64_t blobId,
+                                   uint32_t* outResourceId, void** outPtr, uint64_t* outLength);
     bool transferToHost3D(uint32_t ctxId, uint32_t resourceId, const VirtIOGPUBox& box,
                           uint64_t offset, uint32_t level, uint32_t stride, uint32_t layerStride);
     bool transferFromHost3D(uint32_t ctxId, uint32_t resourceId, const VirtIOGPUBox& box,
@@ -574,6 +610,8 @@ private:
     bool resourceBlobSupported;
     bool resourceUUIDSupported;
     bool blobScanoutActive;
+    bool venusCapsetFound;
+    uint32_t venusCapsetVersion;
     
     // PCI location
     uint8_t bus;
