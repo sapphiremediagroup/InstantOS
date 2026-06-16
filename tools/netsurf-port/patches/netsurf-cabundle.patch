@@ -1,0 +1,15 @@
+--- a/frontends/framebuffer/gui.c
++++ b/frontends/framebuffer/gui.c
+@@ -559,6 +559,12 @@
+ 	/* Set defaults for absent option strings */
+ 	nsoption_setnull_charp(cookie_file, strdup("~/.netsurf/Cookies"));
+ 	nsoption_setnull_charp(cookie_jar, strdup("~/.netsurf/Cookies"));
++
++	/* InstantOS: the CA certificate bundle is shipped in the initrd under the
++	 * /netsurf subtree. Point libcurl/mbedTLS at it so https:// can validate
++	 * the server certificate chain. */
++	nsoption_setnull_charp(ca_bundle,
++			       strdup("/netsurf/etc/cacert.pem"));
+ 
+ 	if (nsoption_charp(cookie_file) == NULL ||
+ 	    nsoption_charp(cookie_jar) == NULL) {

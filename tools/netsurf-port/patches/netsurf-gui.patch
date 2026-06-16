@@ -1,0 +1,15 @@
+--- a/frontends/framebuffer/gui.c
++++ b/frontends/framebuffer/gui.c
+@@ -2200,6 +2200,12 @@
+ 		die("NetSurf operation table failed registration");
+         }
+ 
++	/* Register the InstantOS compositor surface. The kernel does not run
++	 * init_array constructors, so this must be done explicitly and before
++	 * any surface enumeration/selection in process_cmdline().
++	 */
++	nsfb_instant_register();
++
+ 	respaths = fb_init_resource_path(NETSURF_FB_RESPATH":"NETSURF_FB_FONTPATH);
+ 
+ 	/* initialise logging. Not fatal if it fails but not much we

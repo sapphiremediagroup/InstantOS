@@ -1,0 +1,21 @@
+--- a/include/libnsfb.h
++++ b/include/libnsfb.h
+@@ -42,9 +42,18 @@
+     NSFB_SURFACE_LINUX, /**< Linux framebuffer surface */
+     NSFB_SURFACE_ABLE, /**< ABLE framebuffer surface */
+     NSFB_SURFACE_RAM, /**< RAM surface */
++    NSFB_SURFACE_INSTANT, /**< InstantOS compositor surface */
+     NSFB_SURFACE_COUNT, /**< The number of surface kinds */
+ };
+ 
++/** Explicitly register the InstantOS 'instant' compositor surface.
++ *
++ * The InstantOS kernel does not run ELF init_array constructors, so the usual
++ * constructor-based surface registration never fires. The framebuffer frontend
++ * must call this once at startup before selecting the surface by name.
++ */
++void nsfb_instant_register(void);
++
+ enum nsfb_format_e {
+     NSFB_FMT_ANY = 0, /* No specific format - use surface default */
+     NSFB_FMT_XBGR8888, /* 32bpp Blue Green Red */
