@@ -1,4 +1,5 @@
 #include <cpu/syscall/syscall.hpp>
+#include <cpu/cereal/cereal.hpp>
 #include <cpu/process/scheduler.hpp>
 #include <cpu/user/session.hpp>
 #include <cpu/user/user.hpp>
@@ -9,7 +10,10 @@
 #include <graphics/console.hpp>
 #include <graphics/gpu.hpp>
 #include <graphics/virtio_gpu.hpp>
+#include <graphics/venus.hpp>
 #include <common/string.hpp>
+#include <common/ports.hpp>
+#include <common/krandom.hpp>
 #include <time/time.hpp>
 #include <fs/storage/storage.hpp>
 #include <cpuid.h>
@@ -87,7 +91,12 @@ bool currentProcessOwnsFramebuffer() {
         return false;
     }
 
-    return strcmp(current->getName(), "/bin/graphics-compositor") == 0;
+    // The graphics-compositor normally owns the framebuffer. The NetSurf
+    // framebuffer browser (/bin/nsfb) is a fullscreen direct-framebuffer app
+    // that also draws straight to the device, so grant it ownership too.
+    const char* name = current->getName();
+    return strcmp(name, "/bin/graphics-compositor") == 0 ||
+           strcmp(name, "/bin/nsfb") == 0;
 }
 
 bool mapFramebufferIntoCurrentProcess(iFramebuffer* fb, uint64_t* userBase) {
@@ -208,6 +217,17 @@ uint64_t Syscall::sys_gettime() {
 
 uint64_t Syscall::sys_getunixtime() {
     return time_get_unix();
+}
+
+uint64_t Syscall::sys_get_entropy(uint64_t buffer, uint64_t length) {
+    // getentropy(2): at most 256 bytes per call.
+    if (length == 0) return 0;
+    if (length > 256) return syscall_error(SysErrInvalid);
+    if (!isValidUserPointer(buffer, length)) return syscall_error(SysErrInvalid);
+
+    uint8_t local[256];
+    kernel_fill_entropy(local, length);
+    return copyToUser(buffer, local, length) ? 0 : syscall_error(SysErrInvalid);
 }
 
 uint64_t Syscall::sys_clear() {
@@ -491,6 +511,70 @@ uint64_t Syscall::sys_gpu_wait_fence(uint64_t waitPtr) {
     request.completedFence = completedFence;
     request.responseType = responseType;
     return copyToUser(waitPtr, &request, sizeof(request)) ? 0 : static_cast<uint64_t>(-1);
+}
+
+uint64_t Syscall::sys_gpu_venus_probe(uint64_t probePtr) {
+    if (!isValidUserPointer(probePtr, sizeof(GPUVenusProbe))) {
+        return static_cast<uint64_t>(-1);
+    }
+
+    GPUVenusProbe out = {};
+
+    venus::Venus& vk = venus::Venus::get();
+    out.available = vk.negotiate() ? 1 : 0;
+
+    if (out.available) {
+        venus::VenusProbeResult probe = {};
+        const bool ok = vk.probe(&probe);
+        out.replyOk = (ok && probe.replyOk) ? 1 : 0;
+        out.capsetVersion = probe.venusProtocolVersion;
+        out.wireFormatVersion = probe.wireFormatVersion;
+        out.vkXmlVersion = probe.vkXmlVersion;
+        out.instanceVersion = probe.instanceVersion;
+        out.responseType = probe.responseType;
+    }
+
+    return copyToUser(probePtr, &out, sizeof(out)) ? 0 : static_cast<uint64_t>(-1);
+}
+
+uint64_t Syscall::sys_gpu_venus_vulkan(uint64_t resultPtr) {
+    if (!isValidUserPointer(resultPtr, sizeof(GPUVenusVulkan))) {
+        return static_cast<uint64_t>(-1);
+    }
+
+    GPUVenusVulkan out = {};
+
+    venus::Venus& vk = venus::Venus::get();
+    if (vk.negotiate()) {
+        venus::VenusVulkanResult vkr = {};
+        vk.bringUpVulkan(&vkr);
+        out.ringOk = vkr.ringOk ? 1 : 0;
+        out.instanceOk = vkr.instanceOk ? 1 : 0;
+        out.physDevOk = vkr.physDevOk ? 1 : 0;
+        out.propsOk = vkr.propsOk ? 1 : 0;
+        out.deviceOk = vkr.deviceOk ? 1 : 0;
+        out.physDevCount = vkr.physDevCount;
+        out.apiVersion = vkr.device0.apiVersion;
+        out.driverVersion = vkr.device0.driverVersion;
+        out.vendorId = vkr.device0.vendorId;
+        out.deviceId = vkr.device0.deviceId;
+        out.deviceType = vkr.device0.deviceType;
+        out.computeOk = vkr.computeOk ? 1 : 0;
+        out.computeElements = vkr.computeElements;
+        out.computeMismatches = vkr.computeMismatches;
+        out.instanceHandle = vkr.instanceHandle;
+        out.deviceHandle = vkr.deviceHandle;
+        // Copy the device name safely (bounded).
+        for (uint32_t i = 0; i < sizeof(out.deviceName) - 1; ++i) {
+            out.deviceName[i] = vkr.device0.deviceName[i];
+            if (vkr.device0.deviceName[i] == '\0') {
+                break;
+            }
+        }
+        out.deviceName[sizeof(out.deviceName) - 1] = '\0';
+    }
+
+    return copyToUser(resultPtr, &out, sizeof(out)) ? 0 : static_cast<uint64_t>(-1);
 }
 
 extern "C" void _purecall() {

@@ -71,6 +71,11 @@ public:
   bool setCloseOnExec(uint64_t handle, bool enabled);
   void closeOnExecHandles();
 
+  // Copy all live handles from another table into this one (used by fork and
+  // spawn for fd inheritance). Bumps each object's refcount via its retain fn.
+  // closeOnExec handles are skipped when forExec is true.
+  void cloneFrom(const HandleTable& source, bool skipCloseOnExec);
+
   static uint64_t encodeHandle(HandleType type, int slot);
   static bool decodeHandle(uint64_t handle, HandleType* type, int* slot);
 

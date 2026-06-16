@@ -106,6 +106,41 @@ extern "C" __attribute__((naked)) void processTrampoline() {
     );
 }
 
+// fork() child resume path. The scheduler `ret`s here with the kernel stack
+// pointing at a frame laid out by Process::setupForkResume():
+//   [rsp + 0..120]  r15,r14,r13,r12,r11,r10,r9,r8,rbp,rdi,rsi,rdx,rcx,rbx,rax,fsbase
+//   [rsp + 128]     iretq frame: user RIP, CS, RFLAGS, user RSP, SS
+extern "C" __attribute__((naked)) void forkChildTrampoline() {
+    asm volatile(
+        ".intel_syntax noprefix\n"
+        "cli\n"
+        "mov rax, [rsp + 120]\n"   // fsbase
+        "mov rdx, rax\n"
+        "shr rdx, 32\n"
+        "mov ecx, 0xC0000100\n"    // IA32_FS_BASE
+        "wrmsr\n"
+        "swapgs\n"
+        "mov r15, [rsp + 0]\n"
+        "mov r14, [rsp + 8]\n"
+        "mov r13, [rsp + 16]\n"
+        "mov r12, [rsp + 24]\n"
+        "mov r11, [rsp + 32]\n"
+        "mov r10, [rsp + 40]\n"
+        "mov r9,  [rsp + 48]\n"
+        "mov r8,  [rsp + 56]\n"
+        "mov rbp, [rsp + 64]\n"
+        "mov rdi, [rsp + 72]\n"
+        "mov rsi, [rsp + 80]\n"
+        "mov rdx, [rsp + 88]\n"
+        "mov rcx, [rsp + 96]\n"
+        "mov rbx, [rsp + 104]\n"
+        "mov rax, [rsp + 112]\n"   // child returns 0
+        "add rsp, 128\n"
+        "iretq\n"
+        ".att_syntax prefix\n"
+    );
+}
+
 extern "C" __attribute__((naked)) void threadTrampoline() {
     asm volatile (
         ".intel_syntax noprefix\n"

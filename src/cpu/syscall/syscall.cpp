@@ -196,6 +196,18 @@ uint64_t Syscall::handle(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
             return sys_thread_signal(arg1, arg2);
         case SetThreadPointer:
             return sys_set_thread_pointer(arg1);
+        case Ioctl:
+            return sys_ioctl(arg1, arg2, arg3);
+        case Access:
+            return sys_access(arg1, arg2);
+        case Statfs:
+            return sys_statfs(arg1, arg2, arg3);
+        case Chown:
+            return sys_chown(arg1, arg2, arg3, arg4, arg5);
+        case Mknod:
+            return sys_mknod(arg1, arg2, arg3);
+        case GetEntropy:
+            return sys_get_entropy(arg1, arg2);
         case Socket:
             return sys_socket(arg1, arg2, arg3);
         case Bind:
@@ -216,6 +228,10 @@ uint64_t Syscall::handle(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
             return sys_getsockopt(arg1, arg2, arg3, arg4, arg5);
         case SetSockOpt:
             return sys_setsockopt(arg1, arg2, arg3, arg4, arg5);
+        case GetSockName:
+            return sys_getsockname(arg1, arg2, arg3);
+        case GetPeerName:
+            return sys_getpeername(arg1, arg2, arg3);
         case Login:
             return sys_login(arg1);
         case Logout:
@@ -263,7 +279,7 @@ uint64_t Syscall::handle(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
         case Fcntl:
             return sys_fcntl(arg1, arg2, arg3);
         case Poll:
-            return sys_poll(arg1, arg2);
+            return sys_poll(arg1, arg2, arg3);
         case Truncate:
             return sys_truncate(arg1, arg2, arg3);
         case Rename:
@@ -368,6 +384,10 @@ uint64_t Syscall::handle(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
             return sys_gpu_submit_3d(arg1);
         case GPUWaitFence:
             return sys_gpu_wait_fence(arg1);
+        case GPUVenusProbeCall:
+            return sys_gpu_venus_probe(arg1);
+        case GPUVenusVulkanCall:
+            return sys_gpu_venus_vulkan(arg1);
         case GetUnixTime:
             return sys_getunixtime();
         case StorageInfo:

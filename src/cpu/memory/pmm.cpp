@@ -1,6 +1,7 @@
 #include <cpu/cereal/cereal.hpp>
 #include <memory/pmm.hpp>
 
+
 namespace {
 struct KnownReservation {
     uint64_t start;

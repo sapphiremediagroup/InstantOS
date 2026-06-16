@@ -68,13 +68,21 @@ uint64_t Syscall::sys_mmap(uint64_t addr, uint64_t length, uint64_t prot) {
         }
     }
 
+    // Flush any stale TLB entries for this range *before* touching the new
+    // mapping. MapRangeInto / UnmapRangeFrom do not invalidate, so a prior
+    // munmap (or a stale large-page translation) can otherwise leave a bogus
+    // entry cached, causing a reserved-bit / protection fault on the kernel
+    // memset below.
+    for (size_t i = 0; i < pages; i++) {
+        asm volatile("invlpg (%0)" : : "r"(virt + i * PAGE_SIZE) : "memory");
+    }
+
     memset(reinterpret_cast<void*>(virt), 0, aligned_length);
     if (finalFlags != zeroFlags) {
         VMM::ProtectRangeIn(pageTable, virt, pages, finalFlags);
-    }
-
-    for (size_t i = 0; i < pages; i++) {
-        asm volatile("invlpg (%0)" : : "r"(virt + i * PAGE_SIZE) : "memory");
+        for (size_t i = 0; i < pages; i++) {
+            asm volatile("invlpg (%0)" : : "r"(virt + i * PAGE_SIZE) : "memory");
+        }
     }
 
     return virt;
@@ -93,6 +101,14 @@ uint64_t Syscall::sys_mprotect(uint64_t addr, uint64_t length, uint64_t prot) {
     const uint64_t pages = (length + PAGE_SIZE - 1) / PAGE_SIZE;
     if (!VMM::ProtectRangeIn(current->getPageTable(), addr, pages, pageFlagsForProtection(prot, false))) {
         return syscall_error(SysErrInvalid);
+    }
+
+    // Flush stale TLB entries for the range so the new protection (e.g. clearing
+    // the NX bit for JIT/-run executable pages) takes effect immediately.
+    // Without this a subsequent instruction fetch faults against the cached
+    // (still-NX) translation.
+    for (uint64_t i = 0; i < pages; i++) {
+        asm volatile("invlpg (%0)" : : "r"(addr + i * PAGE_SIZE) : "memory");
     }
 
     return 0;

@@ -26,13 +26,25 @@ struct FreeNode {
 
 struct Spinlock {
     int locked = 0;
+    unsigned long savedFlags = 0;
     void lock() {
+        // Disable interrupts while holding the lock so a timer/IRQ handler that
+        // also allocates (e.g. the scheduler reaping a process via kfree) cannot
+        // deadlock against a thread that already holds this non-reentrant lock.
+        unsigned long flags;
+        __asm__ volatile("pushfq; pop %q0" : "=r"(flags) :: "memory");
+        __asm__ volatile("cli" ::: "memory");
         while (__sync_lock_test_and_set(&locked, 1)) {
             __asm__ volatile("pause" ::: "memory");
         }
+        savedFlags = flags;
     }
     void unlock() {
+        unsigned long flags = savedFlags;
         __sync_lock_release(&locked);
+        if (flags & 0x200) {
+            __asm__ volatile("sti" ::: "memory");
+        }
     }
 };
 

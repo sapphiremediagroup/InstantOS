@@ -90,6 +90,19 @@ struct Stat {
     uint64_t st_ctime;
 };
 
+// Filesystem statistics written back by the Statfs syscall. The mlibc sysdep
+// translates this into struct statvfs / struct statfs.
+struct KernelStatfs {
+    uint64_t blockSize;
+    uint64_t totalBlocks;
+    uint64_t freeBlocks;
+    uint64_t totalInodes;
+    uint64_t freeInodes;
+    uint64_t nameMax;
+    uint32_t fsType;
+    uint32_t reserved;
+};
+
 struct PollFD {
     int64_t fd;
     int16_t events;
@@ -306,6 +319,43 @@ struct GPUWaitFence {
     uint8_t completed;
     uint8_t reserved[3];
 };
+
+// Result of the Venus (Vulkan over virtio-gpu) availability + round-trip probe
+// exposed to userspace. See Syscall::sys_gpu_venus_probe.
+struct GPUVenusProbe {
+    uint8_t available;        // out: host advertises a compatible Venus capset
+    uint8_t replyOk;          // out: vkEnumerateInstanceVersion round trip ok
+    uint8_t reserved[2];
+    uint32_t capsetVersion;   // out: VK_MESA_venus_protocol spec version
+    uint32_t wireFormatVersion;
+    uint32_t vkXmlVersion;
+    uint32_t instanceVersion; // out: Vulkan instance version (if replyOk)
+    uint32_t responseType;    // out: virtio-gpu response type of the submission
+};
+
+// Result of a fuller Venus Vulkan bring-up over the async ring (instance +
+// physical device enumeration + properties + logical device). See
+// Syscall::sys_gpu_venus_vulkan.
+struct GPUVenusVulkan {
+    uint8_t ringOk;           // out: async command ring created
+    uint8_t instanceOk;       // out: vkCreateInstance succeeded
+    uint8_t physDevOk;        // out: >=1 physical device enumerated
+    uint8_t propsOk;          // out: device 0 properties read
+    uint8_t deviceOk;         // out: vkCreateDevice succeeded
+    uint8_t computeOk;        // out: compute dispatch ran + readback verified
+    uint8_t reserved[2];
+    uint32_t physDevCount;    // out: number of physical devices
+    uint32_t apiVersion;      // out: device 0 apiVersion
+    uint32_t driverVersion;   // out: device 0 driverVersion
+    uint32_t vendorId;        // out: device 0 vendorID
+    uint32_t deviceId;        // out: device 0 deviceID
+    uint32_t deviceType;      // out: device 0 VkPhysicalDeviceType
+    uint32_t computeElements; // out: elements dispatched/verified
+    uint32_t computeMismatches; // out: readback mismatches (0 = success)
+    uint64_t instanceHandle;  // out: Venus VkInstance object id
+    uint64_t deviceHandle;    // out: Venus VkDevice object id
+    char deviceName[256];     // out: device 0 name
+};
 #include <fs/vfs/vfs.hpp>
 
 enum class SyscallNumber : uint64_t {
@@ -428,6 +478,16 @@ enum class SyscallNumber : uint64_t {
     Sigaltstack,
     ThreadSignal,
     SetThreadPointer,
+    Ioctl,
+    Access,
+    Statfs,
+    Chown,
+    Mknod,
+    GetEntropy,
+    GetSockName,
+    GetPeerName,
+    GPUVenusProbeCall,
+    GPUVenusVulkanCall,
 };
 
 enum MemoryProtection : uint64_t {
@@ -463,6 +523,8 @@ enum SyscallErrno : int {
     SysErrOperationNotSupported = 95,
     SysErrAddressFamilyNotSupported = 97,
     SysErrAddressInUse = 98,
+    SysErrConnectionReset = 104,
+    SysErrTimedOut = 110,
     SysErrNotConnected = 107,
 };
 
@@ -564,7 +626,13 @@ private:
     uint64_t sys_dup2(uint64_t oldHandle, uint64_t newHandle);
     uint64_t sys_pipe(uint64_t pipeHandles);
     uint64_t sys_fcntl(uint64_t handle, uint64_t command, uint64_t value);
-    uint64_t sys_poll(uint64_t fds, uint64_t nfds);
+    uint64_t sys_ioctl(uint64_t handle, uint64_t request, uint64_t arg);
+    uint64_t sys_access(uint64_t path, uint64_t mode);
+    uint64_t sys_statfs(uint64_t target, uint64_t byHandle, uint64_t statbuf);
+    uint64_t sys_chown(uint64_t target, uint64_t byHandle, uint64_t uid, uint64_t gid, uint64_t flags);
+    uint64_t sys_mknod(uint64_t path, uint64_t mode, uint64_t dev);
+    uint64_t sys_get_entropy(uint64_t buffer, uint64_t length);
+    uint64_t sys_poll(uint64_t fds, uint64_t nfds, uint64_t timeoutMs);
     uint64_t sys_truncate(uint64_t target, uint64_t size, uint64_t byHandle);
     uint64_t sys_rename(uint64_t oldPath, uint64_t newPath);
     uint64_t sys_chmod(uint64_t target, uint64_t mode, uint64_t byHandle);
@@ -582,6 +650,8 @@ private:
     uint64_t sys_shutdown(uint64_t socketHandle, uint64_t how);
     uint64_t sys_getsockopt(uint64_t socketHandle, uint64_t level, uint64_t optionName, uint64_t optionValue, uint64_t optionLength);
     uint64_t sys_setsockopt(uint64_t socketHandle, uint64_t level, uint64_t optionName, uint64_t optionValue, uint64_t optionLength);
+    uint64_t sys_getsockname(uint64_t socketHandle, uint64_t addrPtr, uint64_t addrLenPtr);
+    uint64_t sys_getpeername(uint64_t socketHandle, uint64_t addrPtr, uint64_t addrLenPtr);
     uint64_t sys_getppid();
     uint64_t sys_spawn(uint64_t path, uint64_t argv, uint64_t envp);
     uint64_t sys_thread_create(uint64_t entry, uint64_t arg, uint64_t stackSize);
@@ -597,6 +667,8 @@ private:
     uint64_t sys_gpu_resource_assign_uuid(uint64_t uuidPtr);
     uint64_t sys_gpu_submit_3d(uint64_t submitPtr);
     uint64_t sys_gpu_wait_fence(uint64_t waitPtr);
+    uint64_t sys_gpu_venus_probe(uint64_t probePtr);
+    uint64_t sys_gpu_venus_vulkan(uint64_t resultPtr);
     uint64_t sys_getuserinfo(uint64_t uid, uint64_t info_ptr);
     uint64_t sys_readdir(uint64_t path, uint64_t entries, uint64_t count);
     uint64_t sys_fb_flush(uint64_t x, uint64_t y, uint64_t w, uint64_t h);

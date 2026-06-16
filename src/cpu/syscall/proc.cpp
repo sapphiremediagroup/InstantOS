@@ -196,7 +196,65 @@ uint64_t Syscall::sys_procinfo(uint64_t entriesPtr, uint64_t capacity, uint64_t 
 }
 
 uint64_t Syscall::sys_fork() {
-    return syscall_error(SysErrNoSys);
+    Process* parent = Scheduler::get().getCurrentProcess();
+    if (!parent || parent->isThread()) {
+        return syscall_error(SysErrInvalid);
+    }
+
+    // The parent's full userspace register state was captured into its context
+    // by saveSyscallState() on syscall entry.
+    const ProcessContext parentUserCtx = *parent->getContext();
+    const uint64_t parentFsBase = parent->getUserFsBase();
+
+    // Run the copy on the kernel address space so all phys pointers are usable.
+    uint64_t userCR3;
+    asm volatile("mov %%cr3, %0" : "=r"(userCR3));
+    PageTable* kernelPML4 = VMM::GetAddressSpace();
+    VMM::SetAddressSpace(kernelPML4);
+
+    uint32_t childPid = Scheduler::get().allocatePID();
+    Process* child = new Process(childPid);
+    if (!child || !child->getPageTable()) {
+        delete child;
+        asm volatile("mov %0, %%cr3" :: "r"(userCR3) : "memory");
+        return syscall_error(SysErrNoMemory);
+    }
+
+    if (!child->cloneAddressSpaceFrom(parent)) {
+        delete child;
+        asm volatile("mov %0, %%cr3" :: "r"(userCR3) : "memory");
+        return syscall_error(SysErrNoMemory);
+    }
+
+    // Inherit identity, cwd, name, fd table, and signal dispositions.
+    child->setParentPID(parent->getPID());
+    child->setUID(parent->getUID());
+    child->setGID(parent->getGID());
+    child->setSessionID(parent->getSessionID());
+    child->setCwd(parent->getCwd());
+    child->setName(parent->getName());
+    child->setUserFsBase(parentFsBase);
+    child->cloneHandlesFrom(parent, false);
+
+    SignalHandler* dst = child->getSignalHandler();
+    const SignalHandler* src = parent->getSignalHandler();
+    for (int i = 0; i < NSIG; i++) {
+        dst->handlers[i] = src->handlers[i];
+        dst->masks[i] = src->masks[i];
+        dst->flags[i] = src->flags[i];
+        dst->restorers[i] = src->restorers[i];
+    }
+    dst->blocked = src->blocked;
+    dst->pending = 0;  // pending signals are not inherited
+
+    // Arrange for the child to resume in usermode returning 0.
+    child->setupForkResume(parentUserCtx, parentFsBase);
+    child->setState(ProcessState::Ready);
+
+    Scheduler::get().addProcess(child);
+
+    asm volatile("mov %0, %%cr3" :: "r"(userCR3) : "memory");
+    return childPid;
 }
 
 uint64_t Syscall::sys_exec(uint64_t path, uint64_t argv, uint64_t envp) {
@@ -436,6 +494,9 @@ uint64_t Syscall::sys_spawn(uint64_t path, uint64_t argv, uint64_t envp) {
         newProc->setGID(current->getGID());
         newProc->setSessionID(current->getSessionID());
         newProc->setCwd(current->getCwd());
+        // Inherit the parent's open file descriptors (stdin/stdout/stderr and
+        // any others) so spawned programs share the controlling terminal.
+        newProc->cloneHandlesFrom(current, true);
     }
 
     Scheduler::get().addProcess(newProc);

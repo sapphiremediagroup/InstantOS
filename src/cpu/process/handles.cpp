@@ -68,7 +68,7 @@ bool HandleTable::close(uint64_t handle, HandleType expectedType) {
 }
 
 void HandleTable::closeAll() {
-    for (int slot = FirstAllocHandle; slot < MaxHandles; slot++) {
+    for (int slot = 0; slot < MaxHandles; slot++) {
         if (entries[slot].type != HandleType::None) {
             close(encodeHandle(entries[slot].type, slot));
         }
@@ -206,15 +206,50 @@ bool HandleTable::setCloseOnExec(uint64_t handle, bool enabled) {
 }
 
 void HandleTable::closeOnExecHandles() {
-    for (int slot = FirstAllocHandle; slot < MaxHandles; slot++) {
+    for (int slot = 0; slot < MaxHandles; slot++) {
         if (entries[slot].type != HandleType::None && entries[slot].closeOnExec) {
             close(encodeHandle(entries[slot].type, slot));
         }
     }
 }
 
+void HandleTable::cloneFrom(const HandleTable& source, bool skipCloseOnExec) {
+    for (int slot = 0; slot < MaxHandles; slot++) {
+        const HandleEntry& src = source.entries[slot];
+        if (src.type == HandleType::None || !src.object) {
+            continue;
+        }
+        if (skipCloseOnExec && src.closeOnExec) {
+            continue;
+        }
+
+        // Bump the underlying object's refcount so both tables share it.
+        if (src.retain) {
+            src.retain(src.object);
+        }
+
+        if (entries[slot].type != HandleType::None) {
+            releaseEntry(entries[slot]);
+            clearEntry(slot);
+        }
+        entries[slot].type = src.type;
+        entries[slot].rights = src.rights;
+        entries[slot].object = src.object;
+        entries[slot].retain = src.retain;
+        entries[slot].release = src.release;
+        entries[slot].closeOnExec = src.closeOnExec;
+    }
+}
+
 uint64_t HandleTable::encodeHandle(HandleType type, int slot) {
-    if (type == HandleType::None || slot < FirstAllocHandle || slot >= MaxHandles) {
+    if (type == HandleType::None || slot >= MaxHandles) {
+        return static_cast<uint64_t>(-1);
+    }
+    // File handles may occupy the reserved stdio slots 0/1/2 so that POSIX
+    // stdin/stdout/stderr are first-class, inheritable file handles. All other
+    // handle types still start at FirstAllocHandle.
+    const int minSlot = (type == HandleType::File) ? 0 : FirstAllocHandle;
+    if (slot < minSlot) {
         return static_cast<uint64_t>(-1);
     }
 
@@ -226,8 +261,13 @@ bool HandleTable::decodeHandle(uint64_t handle, HandleType* type, int* slot) {
     uint64_t rawSlot = handle & SlotMask;
     if (rawType == static_cast<uint64_t>(HandleType::None) ||
         rawType > static_cast<uint64_t>(HandleType::Socket) ||
-        rawSlot < FirstAllocHandle ||
         rawSlot >= MaxHandles) {
+        return false;
+    }
+    const uint64_t minSlot = (rawType == static_cast<uint64_t>(HandleType::File))
+        ? 0
+        : static_cast<uint64_t>(FirstAllocHandle);
+    if (rawSlot < minSlot) {
         return false;
     }
 

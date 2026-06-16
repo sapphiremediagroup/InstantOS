@@ -277,7 +277,7 @@ void Scheduler::removeProcess(uint32_t pid) {
         
         // SessionManager::get().onProcessExit(pid);
         if (currentProcess == toDelete) currentProcess = nullptr;
-        
+
         delete toDelete;
     }
 }

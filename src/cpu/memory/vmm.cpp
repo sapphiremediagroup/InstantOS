@@ -18,15 +18,16 @@ static void memzero(void* dst, uint64_t size) {
 }
 
 static PageTable* alloc_zeroed_table() {
-    PageTable* table = nullptr;
-    if (heap_is_initialized()) {
-        table = reinterpret_cast<PageTable*>(kmalloc_aligned(sizeof(PageTable), PAGE_SIZE));
-    } else {
-        uint64_t frame = PMM::AllocFrame();
-        if (frame == 0) return nullptr;
-        table = reinterpret_cast<PageTable*>(frame);
-    }
-    if (!table) return nullptr;
+    // Page tables are always allocated from the PMM (one physical frame each),
+    // never from the buddy heap. A page table stored in a heap block is a hazard
+    // for the buddy allocator: the table's PTE bytes can be misread as a free
+    // block's header/free-list pointers during coalescing, corrupting the heap
+    // (observed as an infinite loop in kfree() while tearing down a forked
+    // address space). PMM frames are the natural home for page tables and avoid
+    // this class of bug entirely. free_table() mirrors this via PMM::FreeFrame.
+    uint64_t frame = PMM::AllocFrame();
+    if (frame == 0) return nullptr;
+    PageTable* table = reinterpret_cast<PageTable*>(frame);
     if ((reinterpret_cast<uint64_t>(table) & (PAGE_SIZE - 1)) != 0) return nullptr;
     memzero(table, sizeof(PageTable));
     return table;
@@ -73,8 +74,16 @@ static PageTable* clone_table_if_needed(uint64_t& parentEntry) {
         return reinterpret_cast<PageTable*>(parentEntry & ADDR_MASK);
     }
 
+    // Bit 9 (an AVL/OS-available bit) marks a table that is already private to
+    // this address space (either freshly AllocTable()'d here, or previously
+    // cloned). Such tables must not be re-cloned, or repeated MapPageInto()
+    // calls into the same table would discard earlier entries. Kernel-shared
+    // tables (inherited identity/code maps) lack this bit and are cloned on
+    // first write (copy-on-write).
+    constexpr uint64_t kPrivateTable = 1ULL << 9;
+
     auto* table = reinterpret_cast<PageTable*>(parentEntry & ADDR_MASK);
-    if (!heap_is_initialized() || is_heap_table(table)) {
+    if (!heap_is_initialized() || (parentEntry & kPrivateTable)) {
         return table;
     }
 
@@ -85,7 +94,7 @@ static PageTable* clone_table_if_needed(uint64_t& parentEntry) {
         clone->entries[i] = table->entries[i];
     }
 
-    const uint64_t flags = (parentEntry & ~ADDR_MASK) | ReadWrite;
+    const uint64_t flags = (parentEntry & ~ADDR_MASK) | ReadWrite | kPrivateTable;
     parentEntry = reinterpret_cast<uint64_t>(clone) | flags;
     return clone;
 }
@@ -107,7 +116,7 @@ static PageTable* splitLargePdptEntry(PageTable* pdpt, uint64_t pdpti) {
         pd->entries[i] = (base + i * 0x200000ULL) | flags | Present | LargePage;
     }
 
-    entry = reinterpret_cast<uint64_t>(pd) | flags | Present | ReadWrite | UserSuper;
+    entry = reinterpret_cast<uint64_t>(pd) | flags | Present | ReadWrite | UserSuper | (1ULL << 9);
     return pd;
 }
 
@@ -128,7 +137,7 @@ static PageTable* splitLargePdEntry(PageTable* pd, uint64_t pdi) {
         pt->entries[i] = (base + i * PAGE_SIZE) | flags | Present;
     }
 
-    entry = reinterpret_cast<uint64_t>(pt) | flags | Present | ReadWrite | UserSuper;
+    entry = reinterpret_cast<uint64_t>(pt) | flags | Present | ReadWrite | UserSuper | (1ULL << 9);
     return pt;
 }
 
@@ -173,7 +182,7 @@ void VMM::MapPage(uint64_t virtualAddr, uint64_t physAddr, uint64_t flags) {
     if (!(pml4->entries[pml4i] & Present)) {
         PageTable* pdpt = AllocTable();
         if (!pdpt) return;
-        pml4->entries[pml4i] = reinterpret_cast<uint64_t>(pdpt) | Present | ReadWrite | UserSuper;
+        pml4->entries[pml4i] = reinterpret_cast<uint64_t>(pdpt) | Present | ReadWrite | UserSuper | (1ULL << 9);
     }
     auto* pdpt = clone_table_if_needed(pml4->entries[pml4i]);
     if (!pdpt) return;
@@ -181,7 +190,7 @@ void VMM::MapPage(uint64_t virtualAddr, uint64_t physAddr, uint64_t flags) {
     if (!(pdpt->entries[pdpti] & Present)) {
         PageTable* pd = AllocTable();
         if (!pd) return;
-        pdpt->entries[pdpti] = reinterpret_cast<uint64_t>(pd) | Present | ReadWrite | UserSuper;
+        pdpt->entries[pdpti] = reinterpret_cast<uint64_t>(pd) | Present | ReadWrite | UserSuper | (1ULL << 9);
     }
     if (!(pdpt->entries[pdpti] & LargePage)) {
         if (!clone_table_if_needed(pdpt->entries[pdpti])) return;
@@ -192,7 +201,7 @@ void VMM::MapPage(uint64_t virtualAddr, uint64_t physAddr, uint64_t flags) {
     if (!(pd->entries[pdi] & Present)) {
         PageTable* pt = AllocTable();
         if (!pt) return;
-        pd->entries[pdi] = reinterpret_cast<uint64_t>(pt) | Present | ReadWrite | UserSuper;
+        pd->entries[pdi] = reinterpret_cast<uint64_t>(pt) | Present | ReadWrite | UserSuper | (1ULL << 9);
     }
     if (!(pd->entries[pdi] & LargePage)) {
         if (!clone_table_if_needed(pd->entries[pdi])) return;
@@ -358,10 +367,19 @@ void VMM::MapPageInto(PageTable* pml4, uint64_t virtualAddr, uint64_t physAddr, 
     uint64_t pdi   = PDIndex(virtualAddr);
     uint64_t pti   = PTIndex(virtualAddr);
 
+    // Intermediate paging structures must be at least as permissive as the leaf
+    // they reach. When mapping a user page into a hierarchy whose upper entries
+    // were inherited from the kernel half (which lack the U/S and/or R/W bits),
+    // those bits must be promoted, otherwise the CPU treats the leaf as
+    // supervisor/read-only and user accesses (and isValidUserPointer) fail.
+    const uint64_t upperPromote = (flags & UserSuper) | (flags & ReadWrite);
+
     if (!(pml4->entries[pml4i] & Present)) {
         PageTable* pdpt = AllocTable();
         if (!pdpt) return;
         pml4->entries[pml4i] = reinterpret_cast<uint64_t>(pdpt) | Present | ReadWrite | UserSuper;
+    } else {
+        pml4->entries[pml4i] |= upperPromote;
     }
     auto* pdpt = clone_table_if_needed(pml4->entries[pml4i]);
     if (!pdpt) return;
@@ -370,6 +388,8 @@ void VMM::MapPageInto(PageTable* pml4, uint64_t virtualAddr, uint64_t physAddr, 
         PageTable* pd = AllocTable();
         if (!pd) return;
         pdpt->entries[pdpti] = reinterpret_cast<uint64_t>(pd) | Present | ReadWrite | UserSuper;
+    } else {
+        pdpt->entries[pdpti] |= upperPromote;
     }
     if (!(pdpt->entries[pdpti] & LargePage)) {
         if (!clone_table_if_needed(pdpt->entries[pdpti])) return;
@@ -381,6 +401,8 @@ void VMM::MapPageInto(PageTable* pml4, uint64_t virtualAddr, uint64_t physAddr, 
         PageTable* pt = AllocTable();
         if (!pt) return;
         pd->entries[pdi] = reinterpret_cast<uint64_t>(pt) | Present | ReadWrite | UserSuper;
+    } else {
+        pd->entries[pdi] |= upperPromote;
     }
     if (!(pd->entries[pdi] & LargePage)) {
         if (!clone_table_if_needed(pd->entries[pdi])) return;
@@ -389,6 +411,13 @@ void VMM::MapPageInto(PageTable* pml4, uint64_t virtualAddr, uint64_t physAddr, 
     if (!pt) return;
 
     pt->entries[pti] = physAddr | (flags & ~ADDR_MASK) | Present;
+
+    // If we just edited the live address space, flush the stale translation so
+    // a subsequent access (including a kernel-side memset of a fresh mapping)
+    // doesn't fault against a previously cached entry.
+    if (pml4 == current_pml4()) {
+        InvalidatePage(virtualAddr);
+    }
 }
 
 void VMM::MapRangeInto(PageTable* pml4, uint64_t virtualBase, uint64_t physBase,
@@ -490,6 +519,10 @@ void VMM::UnmapPageFrom(PageTable* pml4, uint64_t virtualAddr) {
         pml4->entries[pml4i] = 0;
         free_table(pdpt);
     }
+
+    if (pml4 == current_pml4()) {
+        InvalidatePage(virtualAddr);
+    }
 }
 
 void VMM::UnmapRangeFrom(PageTable* pml4, uint64_t virtualBase, uint64_t pageCount) {
@@ -501,6 +534,14 @@ void VMM::UnmapRangeFrom(PageTable* pml4, uint64_t virtualBase, uint64_t pageCou
 namespace {
 void freeMappedFrames(uint64_t entry, int level) {
     if (!(entry & Present)) {
+        return;
+    }
+
+    // Never free supervisor-only mappings. The low half of every user address
+    // space inherits the kernel's identity/large-page maps (which lack the U/S
+    // bit). Those frames are shared kernel memory and must not be reclaimed when
+    // a single user address space is torn down.
+    if (!(entry & UserSuper)) {
         return;
     }
 
@@ -537,6 +578,15 @@ void freePrivateTable(PageTable* table, uint64_t kernelEntry, int level) {
 
         const uint64_t baseline = kernelTable ? kernelTable->entries[i] : 0;
         if (entry == baseline) {
+            continue;
+        }
+
+        // Supervisor-only entries map shared kernel memory (e.g. the identity
+        // map inherited into the user address space's low half). Never free the
+        // frames or sub-tables they reference; they are not owned by this user
+        // address space. Without this guard a shallow-copied kernel PDPT/PD makes
+        // the baseline comparison miss and we would free live kernel memory.
+        if (!(entry & UserSuper)) {
             continue;
         }
 
@@ -578,6 +628,12 @@ void VMM::FreeAddressSpace(PageTable* pml4) {
             continue;
         }
 
+        // Recurse to reclaim user mappings. freePrivateTable() skips any
+        // supervisor-only (kernel-shared) sub-entries, so only frames owned by
+        // this user address space are freed. The per-process PDPT itself (a
+        // shallow copy of the kernel's low-half PDPT created in
+        // initializeAddressSpace) is always private to this address space and is
+        // freed below.
         auto* pdpt = reinterpret_cast<PageTable*>(entry & ADDR_MASK);
         freePrivateTable(pdpt, baseline, 3);
         free_table(pdpt);

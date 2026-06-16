@@ -382,6 +382,12 @@ const char* syscallName(uint64_t number) {
         case SyscallNumber::Sigaltstack: return "Sigaltstack";
         case SyscallNumber::ThreadSignal: return "ThreadSignal";
         case SyscallNumber::SetThreadPointer: return "SetThreadPointer";
+        case SyscallNumber::Ioctl: return "Ioctl";
+        case SyscallNumber::Access: return "Access";
+        case SyscallNumber::Statfs: return "Statfs";
+        case SyscallNumber::Chown: return "Chown";
+        case SyscallNumber::Mknod: return "Mknod";
+        case SyscallNumber::GetEntropy: return "GetEntropy";
         case SyscallNumber::Socket: return "Socket";
         case SyscallNumber::Bind: return "Bind";
         case SyscallNumber::Connect: return "Connect";
@@ -395,6 +401,10 @@ const char* syscallName(uint64_t number) {
         case SyscallNumber::StorageInfo: return "StorageInfo";
         case SyscallNumber::StorageFormat: return "StorageFormat";
         case SyscallNumber::StorageMount: return "StorageMount";
+        case SyscallNumber::GetSockName: return "GetSockName";
+        case SyscallNumber::GetPeerName: return "GetPeerName";
+        case SyscallNumber::GPUVenusProbeCall: return "GPUVenusProbe";
+        case SyscallNumber::GPUVenusVulkanCall: return "GPUVenusVulkan";
     }
 
     return "Unknown";

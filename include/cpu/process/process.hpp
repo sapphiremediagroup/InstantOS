@@ -28,7 +28,11 @@ struct ProcessContext {
   uint64_t rip, rflags, cr3, xstate;
 };
 
-#define NSIG 32
+// Number of signal slots. Signals are numbered 1..NSIG-1 and stored as bit
+// positions in 64-bit masks (bit `sig`), so NSIG must be <= 64. This matches
+// the Linux/mlibc ABI range closely enough for userspace (SIGCANCEL=32,
+// SIGTIMER=33, SIGRTMIN=35..) without overflowing the 64-bit mask words.
+#define NSIG 64
 #define SIGHUP 1
 #define SIGINT 2
 #define SIGQUIT 3
@@ -170,6 +174,7 @@ public:
   uint64_t allocateFD(FileDescriptor *fd);
   uint64_t allocateFD(FileDescriptor *fd, uint32_t rights);
   uint64_t allocateFD(FileDescriptor *fd, uint32_t rights, bool closeOnExec);
+  uint64_t allocateFDAt(int slot, FileDescriptor *fd, uint32_t rights, bool closeOnExec);
   FileDescriptor *getFD(uint64_t fileHandle);
   FileDescriptor *getFD(uint64_t fileHandle, uint32_t requiredRights);
   void closeFD(uint64_t fileHandle);
@@ -178,6 +183,16 @@ public:
   bool getHandleCloseOnExec(uint64_t handle, bool *enabled) const;
   bool setHandleCloseOnExec(uint64_t handle, bool enabled);
   void closeOnExecHandles();
+
+  // Copy another process's handle table into ours (fd inheritance for
+  // spawn/fork). skipCloseOnExec excludes FD_CLOEXEC handles.
+  void cloneHandlesFrom(Process *source, bool skipCloseOnExec);
+
+  // fork() support: deep-copy the parent's user address space into this
+  // (freshly created) process, and arrange for this process to resume in
+  // usermode with the given saved register context (child returns 0).
+  bool cloneAddressSpaceFrom(Process *parent);
+  void setupForkResume(const ProcessContext &userContext, uint64_t fsBase);
 
   // Typed handle management
   uint64_t allocateHandle(HandleType type, uint32_t rights, void *object, HandleRetainFn retain, HandleReleaseFn release);
@@ -235,6 +250,11 @@ private:
   uint64_t userStack;
   uint64_t userStackBase;
   uint64_t userStackSize;
+  // True when userStackBase maps a kmalloc()'d region this Process owns (spawn
+  // path). False when the stack is part of a copied address space (fork), in
+  // which case FreeAddressSpace() reclaims the frame and the destructor must
+  // not kfree() it.
+  bool userStackHeapBacked;
   ProcessContext context;
   FPUState *fpuState;
   bool validUserState;

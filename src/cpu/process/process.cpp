@@ -1,6 +1,7 @@
 #include <cpu/process/process.hpp>
 #include <memory/heap.hpp>
 #include <memory/vmm.hpp>
+#include <memory/pmm.hpp>
 #include <cpu/gdt/gdt.hpp>
 #include <cpu/syscall/syscall.hpp>
 #include <cpu/process/scheduler.hpp>
@@ -8,6 +9,8 @@
 #include <fs/vfs/vfs.hpp>
 #include <ipc/ipc.hpp>
 #include <common/string.hpp>
+
+extern "C" void forkChildTrampoline();
 
 extern "C" void enterUsermode(uint64_t entry, uint64_t stack);
 
@@ -130,7 +133,7 @@ bool initializeAddressSpace(ProcessSharedState* state) {
 Process::Process(uint32_t pid)
     : sharedState(nullptr), sessionID(0), uid(0), gid(0), pid(pid), parentPID(0), exitCode(0),
       state(ProcessState::Ready), priority(ProcessPriority::Normal), kernelStack(0), userStack(0),
-      userStackBase(0), userStackSize(0), fpuState(nullptr), userFpuState(nullptr), validUserState(false), savedUserRSP(0),
+      userStackBase(0), userStackSize(0), userStackHeapBacked(false), fpuState(nullptr), userFpuState(nullptr), validUserState(false), savedUserRSP(0),
       userFsBase(0), sleepDeadlineMs(0), sleeping(false),
       threadObject(nullptr) {
     next = nullptr;
@@ -177,6 +180,7 @@ Process::Process(uint32_t pid)
                           USER_STACK_PAGES,
                           PageFlags::Present | PageFlags::ReadWrite | PageFlags::UserSuper | PageFlags::NoExecute);
         userStack = USER_STACK_TOP - 8;
+        userStackHeapBacked = true;
     }
 
     void* fpuPhys = kmalloc_aligned(sizeof(FPUState), 64);
@@ -221,7 +225,7 @@ Process::Process(uint32_t pid)
 Process::Process(uint32_t pid, Process* sharedFrom, uint64_t stackSize)
     : sharedState(nullptr), sessionID(0), uid(0), gid(0), pid(pid), parentPID(0), exitCode(0),
       state(ProcessState::Ready), priority(ProcessPriority::Normal), kernelStack(0), userStack(0),
-      userStackBase(0), userStackSize(0), fpuState(nullptr), validUserState(false), savedUserRSP(0),
+      userStackBase(0), userStackSize(0), userStackHeapBacked(false), fpuState(nullptr), validUserState(false), savedUserRSP(0),
       userFsBase(0), sleepDeadlineMs(0), sleeping(false),
       threadObject(nullptr) {
     next = nullptr;
@@ -281,6 +285,7 @@ Process::Process(uint32_t pid, Process* sharedFrom, uint64_t stackSize)
                           userStackSize / PAGE_SIZE,
                           PageFlags::Present | PageFlags::ReadWrite | PageFlags::UserSuper | PageFlags::NoExecute);
         userStack = userStackBase + userStackSize - 8;
+        userStackHeapBacked = true;
     }
 
     void* fpuPhys = kmalloc_aligned(sizeof(FPUState), 64);
@@ -331,11 +336,15 @@ Process::~Process() {
     }
 
     if (userStackBase && userStackSize && getPageTable()) {
-        uint64_t ustackPhys = VMM::VirtualToPhysicalIn(getPageTable(), userStackBase);
-        if (ustackPhys) {
-            kfree(reinterpret_cast<void*>(ustackPhys));
+        if (userStackHeapBacked) {
+            uint64_t ustackPhys = VMM::VirtualToPhysicalIn(getPageTable(), userStackBase);
+            if (ustackPhys) {
+                kfree(reinterpret_cast<void*>(ustackPhys));
+            }
+            VMM::UnmapRangeFrom(getPageTable(), userStackBase, userStackSize / PAGE_SIZE);
         }
-        VMM::UnmapRangeFrom(getPageTable(), userStackBase, userStackSize / PAGE_SIZE);
+        // For non-heap-backed (forked) stacks, FreeAddressSpace() reclaims the
+        // copied frame; do not kfree() it here.
     }
 
     if (fpuState) {
@@ -352,6 +361,144 @@ Process::~Process() {
 
 PageTable* Process::getPageTable() const {
     return sharedState ? sharedState->pageTable : nullptr;
+}
+
+bool Process::cloneAddressSpaceFrom(Process* parent) {
+    if (!sharedState || !sharedState->pageTable || !parent || !parent->sharedState ||
+        !parent->sharedState->pageTable) {
+        return false;
+    }
+
+    // This Process was built with the spawn constructor, which kmalloc()'d a
+    // user stack and mapped it at USER_STACK_TOP. The copy below replaces every
+    // user PTE with freshly-allocated PMM frames (including the stack), so the
+    // constructor's heap-backed stack must be released now to avoid leaking it
+    // and to ensure the destructor frees the copied frame via FreeAddressSpace()
+    // (not kfree()).
+    if (userStackHeapBacked && userStackBase && userStackSize) {
+        uint64_t ustackPhys = VMM::VirtualToPhysicalIn(sharedState->pageTable, userStackBase);
+        if (ustackPhys) {
+            kfree(reinterpret_cast<void*>(ustackPhys));
+        }
+        VMM::UnmapRangeFrom(sharedState->pageTable, userStackBase, userStackSize / PAGE_SIZE);
+        userStackHeapBacked = false;
+    }
+
+    PageTable* parentPml4 = parent->sharedState->pageTable;
+    PageTable* childPml4 = sharedState->pageTable;
+    PageTable* kernelPml4 = VMM::GetKernelAddressSpace();
+
+    // Walk only the user half (PML4 entries 0..255). The child already has the
+    // kernel half copied from its construction.
+    for (int i = 0; i < 256; i++) {
+        uint64_t pml4e = parentPml4->entries[i];
+        if (!(pml4e & Present)) {
+            continue;
+        }
+        // Skip PML4 sub-trees that are shared verbatim with the kernel address
+        // space (identity map, kernel code/data mapped into the low half). These
+        // must NOT be copied: doing so clobbers the child's kernel mappings with
+        // private frames and makes FreeAddressSpace() later free live kernel
+        // memory. Only genuine user pages (U/S set at the leaf) are cloned below.
+        if (kernelPml4 && pml4e == kernelPml4->entries[i]) {
+            continue;
+        }
+        auto* parentPdpt = reinterpret_cast<PageTable*>(pml4e & ADDR_MASK);
+        for (int j = 0; j < 512; j++) {
+            uint64_t pdpte = parentPdpt->entries[j];
+            if (!(pdpte & Present) || (pdpte & LargePage)) {
+                continue;
+            }
+            auto* parentPd = reinterpret_cast<PageTable*>(pdpte & ADDR_MASK);
+            for (int k = 0; k < 512; k++) {
+                uint64_t pde = parentPd->entries[k];
+                if (!(pde & Present) || (pde & LargePage)) {
+                    continue;
+                }
+                auto* parentPt = reinterpret_cast<PageTable*>(pde & ADDR_MASK);
+                for (int l = 0; l < 512; l++) {
+                    uint64_t pte = parentPt->entries[l];
+                    if (!(pte & Present)) {
+                        continue;
+                    }
+                    // Only copy genuine userspace pages. Kernel pages reachable
+                    // through the low half lack the U/S bit and must be left
+                    // pointing at the shared kernel frames.
+                    if (!(pte & UserSuper)) {
+                        continue;
+                    }
+
+                    const uint64_t vaddr =
+                        (static_cast<uint64_t>(i) << 39) |
+                        (static_cast<uint64_t>(j) << 30) |
+                        (static_cast<uint64_t>(k) << 21) |
+                        (static_cast<uint64_t>(l) << 12);
+                    const uint64_t srcPhys = pte & ADDR_MASK;
+                    const uint64_t flags = pte & ~ADDR_MASK;
+
+                    uint64_t newPhys = PMM::AllocFrames(1);
+                    if (!newPhys) {
+                        return false;
+                    }
+                    memcpy(reinterpret_cast<void*>(newPhys),
+                           reinterpret_cast<const void*>(srcPhys), PAGE_SIZE);
+                    VMM::MapPageInto(childPml4, vaddr, newPhys, flags);
+                }
+            }
+        }
+    }
+
+    return true;
+}
+
+void Process::setupForkResume(const ProcessContext& userContext, uint64_t fsBase) {
+    // Build a frame on the child's kernel stack consumed by forkChildTrampoline.
+    uint64_t sp = kernelStack & ~0xFULL;
+
+    // iretq frame (top): SS, RSP, RFLAGS, CS, RIP -- pushed high to low.
+    sp -= 8; *reinterpret_cast<uint64_t*>(sp) = 0x1B;                  // SS
+    sp -= 8; *reinterpret_cast<uint64_t*>(sp) = userContext.rsp;       // user RSP
+    sp -= 8; *reinterpret_cast<uint64_t*>(sp) = userContext.rflags | 0x200; // RFLAGS (IF)
+    sp -= 8; *reinterpret_cast<uint64_t*>(sp) = 0x23;                  // CS
+    sp -= 8; *reinterpret_cast<uint64_t*>(sp) = userContext.rip;       // user RIP
+
+    // GP register frame (must match forkChildTrampoline offsets).
+    sp -= 8; *reinterpret_cast<uint64_t*>(sp) = fsBase;                // [+120]
+    sp -= 8; *reinterpret_cast<uint64_t*>(sp) = 0;                     // [+112] rax = 0
+    sp -= 8; *reinterpret_cast<uint64_t*>(sp) = userContext.rbx;       // [+104]
+    sp -= 8; *reinterpret_cast<uint64_t*>(sp) = userContext.rcx;       // [+96]
+    sp -= 8; *reinterpret_cast<uint64_t*>(sp) = userContext.rdx;       // [+88]
+    sp -= 8; *reinterpret_cast<uint64_t*>(sp) = userContext.rsi;       // [+80]
+    sp -= 8; *reinterpret_cast<uint64_t*>(sp) = userContext.rdi;       // [+72]
+    sp -= 8; *reinterpret_cast<uint64_t*>(sp) = userContext.rbp;       // [+64]
+    sp -= 8; *reinterpret_cast<uint64_t*>(sp) = userContext.r8;        // [+56]
+    sp -= 8; *reinterpret_cast<uint64_t*>(sp) = userContext.r9;        // [+48]
+    sp -= 8; *reinterpret_cast<uint64_t*>(sp) = userContext.r10;       // [+40]
+    sp -= 8; *reinterpret_cast<uint64_t*>(sp) = userContext.r11;       // [+32]
+    sp -= 8; *reinterpret_cast<uint64_t*>(sp) = userContext.r12;       // [+24]
+    sp -= 8; *reinterpret_cast<uint64_t*>(sp) = userContext.r13;       // [+16]
+    sp -= 8; *reinterpret_cast<uint64_t*>(sp) = userContext.r14;       // [+8]
+    sp -= 8; *reinterpret_cast<uint64_t*>(sp) = userContext.r15;       // [+0]
+
+    // Context the scheduler restores when switching to the child: it `ret`s
+    // into forkChildTrampoline with rsp pointing at the frame above.
+    context.rip = reinterpret_cast<uint64_t>(&forkChildTrampoline);
+    context.rsp = sp;
+    context.rbp = 0;
+    context.cr3 = reinterpret_cast<uint64_t>(sharedState->pageTable) & ADDR_MASK;
+    context.rflags = 0x202;
+    context.xstate = reinterpret_cast<uint64_t>(fpuState);
+
+    // The child has NOT yet returned to user mode: it must first run
+    // forkChildTrampoline (at CPL0) which performs the iretq back to user. So it
+    // must be treated like a freshly-created process. If we marked the user
+    // state valid here, the timer-preemption scheduler path
+    // (Scheduler::schedule(InterruptFrame*)) would take its "resume user
+    // directly" branch and iretq with context.rip == forkChildTrampoline as if
+    // it were a *user* RIP -- faulting on an instruction fetch of supervisor
+    // kernel code from CPL3. Leaving this false routes the child through
+    // switchContext() -> forkChildTrampoline -> iretq, which is correct.
+    setValidUserState(false);
 }
 
 uint64_t Process::getMmapBase() const {
@@ -379,18 +526,21 @@ bool Process::replaceImageFrom(Process* image) {
     const uint64_t oldUserStackBase = userStackBase;
     const uint64_t oldUserStackSize = userStackSize;
     const uint64_t oldUserStack = userStack;
+    const bool oldUserStackHeapBacked = userStackHeapBacked;
 
     sharedState->pageTable = image->sharedState->pageTable;
     sharedState->mmapBase = image->sharedState->mmapBase;
     userStackBase = image->userStackBase;
     userStackSize = image->userStackSize;
     userStack = image->userStack;
+    userStackHeapBacked = image->userStackHeapBacked;
 
     image->sharedState->pageTable = oldPageTable;
     image->sharedState->mmapBase = oldMmapBase;
     image->userStackBase = oldUserStackBase;
     image->userStackSize = oldUserStackSize;
     image->userStack = oldUserStack;
+    image->userStackHeapBacked = oldUserStackHeapBacked;
 
     context.cr3 = reinterpret_cast<uint64_t>(sharedState->pageTable) & ADDR_MASK;
     context.xstate = reinterpret_cast<uint64_t>(fpuState);
@@ -528,6 +678,25 @@ uint64_t Process::allocateFD(FileDescriptor* fd, uint32_t rights, bool closeOnEx
     return sharedState
         ? sharedState->handleTable.allocate(HandleType::File, rights, fd, retainFileHandle, releaseFileHandle, closeOnExec)
         : static_cast<uint64_t>(-1);
+}
+
+uint64_t Process::allocateFDAt(int slot, FileDescriptor* fd, uint32_t rights, bool closeOnExec) {
+    if (!sharedState) {
+        return static_cast<uint64_t>(-1);
+    }
+    uint64_t handle = HandleTable::encodeHandle(HandleType::File, slot);
+    if (handle == static_cast<uint64_t>(-1)) {
+        return handle;
+    }
+    return sharedState->handleTable.allocateAt(handle, HandleType::File, rights, fd,
+                                               retainFileHandle, releaseFileHandle, closeOnExec);
+}
+
+void Process::cloneHandlesFrom(Process* source, bool skipCloseOnExec) {
+    if (!sharedState || !source || !source->sharedState) {
+        return;
+    }
+    sharedState->handleTable.cloneFrom(source->sharedState->handleTable, skipCloseOnExec);
 }
 
 FileDescriptor* Process::getFD(uint64_t fileHandle) {

@@ -5,6 +5,7 @@
 #include <graphics/console.hpp>
 #include <cpu/cpuid.hpp>
 #include <memory/vmm.hpp>
+#include <cpu/cereal/cereal.hpp>
 
 Interrupt *interruptHandlers[256] = {nullptr};
 
