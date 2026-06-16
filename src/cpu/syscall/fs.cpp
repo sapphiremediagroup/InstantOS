@@ -1,6 +1,8 @@
 #include <cpu/syscall/syscall.hpp>
 #include <cpu/cereal/cereal.hpp>
 #include <cpu/process/scheduler.hpp>
+#include <time/tsc_timer.hpp>
+#include <cpu/tty/pty.hpp>
 #include <drivers/usb/ohci.hpp>
 #include <fs/vfs/vfs.hpp>
 #include <graphics/console.hpp>
@@ -19,6 +21,10 @@ constexpr uint64_t kPipeBufferSize = 4096;
 constexpr uint64_t kFcntlGetFD = 1;
 constexpr uint64_t kFcntlSetFD = 2;
 constexpr uint64_t kFdCloseOnExec = 1;
+constexpr uint64_t kFcntlDupFD = 0;
+constexpr uint64_t kFcntlGetFL = 3;
+constexpr uint64_t kFcntlSetFL = 4;
+constexpr uint64_t kFcntlDupFDCloExec = 1030;
 constexpr uint64_t kOpenCreate = 0100;
 constexpr uint64_t kOpenExclusive = 0200;
 constexpr uint64_t kOpenTruncate = 01000;
@@ -58,6 +64,57 @@ struct PipeEndpoint {
     PipeObject* pipe;
     bool writeEnd;
 };
+
+// Named-FIFO registry: all opens of the same on-disk FIFO (identified by its
+// filesystem + inode) share one PipeObject ring buffer, so a writer and reader
+// that open the same path actually communicate. Anonymous pipes do not use this
+// table (they create their own PipeObject directly).
+struct FifoEntry {
+    FileSystem* fs;
+    uint64_t inode;
+    PipeObject* pipe;
+};
+constexpr int kMaxFifos = 32;
+FifoEntry gFifos[kMaxFifos] = {};
+
+PipeObject* fifoLookup(FileSystem* fs, uint64_t inode) {
+    for (int i = 0; i < kMaxFifos; ++i) {
+        if (gFifos[i].pipe && gFifos[i].fs == fs && gFifos[i].inode == inode) {
+            return gFifos[i].pipe;
+        }
+    }
+    return nullptr;
+}
+
+PipeObject* fifoGetOrCreate(FileSystem* fs, uint64_t inode) {
+    PipeObject* existing = fifoLookup(fs, inode);
+    if (existing) return existing;
+    for (int i = 0; i < kMaxFifos; ++i) {
+        if (!gFifos[i].pipe) {
+            PipeObject* pipe = new PipeObject();
+            if (!pipe) return nullptr;
+            pipe->head = pipe->tail = pipe->size = 0;
+            pipe->refs = 0;
+            pipe->readOpen = 0;
+            pipe->writeOpen = 0;
+            gFifos[i].fs = fs;
+            gFifos[i].inode = inode;
+            gFifos[i].pipe = pipe;
+            return pipe;
+        }
+    }
+    return nullptr;
+}
+
+void fifoForget(PipeObject* pipe) {
+    for (int i = 0; i < kMaxFifos; ++i) {
+        if (gFifos[i].pipe == pipe) {
+            gFifos[i].pipe = nullptr;
+            gFifos[i].fs = nullptr;
+            gFifos[i].inode = 0;
+        }
+    }
+}
 
 void traceStr(const char* text) {
     Cereal::get().write(text);
@@ -449,12 +506,22 @@ int16_t pollHandle(Process* current, const PollFD& fd) {
         return 0;
     }
 
-    if (fd.fd == 0) {
+    uint64_t resolved = static_cast<uint64_t>(fd.fd);
+    bool boundStdio = false;
+    if ((fd.fd == 0 || fd.fd == 1 || fd.fd == 2) && current) {
+        uint64_t encoded = HandleTable::encodeHandle(HandleType::File, fd.fd);
+        if (current->getHandle(encoded) != nullptr) {
+            resolved = encoded;
+            boundStdio = true;
+        }
+    }
+
+    if (!boundStdio && fd.fd == 0) {
         USBInput::get().poll();
         Keyboard::get().servicePendingInput();
         return (fd.events & kPollIn) && Keyboard::get().hasKey() ? kPollIn : 0;
     }
-    if (fd.fd == 1 || fd.fd == 2) {
+    if (!boundStdio && (fd.fd == 1 || fd.fd == 2)) {
         return (fd.events & kPollOut) ? kPollOut : 0;
     }
 
@@ -462,7 +529,7 @@ int16_t pollHandle(Process* current, const PollFD& fd) {
         return kPollNval;
     }
 
-    auto* entry = current->getHandle(static_cast<uint64_t>(fd.fd));
+    auto* entry = current->getHandle(resolved);
     if (!entry) {
         return kPollNval;
     }
@@ -495,6 +562,15 @@ int16_t pollHandle(Process* current, const PollFD& fd) {
         return pollPipe(pipeEndpoint(node), fd.events);
     }
 
+    if (node->getType() == FileType::CharDevice) {
+        if (PtyDevice* m = ptyDeviceFromMasterNode(node)) {
+            return m->pollMaster(fd.events);
+        }
+        if (PtyDevice* s = ptyDeviceFromSlaveNode(node)) {
+            return s->pollSlave(fd.events);
+        }
+    }
+
     int16_t revents = 0;
     if ((fd.events & kPollIn) && (entry->rights & HandleRightRead)) {
         revents |= kPollIn;
@@ -525,6 +601,7 @@ int pipeClose(VNode* node) {
             pipe->refs--;
         }
         if (pipe->refs == 0) {
+            fifoForget(pipe);  // no-op for anonymous pipes (not registered)
             delete pipe;
         }
     }
@@ -624,13 +701,13 @@ int pipeStat(VNode*, FileStats* stats) {
 
 bool copyStatToUser(const FileStats& fileStats, uint64_t statbuf) {
     Stat stat {};
-    stat.st_dev = 0;
+    stat.st_dev = fileStats.dev;
     stat.st_ino = fileStats.inode;
     stat.st_mode = fileStats.mode;
     stat.st_nlink = fileStats.links;
-    stat.st_uid = 0;
-    stat.st_gid = 0;
-    stat.st_rdev = 0;
+    stat.st_uid = fileStats.uid;
+    stat.st_gid = fileStats.gid;
+    stat.st_rdev = fileStats.rdev;
     stat.st_size = fileStats.size;
     stat.st_blksize = 4096;
     stat.st_blocks = (fileStats.size + 511) / 512;
@@ -642,6 +719,8 @@ bool copyStatToUser(const FileStats& fileStats, uint64_t statbuf) {
         stat.st_mode |= 0040000;
     } else if (fileStats.type == FileType::CharDevice) {
         stat.st_mode |= 0020000;
+    } else if (fileStats.type == FileType::BlockDevice) {
+        stat.st_mode |= 0060000;
     } else if (fileStats.type == FileType::Pipe) {
         stat.st_mode |= 0010000;
     } else if (fileStats.type == FileType::Symlink) {
@@ -673,9 +752,178 @@ VNodeOps pipeOps {
     nullptr,
     nullptr
 };
+
+// ---- PTY open helpers -----------------------------------------------------
+
+bool pathEquals(const char* a, const char* b) {
+    int i = 0;
+    while (a[i] || b[i]) {
+        if (a[i] != b[i]) {
+            return false;
+        }
+        i++;
+    }
+    return true;
+}
+
+// Match "/dev/pts/<n>" and return the index, or false.
+bool matchPtsPath(const char* path, uint32_t* index) {
+    const char* prefix = "/dev/pts/";
+    int i = 0;
+    while (prefix[i]) {
+        if (path[i] != prefix[i]) {
+            return false;
+        }
+        i++;
+    }
+    if (path[i] == '\0') {
+        return false;
+    }
+    uint32_t value = 0;
+    for (; path[i]; i++) {
+        if (path[i] < '0' || path[i] > '9') {
+            return false;
+        }
+        value = value * 10 + static_cast<uint32_t>(path[i] - '0');
+        if (value >= kMaxPtys) {
+            return false;
+        }
+    }
+    *index = value;
+    return true;
+}
+
+// Allocate a fresh PTY pair, returning the master fd handle in the calling
+// process (used for /dev/ptmx).
+uint64_t openPtyMaster(Process* current, uint64_t flags) {
+    PtyDevice* dev = PtyManager::get().allocate();
+    if (!dev) {
+        return syscall_error(SysErrNoMemory);
+    }
+    VNode* node = PtyManager::get().createMasterNode(dev);
+    if (!node) {
+        PtyManager::get().release(dev);
+        return syscall_error(SysErrNoMemory);
+    }
+    FileDescriptor* fd = new FileDescriptor(node, static_cast<int>(flags));
+    if (!fd) {
+        gPtyMasterOps.close(node);
+        delete node;
+        return syscall_error(SysErrNoMemory);
+    }
+    uint64_t handle = current->allocateFD(fd, HandleRightRead | HandleRightWrite | HandleRightDuplicate,
+                                          (flags & kOpenCloseOnExec) != 0);
+    if (handle == static_cast<uint64_t>(-1)) {
+        VFS::get().close(fd);
+        return syscall_error(SysErrNoMemory);
+    }
+    return handle;
+}
+
+// Open the slave end of an existing pty by index (used for /dev/pts/N).
+uint64_t openPtySlave(Process* current, uint32_t index, uint64_t flags) {
+    PtyDevice* dev = PtyManager::get().deviceForIndex(index);
+    if (!dev) {
+        return syscall_error(SysErrNoEntry);
+    }
+    VNode* node = PtyManager::get().createSlaveNode(dev);
+    if (!node) {
+        return syscall_error(SysErrNoMemory);
+    }
+    FileDescriptor* fd = new FileDescriptor(node, static_cast<int>(flags));
+    if (!fd) {
+        gPtySlaveOps.close(node);
+        delete node;
+        return syscall_error(SysErrNoMemory);
+    }
+    uint64_t handle = current->allocateFD(fd, HandleRightRead | HandleRightWrite | HandleRightDuplicate,
+                                          (flags & kOpenCloseOnExec) != 0);
+    if (handle == static_cast<uint64_t>(-1)) {
+        VFS::get().close(fd);
+        return syscall_error(SysErrNoMemory);
+    }
+    return handle;
+}
+
+// Open a named FIFO. All opens of the same FIFO (keyed by fs+inode) share one
+// PipeObject. POSIX blocking semantics: open(O_RDONLY) blocks until a writer is
+// present and open(O_WRONLY) blocks until a reader is present (unless
+// O_NONBLOCK); O_RDWR never blocks. Returns a handle over a pipe-endpoint VNode
+// so the existing pipeRead/pipeWrite/pipeClose/pollPipe machinery applies.
+uint64_t openFifo(Process* current, VNode* fifoNode, uint64_t flags) {
+    PipeObject* pipe = fifoGetOrCreate(fifoNode->getFS(), fifoNode->getInode());
+    if (!pipe) {
+        return syscall_error(SysErrNoMemory);
+    }
+
+    const uint64_t access = flags & kOpenAccessModeMask;
+    const bool wantWrite = (access == kOpenWriteOnly) || (access == kOpenReadWrite);
+    const bool wantRead = (access != kOpenWriteOnly);  // RO or RW
+    const bool nonBlock = (flags & kOpenNonBlock) != 0;
+
+    auto* endpoint = new PipeEndpoint { pipe, wantWrite && !wantRead };
+    VNode* node = new VNode(nullptr, fifoNode->getInode(), FileType::Pipe);
+    if (!endpoint || !node) {
+        delete endpoint;
+        delete node;
+        return syscall_error(SysErrNoMemory);
+    }
+    node->refCount = 0;
+    node->ops = &pipeOps;
+    node->setData(endpoint);
+
+    // Account this open against the shared pipe.
+    pipe->refs++;
+    if (wantRead) pipe->readOpen++;
+    if (wantWrite) pipe->writeOpen++;
+    wakePipeWaiters();  // a new peer may unblock the other side's open()
+
+    // POSIX rendezvous: a read-only open blocks until a writer exists; a
+    // write-only open blocks until a reader exists. O_RDWR (wantRead &&
+    // wantWrite) never blocks.
+    if (!nonBlock) {
+        if (access == 0) {  // O_RDONLY
+            while (pipe->writeOpen == 0) {
+                if (!blockCurrentForPipe()) break;
+            }
+        } else if (access == kOpenWriteOnly) {
+            while (pipe->readOpen == 0) {
+                if (!blockCurrentForPipe()) break;
+            }
+        }
+    }
+
+    FileDescriptor* fd = new FileDescriptor(node, static_cast<int>(flags));
+    if (!fd) {
+        pipeClose(node);
+        delete node;
+        return syscall_error(SysErrNoMemory);
+    }
+
+    uint32_t rights = HandleRightDuplicate;
+    if (wantRead) rights |= HandleRightRead;
+    if (wantWrite) rights |= HandleRightWrite;
+    uint64_t handle = current->allocateFD(fd, rights, (flags & kOpenCloseOnExec) != 0);
+    if (handle == static_cast<uint64_t>(-1)) {
+        VFS::get().close(fd);
+        return syscall_error(SysErrNoMemory);
+    }
+    return handle;
+}
 }
 
 uint64_t Syscall::sys_write(uint64_t fileHandle, uint64_t buf, uint64_t count) {
+    // If the process has a real file handle bound to a stdio slot (e.g. a tty
+    // inherited from its parent), route through it instead of the kernel
+    // console. Bare integers 0/1/2 map to encoded File handles in those slots.
+    Process* stdioProc = Scheduler::get().getCurrentProcess();
+    if ((fileHandle == 1 || fileHandle == 2) && stdioProc) {
+        uint64_t encoded = HandleTable::encodeHandle(HandleType::File, static_cast<int>(fileHandle));
+        if (stdioProc->getHandle(encoded) != nullptr) {
+            fileHandle = encoded;
+        }
+    }
+
     if (fileHandle == 1 || fileHandle == 2) {
         if (count == 0) return count;
         if (!isValidUserPointer(buf, count)) return syscall_error(SysErrInvalid);
@@ -694,6 +942,12 @@ uint64_t Syscall::sys_write(uint64_t fileHandle, uint64_t buf, uint64_t count) {
             for (uint64_t i = 0; i < toCopy; i++) {
                 char temp[2] = { chunk[i], '\0' };
                 Console::get().drawText(temp);
+            }
+            // Mirror stdout/stderr to the serial port so logs from console-less
+            // processes (e.g. the NetSurf browser spawned by a launcher) are
+            // visible in the serial capture.
+            for (uint64_t i = 0; i < toCopy; i++) {
+                Cereal::get().write(chunk[i]);
             }
             total += toCopy;
         }
@@ -774,6 +1028,15 @@ uint64_t Syscall::sys_serial_write(uint64_t buf, uint64_t count) {
 }
 
 uint64_t Syscall::sys_read(uint64_t fileHandle, uint64_t buf, uint64_t count) {
+    // Route stdin through a bound tty/file handle when one exists.
+    Process* stdinProc = Scheduler::get().getCurrentProcess();
+    if (fileHandle == 0 && stdinProc) {
+        uint64_t encoded = HandleTable::encodeHandle(HandleType::File, 0);
+        if (stdinProc->getHandle(encoded) != nullptr) {
+            fileHandle = encoded;
+        }
+    }
+
     if (fileHandle == 0) {
         if (!isValidUserPointer(buf, count)) {
             traceStr("[stdin] read invalid user buffer count=");
@@ -906,6 +1169,18 @@ uint64_t Syscall::sys_open(uint64_t path, uint64_t flags, uint64_t mode) {
         return syscall_error(SysErrInvalid);
     }
 
+    // PTY device nodes are synthesized per-open; bypass the generic VFS path so
+    // each open gets a fresh, independently-tracked endpoint.
+    if (pathEquals(pathname, "/dev/ptmx")) {
+        return openPtyMaster(current, flags);
+    }
+    {
+        uint32_t ptsIndex = 0;
+        if (matchPtsPath(pathname, &ptsIndex)) {
+            return openPtySlave(current, ptsIndex, flags);
+        }
+    }
+
     if (pathParentDeniesSearch(pathname)) {
         return syscall_error(SysErrAccess);
     }
@@ -942,6 +1217,14 @@ uint64_t Syscall::sys_open(uint64_t path, uint64_t flags, uint64_t mode) {
         }
         if (!openFlagsAllowedByMode(flags, stats.mode)) {
             return syscall_error(SysErrAccess);
+        }
+        // Named FIFO: route through the pipe machinery (shared ring buffer +
+        // blocking open/read/write) rather than the generic file path.
+        if (stats.type == FileType::Pipe) {
+            VNode* fifoNode = VFS::get().lookup(pathname, (flags & kOpenNoFollow) == 0);
+            if (fifoNode) {
+                return openFifo(current, fifoNode, flags);
+            }
         }
     } else {
         if (VFS::get().getLastError() == SysErrLoop) {
@@ -1341,6 +1624,16 @@ uint64_t Syscall::sys_fstat(uint64_t handle, uint64_t statbuf) {
         return syscall_error(SysErrInvalid);
     }
 
+    Process* current = Scheduler::get().getCurrentProcess();
+
+    // Prefer a real file handle bound to a stdio slot.
+    if ((handle == 0 || handle == 1 || handle == 2) && current) {
+        uint64_t encoded = HandleTable::encodeHandle(HandleType::File, static_cast<int>(handle));
+        if (current->getHandle(encoded) != nullptr) {
+            handle = encoded;
+        }
+    }
+
     if (handle == 0 || handle == 1 || handle == 2) {
         FileStats stats {};
         stats.type = FileType::CharDevice;
@@ -1349,7 +1642,6 @@ uint64_t Syscall::sys_fstat(uint64_t handle, uint64_t statbuf) {
         return copyStatToUser(stats, statbuf) ? 0 : syscall_error(SysErrInvalid);
     }
 
-    Process* current = Scheduler::get().getCurrentProcess();
     if (!current) {
         return syscall_error(SysErrInvalid);
     }
@@ -1378,10 +1670,17 @@ uint64_t Syscall::sys_dup2(uint64_t oldHandle, uint64_t newHandle) {
     Process* current = Scheduler::get().getCurrentProcess();
     if (!current) return syscall_error(SysErrInvalid);
 
+    // A bare small integer target (0/1/2) refers to a reserved stdio slot.
+    // Translate it to the encoded File handle for that slot so duplicateTo()
+    // installs the source into the right place (mirrors sys_write/sys_ioctl).
+    if (newHandle <= 2) {
+        newHandle = HandleTable::encodeHandle(HandleType::File, static_cast<int>(newHandle));
+    }
+
     if (!current->duplicateHandleTo(oldHandle, newHandle)) {
         return syscall_error(SysErrBadFile);
     }
-    
+
     return newHandle;
 }
 
@@ -1464,7 +1763,19 @@ uint64_t Syscall::sys_pipe(uint64_t pipeHandles) {
 
 uint64_t Syscall::sys_fcntl(uint64_t handle, uint64_t command, uint64_t value) {
     Process* current = Scheduler::get().getCurrentProcess();
-    if (!current || !current->getHandle(handle)) {
+    if (!current) {
+        return syscall_error(SysErrBadFile);
+    }
+
+    // Bare stdio fds 0/1/2 map to encoded File handles in the reserved slots.
+    if (handle <= 2) {
+        uint64_t encoded = HandleTable::encodeHandle(HandleType::File, static_cast<int>(handle));
+        if (current->getHandle(encoded) != nullptr) {
+            handle = encoded;
+        }
+    }
+
+    if (!current->getHandle(handle)) {
         return syscall_error(SysErrBadFile);
     }
 
@@ -1481,12 +1792,126 @@ uint64_t Syscall::sys_fcntl(uint64_t handle, uint64_t command, uint64_t value) {
                 return syscall_error(SysErrBadFile);
             }
             return 0;
+        case kFcntlGetFL:
+            // The kernel does not track per-fd status flags; report read/write,
+            // no special modes (O_NONBLOCK etc.).
+            return kOpenReadWrite;
+        case kFcntlSetFL:
+            // Accept and ignore status-flag changes (e.g. O_NONBLOCK toggles).
+            return 0;
+        case kFcntlDupFD:
+        case kFcntlDupFDCloExec:
+            // F_DUPFD[_CLOEXEC]: duplicate to a new handle. The kernel uses
+            // encoded handles rather than lowest-numbered fds; the mlibc
+            // userspace fd table maps the returned handle to a small fd.
+            return current->duplicateHandle(handle);
         default:
             return syscall_error(SysErrInvalid);
     }
 }
 
-uint64_t Syscall::sys_poll(uint64_t fds, uint64_t nfds) {
+uint64_t Syscall::sys_ioctl(uint64_t handle, uint64_t request, uint64_t arg) {
+    Process* current = Scheduler::get().getCurrentProcess();
+    if (!current) {
+        return syscall_error(SysErrInvalid);
+    }
+
+    // Bare stdio fds 0/1/2 map to encoded File handles in the reserved stdio
+    // slots (e.g. a tty inherited from the parent). Translate so ioctls such as
+    // isatty()/tcgetattr() on stdin reach the bound device.
+    if (handle <= 2) {
+        uint64_t encoded = HandleTable::encodeHandle(HandleType::File, static_cast<int>(handle));
+        if (current->getHandle(encoded) != nullptr) {
+            handle = encoded;
+        }
+    }
+
+    HandleEntry* entry = current->getHandle(handle);
+    if (!entry || entry->type != HandleType::File) {
+        return syscall_error(SysErrBadFile);
+    }
+    auto* fileFd = reinterpret_cast<FileDescriptor*>(entry->object);
+    VNode* node = fileFd ? fileFd->getNode() : nullptr;
+    if (!node || node->getType() != FileType::CharDevice) {
+        return syscall_error(SysErrInvalid);
+    }
+
+    PtyDevice* master = ptyDeviceFromMasterNode(node);
+    PtyDevice* slave = ptyDeviceFromSlaveNode(node);
+    PtyDevice* dev = master ? master : slave;
+    if (!dev) {
+        return syscall_error(SysErrInvalid);
+    }
+
+    switch (request) {
+        case PTY_TCGETS: {
+            KernelTermios t;
+            dev->getTermios(&t);
+            if (!copyToUser(arg, &t, sizeof(t))) {
+                return syscall_error(SysErrInvalid);
+            }
+            return 0;
+        }
+        case PTY_TCSETS:
+        case PTY_TCSETSW:
+        case PTY_TCSETSF: {
+            KernelTermios t;
+            if (!copyFromUser(&t, arg, sizeof(t))) {
+                return syscall_error(SysErrInvalid);
+            }
+            dev->setTermios(&t);
+            return 0;
+        }
+        case PTY_TIOCGWINSZ: {
+            KernelWinsize ws;
+            dev->getWinsize(&ws);
+            if (!copyToUser(arg, &ws, sizeof(ws))) {
+                return syscall_error(SysErrInvalid);
+            }
+            return 0;
+        }
+        case PTY_TIOCSWINSZ: {
+            KernelWinsize ws;
+            if (!copyFromUser(&ws, arg, sizeof(ws))) {
+                return syscall_error(SysErrInvalid);
+            }
+            dev->setWinsize(&ws);
+            return 0;
+        }
+        case PTY_TIOCGPTN: {
+            uint32_t n = dev->getIndex();
+            if (!copyToUser(arg, &n, sizeof(n))) {
+                return syscall_error(SysErrInvalid);
+            }
+            return 0;
+        }
+        case PTY_TIOCSPTLCK:
+            return 0;  // we never lock the slave
+        case PTY_TIOCGPGRP: {
+            uint32_t pgrp = dev->getForegroundPgid();
+            if (!copyToUser(arg, &pgrp, sizeof(pgrp))) {
+                return syscall_error(SysErrInvalid);
+            }
+            return 0;
+        }
+        case PTY_TIOCSPGRP: {
+            uint32_t pgrp = 0;
+            if (!copyFromUser(&pgrp, arg, sizeof(pgrp))) {
+                return syscall_error(SysErrInvalid);
+            }
+            dev->setForegroundPgid(pgrp);
+            return 0;
+        }
+        case PTY_TIOCSCTTY:
+            dev->setSession(current->getSessionID());
+            dev->setForegroundPgid(current->getPID());
+            return 0;
+        default:
+            return syscall_error(SysErrInvalid);
+    }
+}
+
+uint64_t Syscall::sys_poll(uint64_t fds, uint64_t nfds, uint64_t timeoutMs) {
     if (nfds > HandleTable::MaxHandles) {
         return syscall_error(SysErrInvalid);
     }
@@ -1495,33 +1920,81 @@ uint64_t Syscall::sys_poll(uint64_t fds, uint64_t nfds) {
     }
 
     Process* current = Scheduler::get().getCurrentProcess();
-    PollFD local[64];
-    uint64_t ready = 0;
-    uint64_t index = 0;
-    while (index < nfds) {
-        uint64_t batch = nfds - index;
-        if (batch > 64) {
-            batch = 64;
-        }
-        const uint64_t bytes = batch * sizeof(PollFD);
-        if (!copyFromUser(local, fds + index * sizeof(PollFD), bytes)) {
-            return syscall_error(SysErrInvalid);
-        }
 
-        for (uint64_t i = 0; i < batch; ++i) {
-            local[i].revents = pollHandle(current, local[i]);
-            if (local[i].revents != 0) {
-                ready++;
+    // One scan over all descriptors; returns the ready count and writes revents.
+    auto scanOnce = [&](uint64_t* outReady) -> bool {
+        PollFD local[64];
+        uint64_t ready = 0;
+        uint64_t index = 0;
+        while (index < nfds) {
+            uint64_t batch = nfds - index;
+            if (batch > 64) {
+                batch = 64;
             }
-        }
+            const uint64_t bytes = batch * sizeof(PollFD);
+            if (!copyFromUser(local, fds + index * sizeof(PollFD), bytes)) {
+                return false;
+            }
 
-        if (!copyToUser(fds + index * sizeof(PollFD), local, bytes)) {
+            for (uint64_t i = 0; i < batch; ++i) {
+                local[i].revents = pollHandle(current, local[i]);
+                if (local[i].revents != 0) {
+                    ready++;
+                }
+            }
+
+            if (!copyToUser(fds + index * sizeof(PollFD), local, bytes)) {
+                return false;
+            }
+            index += batch;
+        }
+        *outReady = ready;
+        return true;
+    };
+
+    // timeoutMs: 0 = non-blocking (single scan); kPollWaitForever blocks until
+    // a descriptor is ready (or a signal arrives). A finite non-zero timeout
+    // blocks but arms a sleep deadline so the scheduler's timer wakes us after
+    // timeoutMs even if no descriptor becomes ready (required so callers like
+    // the NetSurf event loop wake to re-run their own scheduler instead of
+    // busy-spinning).
+    constexpr uint64_t kPollWaitForever = static_cast<uint64_t>(-1);
+
+    for (;;) {
+        uint64_t ready = 0;
+        if (!scanOnce(&ready)) {
             return syscall_error(SysErrInvalid);
         }
-        index += batch;
-    }
+        if (ready > 0 || timeoutMs == 0) {
+            return ready;
+        }
 
-    return ready;
+        // Block until woken by an I/O event, the sleep deadline, or a signal.
+        current = Scheduler::get().getCurrentProcess();
+        if (!current) {
+            return 0;
+        }
+        if (timeoutMs != kPollWaitForever) {
+            current->sleepUntil(time_get_uptime_ms() + timeoutMs);
+        }
+        current->setState(ProcessState::Blocked);
+        Scheduler::get().scheduleFromSyscall();
+        current->clearSleep();
+        if (current->hasDeliverableSignal()) {
+            return syscall_error(SysErrInterrupted);
+        }
+
+        if (timeoutMs != kPollWaitForever) {
+            // Finite timeout: we either hit the deadline or were woken by I/O.
+            // Re-scan once and return whatever is ready (0 is fine -> caller
+            // re-polls / re-runs its scheduler).
+            uint64_t ready2 = 0;
+            if (!scanOnce(&ready2)) {
+                return syscall_error(SysErrInvalid);
+            }
+            return ready2;
+        }
+    }
 }
 
 uint64_t Syscall::sys_truncate(uint64_t target, uint64_t size, uint64_t byHandle) {
@@ -1593,7 +2066,169 @@ uint64_t Syscall::sys_rename(uint64_t oldPath, uint64_t newPath) {
         return syscall_error(SysErrNotDirectory);
     }
 
-    return VFS::get().rename(oldPathname, newPathname) == 0 ? 0 : syscall_error(SysErrNoEntry);
+    if (VFS::get().rename(oldPathname, newPathname) == 0) {
+        return 0;
+    }
+    // Map the VFS error to a meaningful errno instead of a blanket ENOENT.
+    switch (VFS::get().getLastError()) {
+        case 18: return syscall_error(SysErrCrossDevice);   // EXDEV
+        case 38: return syscall_error(SysErrNoSys);          // ENOSYS (fs lacks rename)
+        default: return syscall_error(SysErrNoEntry);        // ENOENT
+    }
+}
+
+uint64_t Syscall::sys_access(uint64_t path, uint64_t mode) {
+    // POSIX access()/faccessat() permission probe.
+    //   mode bits: F_OK=0, X_OK=1, W_OK=2, R_OK=4.
+    // The kernel resolves the path (following symlinks), checks existence, then
+    // verifies the requested permission bits against the file's mode. With a
+    // single-owner model we test the owner permission bits (rwx = 0400/0200/0100).
+    constexpr uint64_t kFOk = 0;
+    constexpr uint64_t kXOk = 1;
+    constexpr uint64_t kWOk = 2;
+    constexpr uint64_t kROk = 4;
+
+    if (mode & ~(kXOk | kWOk | kROk)) {
+        return syscall_error(SysErrInvalid);
+    }
+
+    char pathname[256];
+    uint64_t error = 0;
+    bool requiresDirectory = false;
+    if (!copyUserPathOrError(path, pathname, error, &requiresDirectory)) {
+        return error;
+    }
+
+    if (pathParentDeniesSearch(pathname)) {
+        return syscall_error(SysErrAccess);
+    }
+
+    FileStats stats {};
+    if (VFS::get().stat(pathname, &stats) != 0) {
+        return missingPathError(pathname);
+    }
+    if (requiresDirectory && stats.type != FileType::Directory) {
+        return syscall_error(SysErrNotDirectory);
+    }
+
+    // F_OK: existence only.
+    if (mode == kFOk) {
+        return 0;
+    }
+
+    // Owner permission bits from the file mode.
+    const bool canRead = (stats.mode & 0400) != 0;
+    const bool canWrite = (stats.mode & 0200) != 0;
+    const bool canExec = (stats.mode & 0100) != 0;
+
+    if (((mode & kROk) && !canRead) ||
+        ((mode & kWOk) && !canWrite) ||
+        ((mode & kXOk) && !canExec)) {
+        return syscall_error(SysErrAccess);
+    }
+    return 0;
+}
+
+uint64_t Syscall::sys_statfs(uint64_t target, uint64_t byHandle, uint64_t statbuf) {
+    if (!isValidUserPointer(statbuf, sizeof(KernelStatfs))) {
+        return syscall_error(SysErrInvalid);
+    }
+
+    FsStats fsStats {};
+    if (byHandle) {
+        Process* current = Scheduler::get().getCurrentProcess();
+        if (!current) return syscall_error(SysErrInvalid);
+        FileDescriptor* fileFd = current->getFD(target);
+        if (!fileFd) return syscall_error(SysErrBadFile);
+        if (VFS::get().statfs(fileFd, &fsStats) != 0) {
+            return VFS::get().getLastError() == 38 ? syscall_error(SysErrNoSys)
+                                                   : syscall_error(SysErrBadFile);
+        }
+    } else {
+        char pathname[256];
+        uint64_t error = 0;
+        if (!copyUserPathOrError(target, pathname, error)) {
+            return error;
+        }
+        if (pathParentDeniesSearch(pathname)) {
+            return syscall_error(SysErrAccess);
+        }
+        if (VFS::get().statfs(pathname, &fsStats) != 0) {
+            return VFS::get().getLastError() == 38 ? syscall_error(SysErrNoSys)
+                                                   : missingPathError(pathname);
+        }
+    }
+
+    KernelStatfs out {};
+    out.blockSize = fsStats.blockSize;
+    out.totalBlocks = fsStats.totalBlocks;
+    out.freeBlocks = fsStats.freeBlocks;
+    out.totalInodes = fsStats.totalInodes;
+    out.freeInodes = fsStats.freeInodes;
+    out.nameMax = fsStats.nameMax;
+    out.fsType = fsStats.fsType;
+    out.reserved = 0;
+    return copyToUser(statbuf, &out, sizeof(out)) ? 0 : syscall_error(SysErrInvalid);
+}
+
+uint64_t Syscall::sys_chown(uint64_t target, uint64_t byHandle, uint64_t uid, uint64_t gid,
+                            uint64_t flags) {
+    const uint32_t newUid = static_cast<uint32_t>(uid);
+    const uint32_t newGid = static_cast<uint32_t>(gid);
+
+    if (byHandle) {
+        Process* current = Scheduler::get().getCurrentProcess();
+        if (!current) return syscall_error(SysErrInvalid);
+        FileDescriptor* fileFd = current->getFD(target);
+        if (!fileFd) return syscall_error(SysErrBadFile);
+        if (VFS::get().chown(fileFd, newUid, newGid) != 0) {
+            return VFS::get().getLastError() == 38 ? syscall_error(SysErrNoSys)
+                                                   : syscall_error(SysErrBadFile);
+        }
+        return 0;
+    }
+
+    char pathname[256];
+    uint64_t error = 0;
+    if (!copyUserPathOrError(target, pathname, error)) {
+        return error;
+    }
+    if (pathParentDeniesSearch(pathname)) {
+        return syscall_error(SysErrAccess);
+    }
+    // AT_SYMLINK_NOFOLLOW (0x100) -> lchown semantics (do not follow final link).
+    const bool followSymlink = (flags & 0x100) == 0;
+    if (VFS::get().chown(pathname, newUid, newGid, followSymlink) != 0) {
+        return VFS::get().getLastError() == 38 ? syscall_error(SysErrNoSys)
+                                               : missingPathError(pathname);
+    }
+    return 0;
+}
+
+uint64_t Syscall::sys_mknod(uint64_t path, uint64_t mode, uint64_t dev) {
+    char pathname[256];
+    uint64_t error = 0;
+    if (!copyUserPathOrError(path, pathname, error)) {
+        return error;
+    }
+    if (pathParentDeniesSearch(pathname) || pathParentDeniesWrite(pathname)) {
+        return syscall_error(SysErrAccess);
+    }
+
+    // Reject if the target already exists.
+    FileStats existing {};
+    if (VFS::get().lstat(pathname, &existing) == 0) {
+        return syscall_error(SysErrExists);
+    }
+
+    if (VFS::get().mknod(pathname, static_cast<uint32_t>(mode), dev) != 0) {
+        switch (VFS::get().getLastError()) {
+            case 38: return syscall_error(SysErrNoSys);    // fs lacks mknod
+            case 17: return syscall_error(SysErrExists);
+            default: return syscall_error(SysErrNoEntry);
+        }
+    }
+    return 0;
 }
 
 uint64_t Syscall::sys_chmod(uint64_t target, uint64_t mode, uint64_t byHandle) {
@@ -1662,6 +2297,23 @@ uint64_t Syscall::sys_seek(uint64_t handle, uint64_t offset, uint64_t whence) {
     Process* current = Scheduler::get().getCurrentProcess();
     if (!current) {
         return syscall_error(SysErrInvalid);
+    }
+
+    // Bare stdio fds 0/1/2 map to encoded File handles in the reserved stdio
+    // slots (e.g. a tty inherited from the parent). Translate so seek() (used by
+    // mlibc to detect pipe-like vs file-like streams via SEEK_CUR) reaches the
+    // bound device and returns ESPIPE for ttys/pipes instead of EBADF.
+    if (handle <= 2) {
+        uint64_t encoded = HandleTable::encodeHandle(HandleType::File, static_cast<int>(handle));
+        if (current->getHandle(encoded) != nullptr) {
+            handle = encoded;
+        } else {
+            // No File bound to this stdio slot: it is the kernel console, which
+            // is not seekable. Report ESPIPE so libc treats it as a pipe-like
+            // (non-seekable) stream rather than a hard EBADF error. Without this
+            // mlibc's fd_file::determine_type() fails and stdio writes are lost.
+            return syscall_error(SysErrPipe);
+        }
     }
 
     FileDescriptor* fileFd = current->getFD(handle, HandleRightRead);

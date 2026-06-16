@@ -1,6 +1,10 @@
 #include <cpu/syscall/syscall.hpp>
 #include <cpu/process/scheduler.hpp>
+#include <cpu/syscall/tcp_internal.hpp>
+#include <cpu/cereal/cereal.hpp>
 #include <common/string.hpp>
+#include <common/krandom.hpp>
+#include <time/tsc_timer.hpp>
 
 namespace {
 constexpr int kAfInet = 2;
@@ -39,6 +43,51 @@ struct SocketLinger {
     int seconds;
 };
 
+// TCP connection states (subset of RFC 793 sufficient for a client + simple
+// server).  CLOSED is the implicit default for a fresh socket.
+enum class TcpState : uint8_t {
+    Closed = 0,
+    Listen,
+    SynSent,
+    SynReceived,
+    Established,
+    FinWait1,    // we sent FIN, awaiting ACK of it
+    FinWait2,    // our FIN ACKed, awaiting peer FIN
+    CloseWait,   // peer sent FIN, app may still send
+    LastAck,     // we sent FIN after CLOSE_WAIT, awaiting its ACK
+    Closing,     // simultaneous close
+    TimeWait,    // waiting out 2*MSL
+};
+
+// TCP tuning constants.
+constexpr uint32_t kTcpMss = 1460;            // payload bytes per segment
+constexpr uint32_t kTcpReceiveWindow = 65535; // advertised window cap
+constexpr uint64_t kTcpRtoMs = 500;           // initial retransmission timeout
+constexpr uint64_t kTcpRtoMaxMs = 8000;       // RTO ceiling after backoff
+constexpr int kTcpMaxRetries = 8;             // give up after this many resends
+constexpr uint64_t kTcpTimeWaitMs = 2000;     // simplified 2*MSL
+constexpr uint32_t kTcpSendBufferCap = 65536; // max unacked+pending bytes
+
+// A contiguous run of unacknowledged outbound bytes (or a SYN/FIN control
+// segment).  Retained until the peer ACKs past it so it can be retransmitted.
+struct TcpSendSegment {
+    uint32_t seq;          // sequence number of first byte
+    uint32_t length;       // payload bytes (0 for a pure FIN/SYN control seg)
+    uint8_t flags;         // TCP flags to set when (re)transmitting
+    uint64_t lastSentMs;   // time of last (re)transmission
+    int retries;           // retransmission count
+    uint8_t* data;         // owned payload buffer (nullptr if length == 0)
+    TcpSendSegment* next;
+};
+
+// An out-of-order received segment held until the gap before it fills.
+struct TcpReassemblySegment {
+    uint32_t seq;
+    uint32_t length;
+    uint8_t* data;
+    TcpReassemblySegment* next;
+};
+
 struct SocketObject {
     uint32_t refs;
     int domain;
@@ -63,8 +112,20 @@ struct SocketObject {
     uint64_t localAddressLength;
     uint8_t peerAddress[kMaxSocketAddressSize];
     uint64_t peerAddressLength;
-    uint32_t tcpSendSeq;
-    uint32_t tcpRecvNext;
+    uint32_t tcpSendSeq;       // SND.NXT: next seq to assign to new data
+    uint32_t tcpRecvNext;      // RCV.NXT: next seq expected from peer
+    // --- TCP state machine / reliability (remoteTcp sockets only) ---
+    TcpState tcpState;
+    uint32_t tcpSendUnacked;   // SND.UNA: oldest unacknowledged seq
+    uint32_t tcpPeerWindow;    // peer's advertised receive window
+    bool tcpFinSent;           // we have queued/sent our FIN
+    bool tcpFinAcked;          // peer ACKed our FIN
+    bool tcpPeerFinSeen;       // peer's FIN has been received & ACKed
+    uint32_t tcpDupAckCount;   // consecutive duplicate ACKs
+    uint64_t tcpTimeWaitDeadline; // uptime ms at which TIME_WAIT expires
+    TcpSendSegment* tcpSendHead;  // retransmission queue (in seq order)
+    TcpSendSegment* tcpSendTail;
+    TcpReassemblySegment* tcpReasm; // out-of-order hold queue (seq order)
     struct Datagram* datagramHead;
     struct Datagram* datagramTail;
     SocketObject* peer;
@@ -83,6 +144,15 @@ struct Datagram {
 };
 
 SocketObject* gSockets = nullptr;
+
+// Forward declarations (definitions appear later in this file).
+uint16_t socketAddressPort(const uint8_t* address, uint64_t length);
+uint32_t socketAddressIp(const uint8_t* address, uint64_t length);
+void freeTcpQueues(SocketObject* socket);
+uint16_t tcpLocalPort(const SocketObject* s);
+uint16_t tcpAdvertisedWindow(const SocketObject* socket);
+void tcpSendControl(SocketObject* socket, uint8_t flags);
+bool tcpQueueSegment(SocketObject* socket, uint8_t flags, const uint8_t* data, uint32_t length);
 
 void unlinkSocket(SocketObject* socket) {
     SocketObject** link = &gSockets;
@@ -109,6 +179,30 @@ void freeDatagrams(SocketObject* socket) {
     }
 }
 
+void freeTcpQueues(SocketObject* socket) {
+    if (!socket) {
+        return;
+    }
+    TcpSendSegment* seg = socket->tcpSendHead;
+    while (seg) {
+        TcpSendSegment* next = seg->next;
+        delete[] seg->data;
+        delete seg;
+        seg = next;
+    }
+    socket->tcpSendHead = nullptr;
+    socket->tcpSendTail = nullptr;
+
+    TcpReassemblySegment* r = socket->tcpReasm;
+    while (r) {
+        TcpReassemblySegment* next = r->next;
+        delete[] r->data;
+        delete r;
+        r = next;
+    }
+    socket->tcpReasm = nullptr;
+}
+
 void destroySocketObject(SocketObject* socket) {
     if (!socket) {
         return;
@@ -123,6 +217,20 @@ void destroySocketObject(SocketObject* socket) {
         destroySocketObject(accepted);
         accepted = next;
     }
+    // If a remote TCP connection is still live when the last handle is dropped
+    // without a clean shutdown, abort it with a RST so the peer is not left
+    // with a half-open connection.
+    if (socket->remoteTcp &&
+        socket->tcpState != TcpState::Closed &&
+        socket->tcpState != TcpState::TimeWait &&
+        socket->tcpState != TcpState::Listen) {
+        netTransmitTcpSegment(
+            socketAddressPort(socket->localAddress, socket->localAddressLength),
+            socket->peerAddress, socket->peerAddressLength,
+            socket->tcpSendSeq, socket->tcpRecvNext,
+            kTcpRst | kTcpAck, 0, nullptr, 0);
+    }
+    freeTcpQueues(socket);
     freeDatagrams(socket);
     delete socket;
 }
@@ -360,6 +468,7 @@ uint64_t enqueueDatagram(SocketObject* target, SocketObject* source, uint64_t bu
         target->datagramHead = datagram;
     }
     target->datagramTail = datagram;
+    Scheduler::get().wakeAllBlockedProcesses();
     return length;
 }
 
@@ -438,15 +547,36 @@ int16_t pollSocketHandle(void* object, uint32_t rights, int16_t events) {
         revents |= kPollErr;
     }
     if ((events & kPollOut) && (rights & HandleRightWrite) && !socket->writeClosed && !socket->listening) {
-        revents |= kPollOut;
+        // For remote TCP, writable only once established and the send window
+        // has room.
+        if (socket->remoteTcp) {
+            uint32_t inFlight = socket->tcpSendSeq - socket->tcpSendUnacked;
+            uint32_t window = socket->tcpPeerWindow ? socket->tcpPeerWindow : kTcpMss;
+            if ((socket->tcpState == TcpState::Established ||
+                 socket->tcpState == TcpState::CloseWait) && inFlight < window) {
+                revents |= kPollOut;
+            }
+        } else {
+            revents |= kPollOut;
+        }
     }
     if ((events & kPollIn) && (rights & HandleRightRead)) {
-        const bool streamPeerGone = socket->type == kSockStream && socket->connected && !socket->peer;
-        if (socket->acceptHead || socket->datagramHead || socket->readClosed || streamPeerGone || (socket->peer && socket->peer->writeClosed)) {
-            revents |= kPollIn;
-        }
-        if (socket->readClosed || streamPeerGone || (socket->peer && socket->peer->writeClosed)) {
-            revents |= kPollHup;
+        if (socket->remoteTcp) {
+            if (socket->acceptHead || socket->datagramHead ||
+                socket->tcpPeerFinSeen || socket->readClosed || socket->error) {
+                revents |= kPollIn;
+            }
+            if (socket->tcpPeerFinSeen && !socket->datagramHead) {
+                revents |= kPollHup;
+            }
+        } else {
+            const bool streamPeerGone = socket->type == kSockStream && socket->connected && !socket->peer;
+            if (socket->acceptHead || socket->datagramHead || socket->readClosed || streamPeerGone || (socket->peer && socket->peer->writeClosed)) {
+                revents |= kPollIn;
+            }
+            if (socket->readClosed || streamPeerGone || (socket->peer && socket->peer->writeClosed)) {
+                revents |= kPollHup;
+            }
         }
     }
     if ((events & kPollHup) && socket->readClosed && socket->writeClosed) {
@@ -460,7 +590,14 @@ uint64_t Syscall::sys_socket(uint64_t domain, uint64_t type, uint64_t protocol) 
         return syscall_error(SysErrAddressFamilyNotSupported);
     }
 
-    const int socketType = static_cast<int>(type);
+    // The Linux socket type argument carries optional SOCK_NONBLOCK (04000) and
+    // SOCK_CLOEXEC (02000000) flag bits OR'd into the base type. Strip them
+    // before validating/creating the socket; libcurl in particular requests
+    // SOCK_STREAM|SOCK_NONBLOCK. The flags are honoured at the handle level
+    // (fcntl O_NONBLOCK / close-on-exec), so dropping them here is safe.
+    constexpr int kSockNonblock = 04000;     // SOCK_NONBLOCK (Linux ABI)
+    constexpr int kSockCloexec = 02000000;   // SOCK_CLOEXEC  (Linux ABI)
+    const int socketType = static_cast<int>(type) & ~(kSockNonblock | kSockCloexec);
     const int socketProtocol = static_cast<int>(protocol);
     const uint64_t typeError = validateSocketType(socketType, socketProtocol);
     if (typeError != 0) {
@@ -555,6 +692,22 @@ uint64_t Syscall::sys_connect(uint64_t socketHandle, uint64_t address, uint64_t 
     socket->peerAddressLength = copiedLength;
 
     if (socket->type == kSockStream) {
+        // Re-entrant connect() on an in-progress/established remote connection
+        // (mlibc retries connect() while EAGAIN): report current status.
+        if (socket->remoteTcp) {
+            if (socket->error != 0) {
+                const int e = socket->error;
+                socket->error = 0;
+                return syscall_error(static_cast<SyscallErrno>(e));
+            }
+            if (socket->tcpState == TcpState::Established) {
+                return 0;
+            }
+            if (socket->tcpState == TcpState::SynSent ||
+                socket->tcpState == TcpState::SynReceived) {
+                return syscall_error(SysErrAgain);
+            }
+        }
         if (!ensureSocketBound(socket)) {
             return syscall_error(SysErrAddressInUse);
         }
@@ -562,16 +715,25 @@ uint64_t Syscall::sys_connect(uint64_t socketHandle, uint64_t address, uint64_t 
             ? findListeningStreamPeer(socket, copiedAddress, copiedLength)
             : nullptr;
         if (!listener) {
-            const uint64_t result = netStartTcpConnect(
-                socketAddressPort(socket->localAddress, socket->localAddressLength),
-                copiedAddress,
-                copiedLength
-            );
-            if (result == 0 || result == syscall_error(SysErrAgain)) {
-                socket->remoteTcp = true;
-                socket->tcpSendSeq = 1;
+            // Active open to a remote host: initialize the TCP state machine
+            // and transmit a SYN with a randomized ISN.  The SYN is retained on
+            // the send queue and retransmitted by socketTcpTick() until ACKed.
+            socket->remoteTcp = true;
+            uint32_t isn = 0;
+            kernel_fill_entropy(&isn, sizeof(isn));
+            socket->tcpSendSeq = isn;
+            socket->tcpSendUnacked = isn;
+            socket->tcpRecvNext = 0;
+            socket->tcpState = TcpState::SynSent;
+            socket->connected = false;
+            if (!tcpQueueSegment(socket, kTcpSyn, nullptr, 0)) {
+                socket->tcpState = TcpState::Closed;
+                return syscall_error(SysErrNoMemory);
             }
-            return result;
+            // Non-blocking: the handshake completes as the userspace packet pump
+            // delivers the SYN-ACK; the caller retries connect() (EAGAIN) until
+            // the re-entrant check above reports Established.
+            return syscall_error(SysErrAgain);
         }
         if (acceptQueueLength(listener) >= static_cast<uint64_t>(listener->listenBacklog)) {
             return syscall_error(SysErrAgain);
@@ -597,6 +759,7 @@ uint64_t Syscall::sys_connect(uint64_t socketHandle, uint64_t address, uint64_t 
             listener->acceptHead = accepted;
         }
         listener->acceptTail = accepted;
+        Scheduler::get().wakeAllBlockedProcesses();
         return 0;
     }
 
@@ -706,19 +869,48 @@ uint64_t Syscall::sys_send(uint64_t socketHandle, uint64_t buffer, uint64_t leng
             return syscall_error(SysErrNotConnected);
         }
         if (socket->remoteTcp) {
-            const uint64_t sent = netSendTcpPayload(
-                socketAddressPort(socket->localAddress, socket->localAddressLength),
-                socket->peerAddress,
-                socket->peerAddressLength,
-                socket->tcpSendSeq,
-                socket->tcpRecvNext,
-                buffer,
-                length
-            );
-            if (sent == length) {
-                socket->tcpSendSeq += static_cast<uint32_t>(length);
+            if (socket->error != 0) {
+                const int e = socket->error;
+                socket->error = 0;
+                return syscall_error(static_cast<SyscallErrno>(e));
             }
-            return sent;
+            if (socket->tcpState != TcpState::Established &&
+                socket->tcpState != TcpState::CloseWait) {
+                return syscall_error(SysErrNotConnected);
+            }
+
+            // Backpressure: limit total unacknowledged bytes in flight to the
+            // smaller of our send buffer and the peer's advertised window.
+            uint32_t inFlight = socket->tcpSendSeq - socket->tcpSendUnacked;
+            uint32_t window = socket->tcpPeerWindow ? socket->tcpPeerWindow : kTcpMss;
+            uint32_t cap = window < kTcpSendBufferCap ? window : kTcpSendBufferCap;
+            if (inFlight >= cap) {
+                return syscall_error(SysErrAgain);  // window full, try later
+            }
+            uint64_t allowed = cap - inFlight;
+            uint64_t toSend = length < allowed ? length : allowed;
+            if (toSend == 0) {
+                return syscall_error(SysErrAgain);
+            }
+
+            // Copy from user space into a kernel staging buffer, then segment
+            // into MSS-sized PSH/ACK segments retained for retransmission.
+            uint8_t staging[kTcpMss];
+            uint64_t offset = 0;
+            while (offset < toSend) {
+                uint32_t chunk = static_cast<uint32_t>(toSend - offset);
+                if (chunk > kTcpMss) {
+                    chunk = kTcpMss;
+                }
+                if (!copyFromUser(staging, buffer + offset, chunk)) {
+                    return offset != 0 ? offset : syscall_error(SysErrInvalid);
+                }
+                if (!tcpQueueSegment(socket, kTcpPsh | kTcpAck, staging, chunk)) {
+                    return offset != 0 ? offset : syscall_error(SysErrAgain);
+                }
+                offset += chunk;
+            }
+            return offset;
         }
         if (!socket->peer) {
             return syscall_error(SysErrBrokenPipe);
@@ -803,146 +995,458 @@ bool socketDeliverUdpDatagram(
             socket->datagramHead = datagram;
         }
         socket->datagramTail = datagram;
+        // Wake any process blocked in poll()/recv() on this socket. A blocked
+        // process is invisible to the scheduler until re-readied, so without
+        // this the datagram would sit unnoticed (lost-wakeup race).
+        Scheduler::get().wakeAllBlockedProcesses();
         return true;
     }
     return false;
 }
 
-bool socketAcceptTcpConnection(
-    uint16_t srcPort,
-    uint32_t srcIpNetworkOrder,
-    uint16_t dstPort,
-    uint32_t remoteSeq,
-    uint32_t* outSeq,
-    uint32_t* outAck
-) {
-    for (SocketObject* listener = gSockets; listener; listener = listener->next) {
-        if (listener->type != kSockStream || !listener->listening || !listener->bound ||
-            socketAddressPort(listener->localAddress, listener->localAddressLength) != dstPort ||
-            acceptQueueLength(listener) >= static_cast<uint64_t>(listener->listenBacklog)) {
-            continue;
-        }
+// ===========================================================================
+// TCP state machine (remoteTcp sockets)
+// ===========================================================================
+namespace {
 
-        SocketObject* accepted = createSocketObject(listener->domain, listener->type, listener->protocol);
-        if (!accepted) {
+uint16_t tcpLocalPort(const SocketObject* s) {
+    return socketAddressPort(s->localAddress, s->localAddressLength);
+}
+
+// Compute the advertised receive window from free receive-buffer space.
+uint16_t tcpAdvertisedWindow(const SocketObject* socket) {
+    uint64_t queued = 0;
+    for (const Datagram* d = socket->datagramHead; d; d = d->next) {
+        queued += d->length;
+    }
+    uint64_t free = queued >= kTcpReceiveWindow ? 0 : kTcpReceiveWindow - queued;
+    if (free > 0xFFFF) {
+        free = 0xFFFF;
+    }
+    return static_cast<uint16_t>(free);
+}
+
+bool tcpAddressMatches(const SocketObject* socket, uint16_t srcPort, uint32_t srcIp) {
+    if (socketAddressPort(socket->peerAddress, socket->peerAddressLength) != srcPort) {
+        return false;
+    }
+    uint32_t peerIp = 0;
+    if (socket->peerAddressLength >= 8) {
+        memcpy(&peerIp, socket->peerAddress + 4, sizeof(peerIp));
+    }
+    return peerIp == srcIp;
+}
+
+// Transmit a control/ACK segment (no retained payload) for `socket`.
+void tcpSendControl(SocketObject* socket, uint8_t flags) {
+    netTransmitTcpSegment(
+        tcpLocalPort(socket), socket->peerAddress, socket->peerAddressLength,
+        socket->tcpSendSeq, socket->tcpRecvNext, flags,
+        tcpAdvertisedWindow(socket), nullptr, 0);
+}
+
+// Enqueue a retained outbound segment (data, or a SYN/FIN control segment that
+// consumes one sequence number) and transmit it immediately.  `seqLen` is the
+// sequence space the segment consumes (payload length, or 1 for SYN/FIN).
+bool tcpQueueSegment(SocketObject* socket, uint8_t flags, const uint8_t* data, uint32_t length) {
+    auto* seg = new TcpSendSegment {};
+    if (!seg) {
+        return false;
+    }
+    seg->seq = socket->tcpSendSeq;
+    seg->length = length;
+    seg->flags = flags;
+    seg->retries = 0;
+    seg->lastSentMs = time_get_uptime_ms();
+    if (length != 0) {
+        seg->data = new uint8_t[length];
+        if (!seg->data) {
+            delete seg;
             return false;
         }
-
-        accepted->bound = true;
-        accepted->connected = true;
-        accepted->remoteTcp = true;
-        accepted->tcpSendSeq = 2;
-        accepted->tcpRecvNext = remoteSeq + 1;
-        memcpy(accepted->localAddress, listener->localAddress, listener->localAddressLength);
-        accepted->localAddressLength = listener->localAddressLength;
-        uint16_t family = kAfInet;
-        memcpy(accepted->peerAddress, &family, sizeof(family));
-        memcpy(accepted->peerAddress + 2, &srcPort, sizeof(srcPort));
-        memcpy(accepted->peerAddress + 4, &srcIpNetworkOrder, sizeof(srcIpNetworkOrder));
-        accepted->peerAddressLength = 16;
-
-        if (listener->acceptTail) {
-            listener->acceptTail->acceptNext = accepted;
-        } else {
-            listener->acceptHead = accepted;
-        }
-        listener->acceptTail = accepted;
-        if (outSeq) {
-            *outSeq = 1;
-        }
-        if (outAck) {
-            *outAck = accepted->tcpRecvNext;
-        }
-        return true;
+        memcpy(seg->data, data, length);
     }
-    return false;
+    if (socket->tcpSendTail) {
+        socket->tcpSendTail->next = seg;
+    } else {
+        socket->tcpSendHead = seg;
+    }
+    socket->tcpSendTail = seg;
+
+    // Sequence space consumed: payload length, or 1 for a bare SYN/FIN.
+    const uint32_t seqLen = length != 0 ? length
+        : ((flags & (kTcpSyn | kTcpFin)) ? 1u : 0u);
+    socket->tcpSendSeq += seqLen;
+
+    netTransmitTcpSegment(
+        tcpLocalPort(socket), socket->peerAddress, socket->peerAddressLength,
+        seg->seq, socket->tcpRecvNext, flags,
+        tcpAdvertisedWindow(socket), seg->data, seg->length);
+    return true;
 }
 
-bool socketCompleteTcpConnect(uint16_t srcPort, uint32_t srcIpNetworkOrder, uint16_t dstPort, uint32_t remoteSeq) {
-    for (SocketObject* socket = gSockets; socket; socket = socket->next) {
-        if (socket->type != kSockStream || !socket->remoteTcp || socket->connected || !socket->bound ||
-            socketAddressPort(socket->localAddress, socket->localAddressLength) != dstPort ||
-            socketAddressPort(socket->peerAddress, socket->peerAddressLength) != srcPort) {
-            continue;
+// Drop send segments fully acknowledged by `ackNum` (cumulative).  Returns the
+// number of segments freed.
+int tcpAckSendQueue(SocketObject* socket, uint32_t ackNum) {
+    int freed = 0;
+    while (socket->tcpSendHead) {
+        TcpSendSegment* seg = socket->tcpSendHead;
+        const uint32_t seqLen = seg->length != 0 ? seg->length
+            : ((seg->flags & (kTcpSyn | kTcpFin)) ? 1u : 0u);
+        const uint32_t segEnd = seg->seq + seqLen;
+        // Acked if ackNum has advanced to or past the segment's end (handle
+        // wraparound with signed difference).
+        if (static_cast<int32_t>(ackNum - segEnd) < 0) {
+            break;  // not yet fully acknowledged
         }
-        uint32_t peerIp = 0;
-        if (socket->peerAddressLength >= 8) {
-            memcpy(&peerIp, socket->peerAddress + 4, sizeof(peerIp));
+        if ((seg->flags & kTcpFin) != 0) {
+            socket->tcpFinAcked = true;
         }
-        if (peerIp != srcIpNetworkOrder) {
-            continue;
+        socket->tcpSendHead = seg->next;
+        if (!socket->tcpSendHead) {
+            socket->tcpSendTail = nullptr;
         }
-        socket->connected = true;
-        socket->tcpSendSeq = 2;
-        socket->tcpRecvNext = remoteSeq + 1;
-        return true;
+        delete[] seg->data;
+        delete seg;
+        freed++;
     }
-    return false;
+    if (static_cast<int32_t>(ackNum - socket->tcpSendUnacked) > 0) {
+        socket->tcpSendUnacked = ackNum;
+    }
+    return freed;
 }
 
-bool socketDeliverTcpPayload(
-    uint16_t srcPort,
-    uint32_t srcIpNetworkOrder,
-    uint16_t dstPort,
-    uint32_t seq,
-    const uint8_t* payload,
-    uint64_t length,
-    uint32_t* outSeq,
-    uint32_t* outAck
-) {
-    for (SocketObject* socket = gSockets; socket; socket = socket->next) {
-        if (socket->type != kSockStream || !socket->remoteTcp || !socket->connected || !socket->bound || socket->readClosed ||
-            socketAddressPort(socket->localAddress, socket->localAddressLength) != dstPort ||
-            socketAddressPort(socket->peerAddress, socket->peerAddressLength) != srcPort) {
-            continue;
-        }
-        uint32_t peerIp = 0;
-        if (socket->peerAddressLength >= 8) {
-            memcpy(&peerIp, socket->peerAddress + 4, sizeof(peerIp));
-        }
-        if (peerIp != srcIpNetworkOrder) {
-            continue;
-        }
+// Append in-order bytes to the socket receive (datagram) queue.
+bool tcpAppendReceived(SocketObject* socket, const uint8_t* data, uint32_t length) {
+    if (length == 0) {
+        return true;
+    }
+    auto* datagram = new Datagram {};
+    if (!datagram) {
+        return false;
+    }
+    datagram->data = new uint8_t[length];
+    if (!datagram->data) {
+        delete datagram;
+        return false;
+    }
+    memcpy(datagram->data, data, length);
+    datagram->length = length;
+    if (socket->datagramTail) {
+        socket->datagramTail->next = datagram;
+    } else {
+        socket->datagramHead = datagram;
+    }
+    socket->datagramTail = datagram;
+    socket->tcpRecvNext += length;
+    return true;
+}
 
-        if (seq != socket->tcpRecvNext) {
-            if (outSeq) {
-                *outSeq = socket->tcpSendSeq;
+// After advancing tcpRecvNext, pull any buffered out-of-order segments that are
+// now contiguous into the receive queue.
+void tcpDrainReassembly(SocketObject* socket) {
+    bool progress = true;
+    while (progress) {
+        progress = false;
+        TcpReassemblySegment** link = &socket->tcpReasm;
+        while (*link) {
+            TcpReassemblySegment* r = *link;
+            const uint32_t end = r->seq + r->length;
+            if (static_cast<int32_t>(end - socket->tcpRecvNext) <= 0) {
+                // Entirely old/duplicate — drop.
+                *link = r->next;
+                delete[] r->data;
+                delete r;
+                progress = true;
+                continue;
             }
-            if (outAck) {
-                *outAck = socket->tcpRecvNext;
+            if (r->seq == socket->tcpRecvNext) {
+                tcpAppendReceived(socket, r->data, r->length);
+                *link = r->next;
+                delete[] r->data;
+                delete r;
+                progress = true;
+                continue;
             }
-            return true;
+            link = &r->next;
         }
-        auto* datagram = new Datagram {};
-        if (!datagram) {
-            return false;
-        }
-        datagram->data = new uint8_t[length ? length : 1];
-        if (!datagram->data) {
-            delete datagram;
-            return false;
-        }
-        if (length != 0) {
-            memcpy(datagram->data, payload, static_cast<size_t>(length));
-        }
-        datagram->length = length;
-        if (socket->datagramTail) {
-            socket->datagramTail->next = datagram;
-        } else {
-            socket->datagramHead = datagram;
-        }
-        socket->datagramTail = datagram;
-        socket->tcpRecvNext += static_cast<uint32_t>(length);
-        if (outSeq) {
-            *outSeq = socket->tcpSendSeq;
-        }
-        if (outAck) {
-            *outAck = socket->tcpRecvNext;
-        }
-        return true;
     }
-    return false;
 }
+
+// Buffer an out-of-order segment for later reassembly (deduplicated by seq).
+void tcpBufferOutOfOrder(SocketObject* socket, uint32_t seq, const uint8_t* data, uint32_t length) {
+    if (length == 0) {
+        return;
+    }
+    for (TcpReassemblySegment* r = socket->tcpReasm; r; r = r->next) {
+        if (r->seq == seq) {
+            return;  // already held
+        }
+    }
+    auto* r = new TcpReassemblySegment {};
+    if (!r) {
+        return;
+    }
+    r->data = new uint8_t[length];
+    if (!r->data) {
+        delete r;
+        return;
+    }
+    memcpy(r->data, data, length);
+    r->seq = seq;
+    r->length = length;
+    r->next = socket->tcpReasm;
+    socket->tcpReasm = r;
+}
+
+SocketObject* findTcpListener(uint16_t dstPort) {
+    for (SocketObject* s = gSockets; s; s = s->next) {
+        if (s->type == kSockStream && s->listening && s->bound &&
+            tcpLocalPort(s) == dstPort &&
+            acceptQueueLength(s) < static_cast<uint64_t>(s->listenBacklog)) {
+            return s;
+        }
+    }
+    return nullptr;
+}
+
+// Find an established/connecting connection matching the 4-tuple.
+SocketObject* findTcpConnection(uint16_t dstPort, uint16_t srcPort, uint32_t srcIp) {
+    for (SocketObject* s = gSockets; s; s = s->next) {
+        if (s->type != kSockStream || !s->remoteTcp || !s->bound || s->listening) {
+            continue;
+        }
+        if (tcpLocalPort(s) == dstPort && tcpAddressMatches(s, srcPort, srcIp)) {
+            return s;
+        }
+    }
+    return nullptr;
+}
+
+}  // namespace
+
+void socketProcessTcpSegment(const TcpSegmentInfo& seg) {
+    const uint16_t dstPort = seg.dstPort;
+    const uint16_t srcPort = seg.srcPort;
+    const uint32_t srcIp = seg.srcIpNetworkOrder;
+
+    SocketObject* socket = findTcpConnection(dstPort, srcPort, srcIp);
+
+    // No existing connection: only a bare SYN to a listener is interesting.
+    if (!socket) {
+        if ((seg.flags & kTcpSyn) != 0 && (seg.flags & kTcpAck) == 0) {
+            SocketObject* listener = findTcpListener(dstPort);
+            if (!listener) {
+                return;
+            }
+            SocketObject* accepted = createSocketObject(listener->domain, listener->type, listener->protocol);
+            if (!accepted) {
+                return;
+            }
+            accepted->bound = true;
+            accepted->remoteTcp = true;
+            accepted->tcpState = TcpState::SynReceived;
+            memcpy(accepted->localAddress, listener->localAddress, listener->localAddressLength);
+            accepted->localAddressLength = listener->localAddressLength;
+            uint16_t family = kAfInet;
+            memcpy(accepted->peerAddress, &family, sizeof(family));
+            memcpy(accepted->peerAddress + 2, &srcPort, sizeof(srcPort));
+            memcpy(accepted->peerAddress + 4, &srcIp, sizeof(srcIp));
+            accepted->peerAddressLength = 16;
+            accepted->tcpRecvNext = seg.seq + 1;  // consume peer SYN
+            accepted->tcpPeerWindow = seg.window;
+            // Randomized ISN; SYN-ACK consumes one sequence number.
+            uint32_t isn = 0;
+            kernel_fill_entropy(&isn, sizeof(isn));
+            accepted->tcpSendSeq = isn;
+            accepted->tcpSendUnacked = isn;
+            // Link into the listener's accept queue now; promoted to the app on
+            // the final ACK (it is already reachable for matching).
+            if (listener->acceptTail) {
+                listener->acceptTail->acceptNext = accepted;
+            } else {
+                listener->acceptHead = accepted;
+            }
+            listener->acceptTail = accepted;
+            tcpQueueSegment(accepted, kTcpSyn | kTcpAck, nullptr, 0);
+        }
+        return;
+    }
+
+    socket->tcpPeerWindow = seg.window;
+
+    // RST: abort the connection.
+    if ((seg.flags & kTcpRst) != 0) {
+        socket->error = SysErrConnectionReset;
+        socket->readClosed = true;
+        socket->writeClosed = true;
+        socket->connected = false;
+        socket->tcpState = TcpState::Closed;
+        freeTcpQueues(socket);
+        return;
+    }
+
+    // SYN-ACK completing our active open.
+    if (socket->tcpState == TcpState::SynSent) {
+        if ((seg.flags & (kTcpSyn | kTcpAck)) == (kTcpSyn | kTcpAck)) {
+            tcpAckSendQueue(socket, seg.ack);   // ACKs our SYN
+            socket->tcpRecvNext = seg.seq + 1;  // consume peer SYN
+            socket->tcpState = TcpState::Established;
+            socket->connected = true;
+            tcpSendControl(socket, kTcpAck);
+        } else if ((seg.flags & kTcpSyn) != 0) {
+            // Simultaneous open: peer SYN without ACK.
+            socket->tcpRecvNext = seg.seq + 1;
+            socket->tcpState = TcpState::SynReceived;
+            tcpSendControl(socket, kTcpSyn | kTcpAck);
+        }
+        return;
+    }
+
+    // Final ACK of our SYN-ACK promotes a passive open to ESTABLISHED.
+    if (socket->tcpState == TcpState::SynReceived) {
+        if ((seg.flags & kTcpAck) != 0) {
+            tcpAckSendQueue(socket, seg.ack);
+            socket->tcpState = TcpState::Established;
+            socket->connected = true;
+        }
+        // fall through to process any piggybacked data/FIN
+    }
+
+    // Process the ACK field for any state that can carry data.
+    if ((seg.flags & kTcpAck) != 0) {
+        const int32_t adv = static_cast<int32_t>(seg.ack - socket->tcpSendUnacked);
+        if (adv > 0) {
+            tcpAckSendQueue(socket, seg.ack);
+            socket->tcpDupAckCount = 0;
+            // Our FIN may now be acknowledged -> advance close states.
+            if (socket->tcpFinAcked) {
+                if (socket->tcpState == TcpState::FinWait1) {
+                    socket->tcpState = TcpState::FinWait2;
+                } else if (socket->tcpState == TcpState::Closing) {
+                    socket->tcpState = TcpState::TimeWait;
+                    socket->tcpTimeWaitDeadline = time_get_uptime_ms() + kTcpTimeWaitMs;
+                } else if (socket->tcpState == TcpState::LastAck) {
+                    socket->tcpState = TcpState::Closed;
+                    socket->connected = false;
+                }
+            }
+        } else if (adv == 0 && socket->tcpSendHead) {
+            // Duplicate ACK: count for fast retransmit.
+            if (++socket->tcpDupAckCount == 3) {
+                TcpSendSegment* seg0 = socket->tcpSendHead;
+                seg0->lastSentMs = time_get_uptime_ms();
+                netTransmitTcpSegment(
+                    tcpLocalPort(socket), socket->peerAddress, socket->peerAddressLength,
+                    seg0->seq, socket->tcpRecvNext, seg0->flags,
+                    tcpAdvertisedWindow(socket), seg0->data, seg0->length);
+            }
+        }
+    }
+
+    // Incoming data payload.
+    if (seg.payloadLength != 0 &&
+        (socket->tcpState == TcpState::Established ||
+         socket->tcpState == TcpState::FinWait1 ||
+         socket->tcpState == TcpState::FinWait2)) {
+        const int32_t delta = static_cast<int32_t>(seg.seq - socket->tcpRecvNext);
+        if (delta == 0) {
+            tcpAppendReceived(socket, seg.payload, static_cast<uint32_t>(seg.payloadLength));
+            tcpDrainReassembly(socket);
+        } else if (delta > 0) {
+            // Out-of-order: buffer for later, ACK current cumulative point.
+            tcpBufferOutOfOrder(socket, seg.seq, seg.payload, static_cast<uint32_t>(seg.payloadLength));
+        }
+        // delta < 0 -> already-received duplicate, just re-ACK.
+        tcpSendControl(socket, kTcpAck);
+    }
+
+    // Incoming FIN: peer closing its send direction.
+    if ((seg.flags & kTcpFin) != 0) {
+        // Only accept the FIN if it is in-order (its seq equals what we expect
+        // next, accounting for any payload we just consumed).
+        if (seg.seq + static_cast<uint32_t>(seg.payloadLength) == socket->tcpRecvNext) {
+            socket->tcpRecvNext += 1;  // FIN consumes one sequence number
+            socket->tcpPeerFinSeen = true;
+            socket->readClosed = true;
+            tcpSendControl(socket, kTcpAck);
+            switch (socket->tcpState) {
+                case TcpState::Established:
+                case TcpState::SynReceived:
+                    socket->tcpState = TcpState::CloseWait;
+                    break;
+                case TcpState::FinWait1:
+                    socket->tcpState = socket->tcpFinAcked ? TcpState::TimeWait : TcpState::Closing;
+                    if (socket->tcpState == TcpState::TimeWait) {
+                        socket->tcpTimeWaitDeadline = time_get_uptime_ms() + kTcpTimeWaitMs;
+                    }
+                    break;
+                case TcpState::FinWait2:
+                    socket->tcpState = TcpState::TimeWait;
+                    socket->tcpTimeWaitDeadline = time_get_uptime_ms() + kTcpTimeWaitMs;
+                    break;
+                default:
+                    break;
+            }
+        }
+    }
+
+    // A connection state change, new data, FIN (EOF) or error here may make a
+    // process blocked in connect()/recv()/poll() runnable. Wake them so they
+    // re-scan (lost-wakeup race otherwise — a Blocked process is invisible to
+    // the scheduler until explicitly re-readied).
+    Scheduler::get().wakeAllBlockedProcesses();
+}
+
+void socketTcpTick() {
+    const uint64_t now = time_get_uptime_ms();
+    for (SocketObject* socket = gSockets; socket; socket = socket->next) {
+        if (socket->type != kSockStream || !socket->remoteTcp) {
+            continue;
+        }
+
+        // TIME_WAIT expiry.
+        if (socket->tcpState == TcpState::TimeWait &&
+            now >= socket->tcpTimeWaitDeadline) {
+            socket->tcpState = TcpState::Closed;
+            socket->connected = false;
+            freeTcpQueues(socket);
+            continue;
+        }
+
+        // Retransmit the oldest unacknowledged segment past its RTO.
+        TcpSendSegment* seg = socket->tcpSendHead;
+        if (!seg) {
+            continue;
+        }
+        // Exponential backoff: RTO doubles per retry, capped.
+        uint64_t rto = kTcpRtoMs << (seg->retries < 5 ? seg->retries : 5);
+        if (rto > kTcpRtoMaxMs) {
+            rto = kTcpRtoMaxMs;
+        }
+        if (now - seg->lastSentMs < rto) {
+            continue;
+        }
+        if (seg->retries >= kTcpMaxRetries) {
+            // Give up: connection is dead.
+            socket->error = SysErrTimedOut;
+            socket->readClosed = true;
+            socket->writeClosed = true;
+            socket->connected = false;
+            socket->tcpState = TcpState::Closed;
+            freeTcpQueues(socket);
+            Scheduler::get().wakeAllBlockedProcesses();
+            continue;
+        }
+        seg->retries++;
+        seg->lastSentMs = now;
+        netTransmitTcpSegment(
+            tcpLocalPort(socket), socket->peerAddress, socket->peerAddressLength,
+            seg->seq, socket->tcpRecvNext, seg->flags,
+            tcpAdvertisedWindow(socket), seg->data, seg->length);
+    }
+}
+
 
 uint64_t Syscall::sys_recv(uint64_t socketHandle, uint64_t buffer, uint64_t length, uint64_t flags) {
     (void)flags;
@@ -959,7 +1463,16 @@ uint64_t Syscall::sys_recv(uint64_t socketHandle, uint64_t buffer, uint64_t leng
     if (length != 0 && !isValidUserPointer(buffer, static_cast<size_t>(length))) {
         return syscall_error(SysErrInvalid);
     }
-    if (socket->readClosed) {
+    // Surface a pending connection error (RST / retransmission timeout) once
+    // any buffered data has been consumed.
+    if (socket->remoteTcp && socket->error != 0 && !socket->datagramHead) {
+        const int e = socket->error;
+        socket->error = 0;
+        return syscall_error(static_cast<SyscallErrno>(e));
+    }
+    // For remote TCP, only report EOF (readClosed) once the receive queue is
+    // drained — buffered bytes received before the FIN must still be returned.
+    if (socket->readClosed && (!socket->remoteTcp || !socket->datagramHead)) {
         return 0;
     }
     if (length == 0) {
@@ -970,7 +1483,12 @@ uint64_t Syscall::sys_recv(uint64_t socketHandle, uint64_t buffer, uint64_t leng
     }
     Datagram* datagram = socket->datagramHead;
     if (!datagram) {
-        if (socket->type == kSockStream && (!socket->peer || socket->peer->writeClosed)) {
+        // Remote TCP: EOF once the peer's FIN has been seen.
+        if (socket->remoteTcp && socket->tcpPeerFinSeen) {
+            return 0;
+        }
+        if (socket->type == kSockStream && !socket->remoteTcp &&
+            (!socket->peer || socket->peer->writeClosed)) {
             return 0;
         }
         return syscall_error(SysErrAgain);
@@ -978,6 +1496,8 @@ uint64_t Syscall::sys_recv(uint64_t socketHandle, uint64_t buffer, uint64_t leng
     const uint64_t copied = datagram->length < length ? datagram->length : length;
     if (copied != 0 && !copyToUser(buffer, datagram->data, static_cast<size_t>(copied))) {
         return syscall_error(SysErrInvalid);
+    }
+    if (socket->type == kSockDgram) {
     }
     if (socket->type == kSockStream && copied < datagram->length) {
         const uint64_t remaining = datagram->length - copied;
@@ -1013,6 +1533,20 @@ uint64_t Syscall::sys_shutdown(uint64_t socketHandle, uint64_t how) {
     }
     if (how == kShutdownWrite || how == kShutdownBoth) {
         socket->writeClosed = true;
+        // Initiate an active close on a remote TCP connection: queue a FIN
+        // (retransmitted by socketTcpTick) and advance the close state.
+        if (socket->remoteTcp && !socket->tcpFinSent &&
+            (socket->tcpState == TcpState::Established ||
+             socket->tcpState == TcpState::CloseWait ||
+             socket->tcpState == TcpState::SynReceived)) {
+            socket->tcpFinSent = true;
+            tcpQueueSegment(socket, kTcpFin | kTcpAck, nullptr, 0);
+            if (socket->tcpState == TcpState::CloseWait) {
+                socket->tcpState = TcpState::LastAck;
+            } else {
+                socket->tcpState = TcpState::FinWait1;
+            }
+        }
     }
     return 0;
 }
@@ -1142,4 +1676,64 @@ uint64_t Syscall::sys_setsockopt(
         default:
             return syscall_error(SysErrProtoOpt);
     }
+}
+
+// Copy a stored socket address (local or peer) out to user space using the
+// standard capacity-in / actual-length-out protocol shared with accept().
+static uint64_t copySocketNameToUser(
+    const uint8_t* storedAddress,
+    uint64_t storedLength,
+    uint64_t addrPtr,
+    uint64_t addrLenPtr
+) {
+    if (addrLenPtr == 0) {
+        return syscall_error(SysErrInvalid);
+    }
+    uint32_t capacity = 0;
+    if (!Syscall::copyFromUser(&capacity, addrLenPtr, sizeof(capacity))) {
+        return syscall_error(SysErrInvalid);
+    }
+    const uint32_t actual = static_cast<uint32_t>(storedLength);
+    const uint32_t copied = capacity < actual ? capacity : actual;
+    if (addrPtr != 0 && copied != 0 && !Syscall::copyToUser(addrPtr, storedAddress, copied)) {
+        return syscall_error(SysErrInvalid);
+    }
+    if (!Syscall::copyToUser(addrLenPtr, &actual, sizeof(actual))) {
+        return syscall_error(SysErrInvalid);
+    }
+    return 0;
+}
+
+uint64_t Syscall::sys_getsockname(uint64_t socketHandle, uint64_t addrPtr, uint64_t addrLenPtr) {
+    uint64_t error = 0;
+    SocketObject* socket = resolveSocket(
+        Scheduler::get().getCurrentProcess(),
+        socketHandle,
+        HandleRightRead,
+        &error
+    );
+    if (!socket) {
+        return error;
+    }
+    return copySocketNameToUser(
+        socket->localAddress, socket->localAddressLength, addrPtr, addrLenPtr);
+}
+
+uint64_t Syscall::sys_getpeername(uint64_t socketHandle, uint64_t addrPtr, uint64_t addrLenPtr) {
+    uint64_t error = 0;
+    SocketObject* socket = resolveSocket(
+        Scheduler::get().getCurrentProcess(),
+        socketHandle,
+        HandleRightRead,
+        &error
+    );
+    if (!socket) {
+        return error;
+    }
+    // Only a connected socket has a peer address recorded.
+    if (socket->peerAddressLength == 0) {
+        return syscall_error(SysErrNotConnected);
+    }
+    return copySocketNameToUser(
+        socket->peerAddress, socket->peerAddressLength, addrPtr, addrLenPtr);
 }

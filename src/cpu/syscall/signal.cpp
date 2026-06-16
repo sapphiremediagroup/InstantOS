@@ -27,7 +27,10 @@ struct UserSignalFrame {
 };
 
 uint64_t validSignalMask(uint64_t mask) {
-    mask &= (1ULL << NSIG) - 1ULL;
+    // NSIG signal slots map to bits 0..NSIG-1. Build the bitmask without
+    // shifting by 64 (which is undefined behaviour).
+    const uint64_t allSignals = (NSIG >= 64) ? ~0ULL : ((1ULL << NSIG) - 1ULL);
+    mask &= allSignals;
     mask &= ~1ULL;
     mask &= ~(1ULL << SIGKILL);
     return mask;

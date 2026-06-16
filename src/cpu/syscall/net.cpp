@@ -1,11 +1,10 @@
 #include <cpu/syscall/syscall.hpp>
 #include <drivers/net/net_device.hpp>
+#include <cpu/syscall/tcp_internal.hpp>
 #include <common/string.hpp>
+#include <cpu/cereal/cereal.hpp>
 
 bool socketDeliverUdpDatagram(uint16_t srcPort, uint32_t srcIpNetworkOrder, uint16_t dstPort, const uint8_t* payload, uint64_t length);
-bool socketAcceptTcpConnection(uint16_t srcPort, uint32_t srcIpNetworkOrder, uint16_t dstPort, uint32_t remoteSeq, uint32_t* outSeq, uint32_t* outAck);
-bool socketCompleteTcpConnect(uint16_t srcPort, uint32_t srcIpNetworkOrder, uint16_t dstPort, uint32_t remoteSeq);
-bool socketDeliverTcpPayload(uint16_t srcPort, uint32_t srcIpNetworkOrder, uint16_t dstPort, uint32_t seq, const uint8_t* payload, uint64_t length, uint32_t* outSeq, uint32_t* outAck);
 
 namespace {
 constexpr uint16_t kEtherTypeIpv4 = 0x0800;
@@ -23,7 +22,21 @@ constexpr uint8_t kTcpFlagSyn = 0x02;
 constexpr uint8_t kTcpFlagPsh = 0x08;
 constexpr uint8_t kTcpFlagAck = 0x10;
 constexpr uint32_t kLocalIpv4 = (10U << 24) | (0U << 16) | (2U << 8) | 15U;
+// QEMU user-mode networking: guest 10.0.2.15/24, gateway 10.0.2.2.
+constexpr uint32_t kGatewayIpv4 = (10U << 24) | (0U << 16) | (2U << 8) | 2U;
+constexpr uint32_t kSubnetMask = 0xFFFFFF00U;  // /24
 constexpr uint8_t kBroadcastMac[6] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
+
+// Resolve the next-hop IP for a destination: the destination itself if it is on
+// our local subnet, otherwise the default gateway.  Without this, off-subnet
+// destinations would ARP for an address no one on the link answers, so the
+// frame is never sent (TCP to any public host, off-link UDP, etc.).
+inline uint32_t nextHopIp(uint32_t destIp) {
+    if ((destIp & kSubnetMask) == (kLocalIpv4 & kSubnetMask)) {
+        return destIp;
+    }
+    return kGatewayIpv4;
+}
 
 struct EthernetHeader {
     uint8_t dst[6];
@@ -344,6 +357,7 @@ bool sendTcpFrame(
     uint32_t seq,
     uint32_t ack,
     uint8_t flags,
+    uint16_t window,
     const uint8_t* payload,
     size_t payloadLength
 ) {
@@ -379,7 +393,7 @@ bool sendTcpFrame(
     tcp->ack = toNetwork32(ack);
     tcp->dataOffsetReserved = static_cast<uint8_t>((sizeof(TcpHeader) / 4) << 4);
     tcp->flags = flags;
-    tcp->window = toNetwork16(4096);
+    tcp->window = toNetwork16(window);
     if (payloadLength != 0) {
         memcpy(reinterpret_cast<uint8_t*>(tcp + 1), payload, payloadLength);
     }
@@ -458,35 +472,18 @@ void handleIpv4(NetDevice& net, const uint8_t* packet, size_t length) {
         if (tcpHeaderLength < sizeof(TcpHeader) || totalLength < ihl + tcpHeaderLength) {
             return;
         }
-        const uint16_t srcPort = tcp->srcPort;
-        const uint16_t dstPort = tcp->dstPort;
-        const uint32_t seq = fromNetwork32(tcp->seq);
-        const size_t payloadLength = totalLength - ihl - tcpHeaderLength;
-        const auto* payload = packet + sizeof(EthernetHeader) + ihl + tcpHeaderLength;
 
-        if ((tcp->flags & kTcpFlagSyn) != 0 && (tcp->flags & kTcpFlagAck) == 0) {
-            uint32_t replySeq = 0;
-            uint32_t replyAck = 0;
-            if (socketAcceptTcpConnection(srcPort, ip->srcIp, dstPort, seq, &replySeq, &replyAck)) {
-                sendTcpFrame(net, fromNetwork32(ip->srcIp), eth->src, dstPort, srcPort, replySeq, replyAck, kTcpFlagSyn | kTcpFlagAck, nullptr, 0);
-            }
-            return;
-        }
-
-        if ((tcp->flags & (kTcpFlagSyn | kTcpFlagAck)) == (kTcpFlagSyn | kTcpFlagAck)) {
-            if (socketCompleteTcpConnect(srcPort, ip->srcIp, dstPort, seq)) {
-                sendTcpFrame(net, fromNetwork32(ip->srcIp), eth->src, dstPort, srcPort, fromNetwork32(tcp->ack), seq + 1, kTcpFlagAck, nullptr, 0);
-            }
-            return;
-        }
-
-        if (payloadLength != 0) {
-            uint32_t replySeq = 0;
-            uint32_t replyAck = 0;
-            if (socketDeliverTcpPayload(srcPort, ip->srcIp, dstPort, seq, payload, payloadLength, &replySeq, &replyAck)) {
-                sendTcpFrame(net, fromNetwork32(ip->srcIp), eth->src, dstPort, srcPort, replySeq, replyAck, kTcpFlagAck, nullptr, 0);
-            }
-        }
+        TcpSegmentInfo segment {};
+        segment.srcPort = tcp->srcPort;
+        segment.dstPort = tcp->dstPort;
+        segment.srcIpNetworkOrder = ip->srcIp;
+        segment.seq = fromNetwork32(tcp->seq);
+        segment.ack = fromNetwork32(tcp->ack);
+        segment.window = fromNetwork16(tcp->window);
+        segment.flags = tcp->flags;
+        segment.payload = packet + sizeof(EthernetHeader) + ihl + tcpHeaderLength;
+        segment.payloadLength = totalLength - ihl - tcpHeaderLength;
+        socketProcessTcpSegment(segment);
         return;
     }
 
@@ -583,7 +580,7 @@ uint64_t netSendUdpDatagram(uint16_t srcPort, const uint8_t* dstAddress, uint64_
     NetDevice& net = *netDev;
 
     uint8_t dstMac[6] {};
-    if (!resolveArpBlocking(net, dstIp, dstMac)) {
+    if (!resolveArpBlocking(net, nextHopIp(dstIp), dstMac)) {
         return syscall_error(SysErrAgain);
     }
 
@@ -592,64 +589,46 @@ uint64_t netSendUdpDatagram(uint16_t srcPort, const uint8_t* dstAddress, uint64_
         : syscall_error(SysErrAgain);
 }
 
-uint64_t netStartTcpConnect(uint16_t srcPort, const uint8_t* dstAddress, uint64_t dstAddressLength) {
-    if (!dstAddress || dstAddressLength < 8 || srcPort == 0) {
-        return syscall_error(SysErrInvalid);
-    }
-    uint32_t dstIpNetworkOrder = 0;
-    uint16_t dstPort = 0;
-    memcpy(&dstIpNetworkOrder, dstAddress + 4, sizeof(dstIpNetworkOrder));
-    memcpy(&dstPort, dstAddress + 2, sizeof(dstPort));
-    const uint32_t dstIp = fromNetwork32(dstIpNetworkOrder);
-    if (dstIp == 0 || dstPort == 0) {
-        return syscall_error(SysErrInvalid);
-    }
-
-    NetDevice* netDev = NetDeviceRegistry::active();
-    if (!netDev) {
-        return syscall_error(SysErrNoEntry);
-    }
-    NetDevice& net = *netDev;
-    uint8_t dstMac[6] {};
-    if (!lookupArp(dstIp, dstMac)) {
-        return sendArpRequest(net, dstIp) ? syscall_error(SysErrAgain) : syscall_error(SysErrNoEntry);
-    }
-    return sendTcpFrame(net, dstIp, dstMac, srcPort, dstPort, 1, 0, kTcpFlagSyn, nullptr, 0)
-        ? syscall_error(SysErrAgain)
-        : syscall_error(SysErrNoEntry);
-}
-
-uint64_t netSendTcpPayload(uint16_t srcPort, const uint8_t* dstAddress, uint64_t dstAddressLength, uint32_t seq, uint32_t ack, uint64_t buffer, uint64_t length) {
-    if (!dstAddress || dstAddressLength < 8 || srcPort == 0 || length > NET_DEVICE_MTU - sizeof(EthernetHeader) - sizeof(Ipv4Header) - sizeof(TcpHeader)) {
-        return syscall_error(SysErrInvalid);
+bool netTransmitTcpSegment(
+    uint16_t srcPort,
+    const uint8_t* peerAddress,
+    uint64_t peerAddressLength,
+    uint32_t seq,
+    uint32_t ack,
+    uint8_t flags,
+    uint16_t window,
+    const uint8_t* payload,
+    size_t payloadLength
+) {
+    if (!peerAddress || peerAddressLength < 8 || srcPort == 0 ||
+        payloadLength > NET_DEVICE_MTU - sizeof(EthernetHeader) - sizeof(Ipv4Header) - sizeof(TcpHeader)) {
+        return false;
     }
 
     uint32_t dstIpNetworkOrder = 0;
     uint16_t dstPort = 0;
-    memcpy(&dstIpNetworkOrder, dstAddress + 4, sizeof(dstIpNetworkOrder));
-    memcpy(&dstPort, dstAddress + 2, sizeof(dstPort));
+    memcpy(&dstPort, peerAddress + 2, sizeof(dstPort));
+    memcpy(&dstIpNetworkOrder, peerAddress + 4, sizeof(dstIpNetworkOrder));
     const uint32_t dstIp = fromNetwork32(dstIpNetworkOrder);
     if (dstIp == 0 || dstPort == 0) {
-        return syscall_error(SysErrInvalid);
-    }
-
-    uint8_t payload[NET_DEVICE_MTU] {};
-    if (length != 0 && !Syscall::copyFromUser(payload, buffer, static_cast<size_t>(length))) {
-        return syscall_error(SysErrInvalid);
+        return false;
     }
 
     NetDevice* netDev = NetDeviceRegistry::active();
     if (!netDev) {
-        return syscall_error(SysErrNoEntry);
+        return false;
     }
     NetDevice& net = *netDev;
+
+    // Resolve ARP for the next hop (gateway for off-subnet destinations)
+    // synchronously so a cold cache does not silently drop the segment.
     uint8_t dstMac[6] {};
-    if (!lookupArp(dstIp, dstMac)) {
-        return sendArpRequest(net, dstIp) ? syscall_error(SysErrAgain) : syscall_error(SysErrNoEntry);
+    if (!resolveArpBlocking(net, nextHopIp(dstIp), dstMac)) {
+        return false;
     }
-    return sendTcpFrame(net, dstIp, dstMac, srcPort, dstPort, seq, ack, kTcpFlagPsh | kTcpFlagAck, payload, static_cast<size_t>(length))
-        ? length
-        : syscall_error(SysErrAgain);
+
+    return sendTcpFrame(net, dstIp, dstMac, srcPort, dstPort, seq, ack, flags, window,
+                        payload, payloadLength);
 }
 
 uint64_t Syscall::sys_net_get_mac(uint64_t macPtr) {
@@ -742,7 +721,21 @@ uint64_t Syscall::sys_net_process_packets() {
     if (!netDev) {
         return syscall_error(SysErrNoEntry);
     }
-    return pumpPackets(*netDev);
+    const uint64_t processed = pumpPackets(*netDev);
+    // Drive TCP retransmission/timers once per pump (top-level only, so we do
+    // not recurse through resolveArpBlocking -> pumpPackets).
+    socketTcpTick();
+    return processed;
+}
+
+uint64_t netPumpOnce() {
+    NetDevice* netDev = NetDeviceRegistry::active();
+    if (!netDev) {
+        return 0;
+    }
+    const uint64_t processed = pumpPackets(*netDev);
+    socketTcpTick();
+    return processed;
 }
 
 uint64_t Syscall::sys_net_get_ping_reply(uint64_t replyPtr) {
