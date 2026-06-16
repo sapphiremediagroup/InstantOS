@@ -210,6 +210,94 @@ uint8_t acpiObjectTypeValue(ObjectType type) {
     }
 }
 
+char hexDigit(uint8_t value) {
+    return value < 10 ? static_cast<char>('0' + value)
+                      : static_cast<char>('A' + (value - 10));
+}
+
+// Decode a 32-bit EISA ID (as stored in a _HID/_CID integer) into the classic
+// 7-character "AAA1234" PNP/ACPI identifier string. The first dword is stored
+// big-endian within the integer: three 5-bit compressed letters followed by a
+// 4-hex-digit product id. Returns the number of characters written (7), or 0.
+size_t decodeEisaId(uint32_t id, char out[8]) {
+    // The compressed letters live in the low 16 bits (swapped to big-endian).
+    const uint16_t mfg = static_cast<uint16_t>((id & 0xFF) << 8 | ((id >> 8) & 0xFF));
+    out[0] = static_cast<char>('A' + ((mfg >> 10) & 0x1F) - 1);
+    out[1] = static_cast<char>('A' + ((mfg >> 5) & 0x1F) - 1);
+    out[2] = static_cast<char>('A' + (mfg & 0x1F) - 1);
+    // The product ID is the upper two bytes rendered as four hex digits, most
+    // significant nibble first, in byte order (byte2 then byte3).
+    const uint8_t b2 = (id >> 16) & 0xFF;
+    const uint8_t b3 = (id >> 24) & 0xFF;
+    out[3] = hexDigit(b2 >> 4);
+    out[4] = hexDigit(b2 & 0xF);
+    out[5] = hexDigit(b3 >> 4);
+    out[6] = hexDigit(b3 & 0xF);
+    out[7] = 0;
+
+    for (size_t i = 0; i < 3; ++i) {
+        if (out[i] < 'A' || out[i] > 'Z') {
+            return 0;
+        }
+    }
+    return 7;
+}
+
+// Render an _HID/_CID Object (either an EISA-encoded integer or a string) into
+// a NUL-terminated identifier in `out` (capacity `cap`). Returns chars written.
+size_t hidToString(const Object& obj, char* out, size_t cap) {
+    if (cap == 0) {
+        return 0;
+    }
+    out[0] = 0;
+    if (obj.type == ObjectType::Integer) {
+        char decoded[8];
+        if (decodeEisaId(static_cast<uint32_t>(obj.integer), decoded) == 0) {
+            return 0;
+        }
+        size_t i = 0;
+        for (; decoded[i] && i + 1 < cap; ++i) {
+            out[i] = decoded[i];
+        }
+        out[i] = 0;
+        return i;
+    }
+    if (obj.type == ObjectType::String && obj.string) {
+        size_t i = 0;
+        for (; i < obj.length && obj.string[i] && i + 1 < cap; ++i) {
+            out[i] = obj.string[i];
+        }
+        out[i] = 0;
+        return i;
+    }
+    return 0;
+}
+
+bool asciiEqualsIgnoreCase(const char* a, const char* b) {
+    if (!a || !b) {
+        return false;
+    }
+    while (*a && *b) {
+        char ca = *a;
+        char cb = *b;
+        if (ca >= 'a' && ca <= 'z') ca = static_cast<char>(ca - 32);
+        if (cb >= 'a' && cb <= 'z') cb = static_cast<char>(cb - 32);
+        if (ca != cb) {
+            return false;
+        }
+        ++a;
+        ++b;
+    }
+    return *a == 0 && *b == 0;
+}
+
+constexpr char kPnpHidName[4] = { '_', 'H', 'I', 'D' };
+constexpr char kPnpCidName[4] = { '_', 'C', 'I', 'D' };
+constexpr char kPnpAdrName[4] = { '_', 'A', 'D', 'R' };
+constexpr char kPnpUidName[4] = { '_', 'U', 'I', 'D' };
+constexpr char kPnpStaName[4] = { '_', 'S', 'T', 'A' };
+constexpr char kPnpCrsName[4] = { '_', 'C', 'R', 'S' };
+
 }
 
 struct NamespaceNode {
@@ -1058,6 +1146,434 @@ bool Interpreter::getS5SleepTypes(uint16_t* slpTypA, uint16_t* slpTypB) {
     *slpTypA = static_cast<uint16_t>(first & 0x7);
     *slpTypB = static_cast<uint16_t>(second & 0x7);
     return true;
+}
+
+size_t Interpreter::nodePath(NamespaceNode* node, char* out, size_t cap) {
+    if (!node || !out || cap == 0) {
+        return 0;
+    }
+
+    // Collect ancestors from the node up to (but excluding) the root, then emit
+    // them in forward order separated by '.', prefixed with the root '\'.
+    NamespaceNode* chain[32];
+    size_t count = 0;
+    for (NamespaceNode* cur = node; cur && cur != root && count < 32; cur = cur->parent) {
+        chain[count++] = cur;
+    }
+
+    size_t pos = 0;
+    auto put = [&](char c) {
+        if (pos + 1 < cap) {
+            out[pos++] = c;
+        }
+    };
+
+    put('\\');
+    for (size_t i = count; i > 0; --i) {
+        NamespaceNode* seg = chain[i - 1];
+        // Names are 4 chars, trailing-'_' padded (e.g. "_SB_"); emit only the
+        // significant prefix so paths read canonically ("_SB").
+        size_t significant = 4;
+        while (significant > 0 && seg->name[significant - 1] == '_') {
+            --significant;
+        }
+        // A name that is entirely underscores (or empty) keeps at least one char.
+        if (significant == 0) {
+            significant = 1;
+        }
+        for (size_t j = 0; j < significant; ++j) {
+            if (seg->name[j] != 0) {
+                put(seg->name[j]);
+            }
+        }
+        if (i > 1) {
+            put('.');
+        }
+    }
+    out[pos < cap ? pos : cap - 1] = 0;
+    return pos;
+}
+
+bool Interpreter::evaluateChildObject(NamespaceNode* device, const char name[4], Object* out) {
+    if (!device || !out) {
+        return false;
+    }
+    NamespaceNode* child = findChild(device, name);
+    if (!child || !child->defined) {
+        return false;
+    }
+    ExecutionContext context;
+    context.interpreter = this;
+    context.scope = device;
+    return evaluateNamedObject(context, child, out);
+}
+
+bool Interpreter::evaluateChildInteger(NamespaceNode* device, const char name[4], uint64_t* value) {
+    Object obj;
+    if (!evaluateChildObject(device, name, &obj)) {
+        return false;
+    }
+    return objectToInteger(obj, value);
+}
+
+bool Interpreter::describeDevice(NamespaceNode* node, DeviceInfo* out) {
+    if (!node || !out || node->object.type != ObjectType::Device) {
+        return false;
+    }
+
+    *out = DeviceInfo{};
+    out->node = node;
+    nodePath(node, out->path, sizeof(out->path));
+
+    Object hidObj;
+    if (evaluateChildObject(node, kPnpHidName, &hidObj)) {
+        hidToString(hidObj, out->hid, sizeof(out->hid));
+    }
+
+    Object cidObj;
+    if (evaluateChildObject(node, kPnpCidName, &cidObj)) {
+        // _CID may be a single value or a package of compatible IDs; take the
+        // first that decodes to a usable identifier.
+        if (cidObj.type == ObjectType::Package && cidObj.elements) {
+            for (size_t i = 0; i < cidObj.elementCount; ++i) {
+                if (hidToString(cidObj.elements[i], out->cid, sizeof(out->cid)) != 0) {
+                    break;
+                }
+            }
+        } else {
+            hidToString(cidObj, out->cid, sizeof(out->cid));
+        }
+    }
+
+    uint64_t value = 0;
+    if (evaluateChildInteger(node, kPnpAdrName, &value)) {
+        out->adr = value;
+        out->hasAdr = true;
+    }
+    if (evaluateChildInteger(node, kPnpUidName, &value)) {
+        out->uid = value;
+        out->hasUid = true;
+    }
+
+    // _STA defaults to 0x0F (present + enabled + UI + functioning) when absent,
+    // per the ACPI specification.
+    if (evaluateChildInteger(node, kPnpStaName, &value)) {
+        out->sta = static_cast<uint32_t>(value);
+    } else {
+        out->sta = 0x0F;
+    }
+    out->present = (out->sta & 0x1) != 0;
+    out->enabled = (out->sta & 0x2) != 0;
+    return true;
+}
+
+void Interpreter::walkDevices(NamespaceNode* node, DeviceCallback callback, void* context, bool* stop) {
+    if (!node || *stop) {
+        return;
+    }
+
+    for (NamespaceNode* child = node->child; child && !*stop; child = child->next) {
+        if (child->object.type == ObjectType::Device) {
+            DeviceInfo info;
+            if (describeDevice(child, &info)) {
+                if (!callback(info, context)) {
+                    *stop = true;
+                    return;
+                }
+            }
+        }
+        // Recurse into Devices, Scopes and other container nodes so nested buses
+        // (e.g. \_SB.PCI0.I2C1.<peripheral>) are discovered.
+        walkDevices(child, callback, context, stop);
+    }
+}
+
+void Interpreter::forEachDevice(DeviceCallback callback, void* context) {
+    if (!initialized || !callback || !root) {
+        return;
+    }
+    bool stop = false;
+    walkDevices(root, callback, context, &stop);
+}
+
+NamespaceNode* Interpreter::findDeviceByHidRecursive(NamespaceNode* node, const char* hid) {
+    if (!node) {
+        return nullptr;
+    }
+    for (NamespaceNode* child = node->child; child; child = child->next) {
+        if (child->object.type == ObjectType::Device) {
+            DeviceInfo info;
+            if (describeDevice(child, &info)) {
+                if (asciiEqualsIgnoreCase(info.hid, hid) ||
+                    asciiEqualsIgnoreCase(info.cid, hid)) {
+                    return child;
+                }
+            }
+        }
+        NamespaceNode* found = findDeviceByHidRecursive(child, hid);
+        if (found) {
+            return found;
+        }
+    }
+    return nullptr;
+}
+
+NamespaceNode* Interpreter::findDeviceByHid(const char* hid) {
+    if (!initialized || !hid || !root) {
+        return nullptr;
+    }
+    return findDeviceByHidRecursive(root, hid);
+}
+
+size_t Interpreter::readDeviceResources(NamespaceNode* node, AcpiResource* outResources,
+                                        size_t maxResources) {
+    if (!node || !outResources || maxResources == 0 ||
+        node->object.type != ObjectType::Device) {
+        return 0;
+    }
+
+    Object crs;
+    if (!evaluateChildObject(node, kPnpCrsName, &crs)) {
+        return 0;
+    }
+    if (crs.type != ObjectType::Buffer || !crs.buffer || crs.length == 0) {
+        return 0;
+    }
+    return parseCrsBuffer(crs.buffer, crs.length, outResources, maxResources);
+}
+
+size_t Interpreter::parseCrsBuffer(const uint8_t* data, size_t length, AcpiResource* out,
+                                   size_t maxResources) {
+    size_t produced = 0;
+    size_t i = 0;
+
+    while (i < length && produced < maxResources) {
+        const uint8_t tag = data[i];
+
+        if ((tag & 0x80) == 0) {
+            // Small resource descriptor: bits[2:0] of the length follow the tag.
+            const uint8_t name = (tag >> 3) & 0x0F;
+            const size_t len = tag & 0x07;
+            const size_t bodyStart = i + 1;
+            if (bodyStart + len > length) {
+                break;
+            }
+            const uint8_t* body = data + bodyStart;
+
+            if (name == 0x04 && len >= 2) {
+                // IRQ descriptor: 16-bit mask of ISA IRQs, optional flags byte.
+                AcpiResource& r = out[produced];
+                r = AcpiResource{};
+                r.kind = ResourceKind::Irq;
+                const uint16_t mask = static_cast<uint16_t>(body[0] | (body[1] << 8));
+                for (uint8_t bit = 0; bit < 16 && r.interruptCount < 16; ++bit) {
+                    if (mask & (1u << bit)) {
+                        r.interrupts[r.interruptCount++] = bit;
+                    }
+                }
+                if (len >= 3) {
+                    const uint8_t flags = body[2];
+                    r.levelTriggered = (flags & 0x01) == 0;
+                    r.activeLow = (flags & 0x08) != 0;
+                    r.shared = (flags & 0x10) != 0;
+                }
+                ++produced;
+            } else if (name == 0x05 && len >= 2) {
+                // DMA descriptor: 8-bit channel mask.
+                AcpiResource& r = out[produced];
+                r = AcpiResource{};
+                r.kind = ResourceKind::Dma;
+                for (uint8_t bit = 0; bit < 8 && r.interruptCount < 16; ++bit) {
+                    if (body[0] & (1u << bit)) {
+                        r.interrupts[r.interruptCount++] = bit;
+                    }
+                }
+                ++produced;
+            } else if (name == 0x08 && len >= 7) {
+                // I/O port descriptor.
+                AcpiResource& r = out[produced];
+                r = AcpiResource{};
+                r.kind = ResourceKind::Io;
+                r.base = static_cast<uint16_t>(body[1] | (body[2] << 8)); // min base
+                r.length = body[6];                                        // range length
+                ++produced;
+            } else if (name == 0x09 && len >= 3) {
+                // Fixed I/O port descriptor.
+                AcpiResource& r = out[produced];
+                r = AcpiResource{};
+                r.kind = ResourceKind::Io;
+                r.base = static_cast<uint16_t>(body[0] | (body[1] << 8));
+                r.length = body[2];
+                ++produced;
+            }
+
+            if (name == 0x0F) { // End tag
+                break;
+            }
+            i = bodyStart + len;
+            continue;
+        }
+
+        // Large resource descriptor: tag byte + 2-byte little-endian length.
+        if (i + 3 > length) {
+            break;
+        }
+        const uint8_t name = tag & 0x7F;
+        const size_t len = static_cast<size_t>(data[i + 1]) | (static_cast<size_t>(data[i + 2]) << 8);
+        const size_t bodyStart = i + 3;
+        if (bodyStart + len > length) {
+            break;
+        }
+        const uint8_t* body = data + bodyStart;
+
+        switch (name) {
+            case 0x01: { // 24-bit Memory Range
+                if (len >= 9) {
+                    AcpiResource& r = out[produced];
+                    r = AcpiResource{};
+                    r.kind = ResourceKind::Memory;
+                    r.base = static_cast<uint64_t>(readLe16(body + 1)) << 8;
+                    r.length = static_cast<uint64_t>(readLe16(body + 7)) << 8;
+                    ++produced;
+                }
+                break;
+            }
+            case 0x05: { // 32-bit Memory Range
+                if (len >= 17) {
+                    AcpiResource& r = out[produced];
+                    r = AcpiResource{};
+                    r.kind = ResourceKind::Memory;
+                    r.base = readLe32(body + 4);
+                    r.length = readLe32(body + 16);
+                    ++produced;
+                }
+                break;
+            }
+            case 0x06: { // 32-bit Fixed Memory Range
+                if (len >= 9) {
+                    AcpiResource& r = out[produced];
+                    r = AcpiResource{};
+                    r.kind = ResourceKind::Memory;
+                    r.base = readLe32(body + 1);
+                    r.length = readLe32(body + 5);
+                    ++produced;
+                }
+                break;
+            }
+            case 0x09: { // Extended Interrupt Descriptor
+                if (len >= 3) {
+                    AcpiResource& r = out[produced];
+                    r = AcpiResource{};
+                    r.kind = ResourceKind::Irq;
+                    const uint8_t flags = body[0];
+                    r.levelTriggered = (flags & 0x02) == 0;
+                    r.activeLow = (flags & 0x04) != 0;
+                    r.shared = (flags & 0x08) != 0;
+                    const uint8_t tableLen = body[1];
+                    size_t off = 2;
+                    for (uint8_t n = 0; n < tableLen && r.interruptCount < 16 && off + 4 <= len; ++n) {
+                        r.interrupts[r.interruptCount++] = readLe32(body + off);
+                        off += 4;
+                    }
+                    ++produced;
+                }
+                break;
+            }
+            case 0x0A: { // QWord Address Space (memory or I/O)
+                if (len >= 43) {
+                    AcpiResource& r = out[produced];
+                    r = AcpiResource{};
+                    r.kind = body[0] == 0 ? ResourceKind::Memory : ResourceKind::Io;
+                    r.base = readLe64(body + 13);   // _MIN
+                    r.length = readLe64(body + 37); // _LEN
+                    ++produced;
+                }
+                break;
+            }
+            case 0x07: { // DWord Address Space
+                if (len >= 23) {
+                    AcpiResource& r = out[produced];
+                    r = AcpiResource{};
+                    r.kind = body[0] == 0 ? ResourceKind::Memory : ResourceKind::Io;
+                    r.base = readLe32(body + 7);    // _MIN
+                    r.length = readLe32(body + 19); // _LEN
+                    ++produced;
+                }
+                break;
+            }
+            case 0x0C: { // GPIO Connection Descriptor
+                if (len >= 22) {
+                    AcpiResource& r = out[produced];
+                    r = AcpiResource{};
+                    const uint8_t connType = body[2]; // 0=interrupt, 1=I/O
+                    r.kind = connType == 0 ? ResourceKind::GpioInt : ResourceKind::GpioIo;
+                    const uint16_t intFlags = readLe16(body + 3);
+                    r.levelTriggered = (intFlags & 0x01) == 0;
+                    r.activeLow = ((intFlags >> 1) & 0x03) == 0x01;
+                    r.shared = (intFlags & 0x08) != 0;
+                    // Pin table offset (body+0x0E) lists 16-bit pin numbers.
+                    const uint16_t pinOffset = readLe16(body + 14);
+                    const uint16_t resSrcOffset = readLe16(body + 17);
+                    for (size_t p = pinOffset; p + 2 <= len && p + 2 <= resSrcOffset &&
+                                               r.interruptCount < 16; p += 2) {
+                        r.interrupts[r.interruptCount++] = readLe16(body + p);
+                    }
+                    const uint16_t resSrcNameOffset = readLe16(body + 17);
+                    if (resSrcNameOffset && resSrcNameOffset < len) {
+                        r.resourceSource = reinterpret_cast<const char*>(body + resSrcNameOffset);
+                        r.resourceSourceLength = len - resSrcNameOffset;
+                    }
+                    ++produced;
+                }
+                break;
+            }
+            case 0x0E: { // Serial Bus Connection Descriptor (I2C/SPI/UART)
+                if (len >= 9) {
+                    const uint8_t busType = body[2]; // 1=I2C, 2=SPI, 3=UART
+                    AcpiResource& r = out[produced];
+                    r = AcpiResource{};
+                    // Type-specific data starts after the 9-byte common header
+                    // plus the vendor-defined length fields.
+                    const uint8_t* typeData = body + 9;
+                    const size_t typeDataLen = (len > 9) ? (len - 9) : 0;
+                    if (busType == 1 && typeDataLen >= 6) { // I2C
+                        r.kind = ResourceKind::I2cSerialBus;
+                        r.busSpeedHz = readLe32(typeData);
+                        r.serialAddress = readLe16(typeData + 4);
+                    } else if (busType == 2 && typeDataLen >= 9) { // SPI
+                        r.kind = ResourceKind::SpiSerialBus;
+                        r.busSpeedHz = readLe32(typeData);
+                        // ConnectionSpeed(4) DataBitLength(1) Phase(1)
+                        // Polarity(1) DeviceSelection(2)
+                        r.serialAddress = readLe16(typeData + 7);
+                    } else if (busType == 3 && typeDataLen >= 4) { // UART
+                        r.kind = ResourceKind::UartSerialBus;
+                        r.busSpeedHz = readLe32(typeData);
+                    } else {
+                        break;
+                    }
+                    // Resource source (parent controller path) follows the
+                    // type-specific data block. Its length is given by the type
+                    // data length field at body[7..8]; anything after that in the
+                    // descriptor body is the NUL-terminated controller name.
+                    const uint16_t typeDataLenField = readLe16(body + 7);
+                    const size_t resSrcOff = 9 + typeDataLenField;
+                    if (resSrcOff < len) {
+                        r.resourceSource = reinterpret_cast<const char*>(body + resSrcOff);
+                        r.resourceSourceLength = len - resSrcOff;
+                    }
+                    ++produced;
+                }
+                break;
+            }
+            default:
+                break;
+        }
+
+        i = bodyStart + len;
+    }
+
+    return produced;
 }
 
 bool Interpreter::evaluateNamedObject(ExecutionContext& context, NamespaceNode* node, Object* result) {

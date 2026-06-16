@@ -32,6 +32,15 @@ public:
     AML::Interpreter& aml();
     bool evaluateAml(const char* path, AML::Object* result);
 
+    // Device enumeration over the AML namespace. These thin wrappers ensure the
+    // namespace has been loaded (DSDT + SSDTs) before walking it, so drivers can
+    // discover USB/I2C/SPI/GPIO peripherals by hardware ID and read their _CRS
+    // resources. Returns false / nullptr / 0 when AML is unavailable.
+    bool forEachDevice(AML::Interpreter::DeviceCallback callback, void* context);
+    AML::NamespaceNode* findDeviceByHid(const char* hid);
+    size_t readDeviceResources(AML::NamespaceNode* node, AML::AcpiResource* outResources,
+                               size_t maxResources);
+
     // PCIe ECAM (MCFG) accessors. Returns the MMIO base for a given
     // segment/bus/device/function, or 0 if no ECAM region covers it (callers
     // should then fall back to legacy 0xCF8/0xCFC config access on segment 0).

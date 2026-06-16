@@ -788,6 +788,37 @@ bool ACPI::evaluateAml(const char* path, AML::Object* result) {
     return amlInterpreter.evaluate(path, result);
 }
 
+bool ACPI::forEachDevice(AML::Interpreter::DeviceCallback callback, void* context) {
+    if (!callback) {
+        return false;
+    }
+    enumerate(); // ensure DSDT + SSDTs are loaded into the namespace
+    if (!amlInitialized) {
+        return false;
+    }
+    amlInterpreter.forEachDevice(callback, context);
+    return true;
+}
+
+AML::NamespaceNode* ACPI::findDeviceByHid(const char* hid) {
+    if (!hid) {
+        return nullptr;
+    }
+    enumerate();
+    if (!amlInitialized) {
+        return nullptr;
+    }
+    return amlInterpreter.findDeviceByHid(hid);
+}
+
+size_t ACPI::readDeviceResources(AML::NamespaceNode* node, AML::AcpiResource* outResources,
+                                 size_t maxResources) {
+    if (!node || !outResources || maxResources == 0 || !amlInitialized) {
+        return 0;
+    }
+    return amlInterpreter.readDeviceResources(node, outResources, maxResources);
+}
+
 void ACPI::shutdown() {
     rsdp = nullptr;
     rsdt = nullptr;
