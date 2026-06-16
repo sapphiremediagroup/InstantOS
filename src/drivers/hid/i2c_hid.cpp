@@ -216,6 +216,8 @@ void log_str(const char* s) {
     Cereal::get().write(s);
 }
 
+void log_table_signature(const char* signature);
+
 void log_hex(uint64_t value) {
     Cereal::get().write("0x");
     bool started = false;
@@ -1316,8 +1318,38 @@ void scan_aml_devices(const char* signature, const uint8_t* data, size_t length,
         size_t resourceLength = 0;
         if (find_crs_buffer(body, bodyLength, &resourceData, &resourceLength)) {
             parse_resource_template(resourceData, resourceLength, device);
+        } else {
+            size_t crsOffset = 0;
+            if (scan_bytes_for(body, bodyLength, "_CRS", 4, &crsOffset)) {
+                log_str("[i2c:hid] ");
+                log_table_signature(signature);
+                log_str(":");
+                for (size_t n = 0; n < 4; n++) {
+                    Cereal::get().write(static_cast<char>(data[nameOffset + n]));
+                }
+                log_str(" has _CRS but not a static ResourceTemplate buffer offset=");
+                log_hex(crsOffset);
+                log_str("; AML method evaluation is not implemented yet\n");
+            } else {
+                log_str("[i2c:hid] ");
+                log_table_signature(signature);
+                log_str(":");
+                for (size_t n = 0; n < 4; n++) {
+                    Cereal::get().write(static_cast<char>(data[nameOffset + n]));
+                }
+                log_str(" has HID-over-I2C _HID but no _CRS resource found\n");
+            }
         }
         device.hasDescriptorRegister = find_hid_descriptor_register(body, bodyLength, &device.descriptorRegister);
+        if (!device.hasDescriptorRegister) {
+            log_str("[i2c:hid] ");
+            log_table_signature(signature);
+            log_str(":");
+            for (size_t n = 0; n < 4; n++) {
+                Cereal::get().write(static_cast<char>(data[nameOffset + n]));
+            }
+            log_str(" missing HID descriptor register from _DSM UUID scan\n");
+        }
 
         scan->driver->recordAmlDevice(device);
     }

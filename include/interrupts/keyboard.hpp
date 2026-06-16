@@ -195,6 +195,9 @@ public:
         const bool inputPosted = postInputManagerEvent(event);
         const bool buffered = appendToBuffer(c, prefix);
         Scheduler::get().wakeAllBlockedProcesses();
+        (void)windowPosted;
+        (void)inputPosted;
+        (void)buffered;
         return true;
     }
 
