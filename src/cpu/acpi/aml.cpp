@@ -1342,6 +1342,35 @@ size_t Interpreter::readDeviceResources(NamespaceNode* node, AcpiResource* outRe
     return parseCrsBuffer(crs.buffer, crs.length, outResources, maxResources);
 }
 
+size_t Interpreter::readNodeResources(NamespaceNode* node, AcpiResource* outResources,
+                                      size_t maxResources) {
+    if (!node || !outResources || maxResources == 0) {
+        return 0;
+    }
+    Object crs;
+    if (!evaluateChildObject(node, kPnpCrsName, &crs)) {
+        return 0;
+    }
+    if (crs.type != ObjectType::Buffer || !crs.buffer || crs.length == 0) {
+        return 0;
+    }
+    return parseCrsBuffer(crs.buffer, crs.length, outResources, maxResources);
+}
+
+bool Interpreter::evaluateDeviceObject(NamespaceNode* device, const char name[4], Object* out) {
+    if (!initialized) {
+        return false;
+    }
+    return evaluateChildObject(device, name, out);
+}
+
+NamespaceNode* Interpreter::resolvePath(const char* path, NamespaceNode* scope) {
+    if (!initialized || !path) {
+        return nullptr;
+    }
+    return resolveAsciiPath(path, scope ? scope : root, false);
+}
+
 size_t Interpreter::parseCrsBuffer(const uint8_t* data, size_t length, AcpiResource* out,
                                    size_t maxResources) {
     size_t produced = 0;

@@ -135,6 +135,20 @@ public:
     // `out` (capacity `cap`). Returns the number of characters written.
     size_t nodePath(NamespaceNode* node, char* out, size_t cap);
 
+    // Evaluate a named child object of a device node (e.g. "_PRT", "_BBN",
+    // "_SEG", "_ADR") and copy the result into `out`. Returns false if the
+    // child does not exist or evaluation fails. Useful for PCI routing where a
+    // host-bridge device exposes a _PRT package.
+    bool evaluateDeviceObject(NamespaceNode* device, const char name[4], Object* out);
+
+    // Resolve an absolute or scope-relative ASCII namespace path (e.g. a _PRT
+    // entry's Source link device) to its node. Returns nullptr if not found.
+    NamespaceNode* resolvePath(const char* path, NamespaceNode* scope = nullptr);
+
+    // Parse the _CRS of an interrupt-link device into resources (same format as
+    // readDeviceResources but accepts any node, e.g. a PNP0C0F link).
+    size_t readNodeResources(NamespaceNode* node, AcpiResource* outResources, size_t maxResources);
+
     size_t namespaceNodeCount() const { return nodeCount; }
     bool isInitialized() const { return initialized; }
 
