@@ -110,6 +110,12 @@ public:
     static int nodeMkdir(VNode* parent, const char* name, uint32_t mode, VNode** result);
     static int nodeUnlink(VNode* parent, const char* name);
     static int nodeRmdir(VNode* parent, const char* name);
+    static int nodeTruncate(VNode* node, uint64_t size);
+    static int nodeRename(VNode* oldParent, const char* oldName, VNode* newParent, const char* newName);
+    static int nodeChmod(VNode* node, uint32_t mode);
+    static int nodeUtime(VNode* node, uint64_t atime, uint64_t mtime);
+    static int nodeStatfs(VNode* node, FsStats* stats);
+    static int nodeChown(VNode* node, uint32_t uid, uint32_t gid);
     
     bool readCluster(uint32_t cluster, void* buffer);
     bool writeCluster(uint32_t cluster, const void* buffer);
@@ -117,6 +123,7 @@ public:
     bool setNextCluster(uint32_t cluster, uint32_t value);
     uint32_t allocateCluster();
     bool freeClusterChain(uint32_t startCluster);
+    bool updateDirEntry(uint32_t parentCluster, const char* name, uint32_t newSize, uint32_t firstCluster);
     
 
     
@@ -124,7 +131,7 @@ private:
     BlockDevice* device;
     FAT32BPB bpb;
     VNode* rootNode;
-    VNodeOps ops;
+    VNodeOps ops{};
     
     uint32_t fatStart;
     uint32_t dataStart;

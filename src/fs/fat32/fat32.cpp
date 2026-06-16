@@ -15,10 +15,12 @@ FAT32FS::FAT32FS(BlockDevice* device) : FileSystem("fat32"), device(device), roo
     ops.mkdir = nodeMkdir;
     ops.unlink = nodeUnlink;
     ops.rmdir = nodeRmdir;
-    ops.truncate = nullptr;
-    ops.rename = nullptr;
-    ops.chmod = nullptr;
-    ops.utime = nullptr;
+    ops.truncate = nodeTruncate;
+    ops.rename = nodeRename;
+    ops.chmod = nodeChmod;
+    ops.utime = nodeUtime;
+    ops.statfs = nodeStatfs;
+    ops.chown = nodeChown;
     ops.link = nullptr;
 }
 
@@ -238,6 +240,33 @@ bool FAT32FS::freeClusterChain(uint32_t startCluster) {
     }
     
     return true;
+}
+
+// Update a file's directory entry on disk: its size and first-cluster fields.
+// Used after writes/truncates so the on-disk metadata stays consistent.
+bool FAT32FS::updateDirEntry(uint32_t parentCluster, const char* name, uint32_t newSize, uint32_t firstCluster) {
+    FAT32DirEntry entry;
+    uint32_t entryCluster = 0;
+    uint32_t entryOffset = 0;
+    if (!findEntry(parentCluster, name, &entry, &entryCluster, &entryOffset)) {
+        return false;
+    }
+
+    void* buffer = kmalloc(clusterSize);
+    if (!buffer) return false;
+    if (!readCluster(entryCluster, buffer)) {
+        kfree(buffer);
+        return false;
+    }
+
+    FAT32DirEntry* e = (FAT32DirEntry*)((uint8_t*)buffer + entryOffset);
+    e->fileSize = newSize;
+    e->fstClusHI = (firstCluster >> 16) & 0xFFFF;
+    e->fstClusLO = firstCluster & 0xFFFF;
+
+    bool result = writeCluster(entryCluster, buffer);
+    kfree(buffer);
+    return result;
 }
 
 void FAT32FS::shortNameFromLong(const char* longName, char* shortName) {
@@ -709,8 +738,51 @@ int64_t FAT32FS::nodeWrite(VNode* node, const void* buffer, uint64_t size, uint6
     if (offset + size > fatNode->size) {
         fatNode->size = offset + size;
     }
+
+    // Persist the updated size and first cluster to the directory entry so the
+    // file metadata survives and reads see the correct length.
+    bool upd = fs->updateDirEntry(fatNode->parentCluster, fatNode->name, fatNode->size, fatNode->cluster);
+    Console::get().drawText("[fat.write] name='"); Console::get().drawText(fatNode->name);
+    Console::get().drawText("' off="); Console::get().drawNumber((int64_t)offset);
+    Console::get().drawText(" size="); Console::get().drawNumber((int64_t)size);
+    Console::get().drawText(" newSize="); Console::get().drawNumber((int64_t)fatNode->size);
+    Console::get().drawText(" pcl="); Console::get().drawNumber((int64_t)fatNode->parentCluster);
+    Console::get().drawText(" upd="); Console::get().drawNumber(upd ? 1 : 0);
+    Console::get().drawText("\n");
     
     return bytesWritten;
+}
+
+int FAT32FS::nodeTruncate(VNode* node, uint64_t size) {
+    if (!node) return -1;
+
+    FAT32Node* fatNode = (FAT32Node*)node->getData();
+    if (!fatNode || fatNode->isDirectory) return -1;
+
+    FAT32FS* fs = (FAT32FS*)node->getFS();
+
+    // Only truncation to zero is supported for now (the common O_TRUNC case).
+    // Free any existing cluster chain past the first cluster and reset size.
+    if (size == 0) {
+        if (fatNode->cluster >= 2 && fatNode->cluster < FAT32_EOC) {
+            uint32_t next = fs->getNextCluster(fatNode->cluster);
+            if (next >= 2 && next < FAT32_EOC) {
+                fs->freeClusterChain(next);
+            }
+            // Keep the first cluster but mark it end-of-chain.
+            fs->setNextCluster(fatNode->cluster, FAT32_EOC);
+        }
+        fatNode->size = 0;
+        fs->updateDirEntry(fatNode->parentCluster, fatNode->name, 0, fatNode->cluster);
+        return 0;
+    }
+
+    // Growing/partial truncation not yet implemented; treat as success if the
+    // requested size matches the current size, otherwise reject.
+    if (size == fatNode->size) {
+        return 0;
+    }
+    return -1;
 }
 
 int FAT32FS::nodeStat(VNode* node, FileStats* stats) {
@@ -726,6 +798,10 @@ int FAT32FS::nodeStat(VNode* node, FileStats* stats) {
     stats->atime = 0;
     stats->mtime = 0;
     stats->ctime = 0;
+    stats->uid = 0;
+    stats->gid = 0;
+    stats->rdev = 0;
+    stats->dev = reinterpret_cast<uint64_t>(node->getFS());
     
     if (fatNode->isDirectory) {
         stats->type = FileType::Directory;
@@ -990,6 +1066,167 @@ int FAT32FS::nodeUnlink(VNode* parent, const char* name) {
         fs->freeClusterChain(cluster);
     }
     
+    return 0;
+}
+
+// Rename/move a file or directory within this FAT32 volume. Implemented as
+// "create new directory entry referencing the same cluster chain, then remove
+// the old entry" so file data is never copied. The cluster chain (and thus the
+// file contents) is preserved; only directory entries change.
+int FAT32FS::nodeRename(VNode* oldParent, const char* oldName, VNode* newParent, const char* newName) {
+    if (!oldParent || !oldName || !newParent || !newName) return -1;
+
+    FAT32Node* oldParentNode = (FAT32Node*)oldParent->getData();
+    FAT32Node* newParentNode = (FAT32Node*)newParent->getData();
+    if (!oldParentNode || !oldParentNode->isDirectory) return -1;
+    if (!newParentNode || !newParentNode->isDirectory) return -1;
+
+    FAT32FS* fs = (FAT32FS*)oldParent->getFS();
+    if (fs != (FAT32FS*)newParent->getFS()) return -1;  // same volume only
+
+    // Locate the source entry.
+    FAT32DirEntry srcEntry;
+    if (!fs->findEntry(oldParentNode->cluster, oldName, &srcEntry, nullptr, nullptr)) {
+        return -1;  // source does not exist
+    }
+
+    const uint8_t srcAttr = srcEntry.attr;
+    const bool srcIsDir = (srcAttr & FAT32_ATTR_DIRECTORY) != 0;
+    const uint32_t srcCluster = ((uint32_t)srcEntry.fstClusHI << 16) | srcEntry.fstClusLO;
+    const uint32_t srcSize = srcEntry.fileSize;
+
+    // Same path (same parent, identical name): nothing to do.
+    if (oldParentNode->cluster == newParentNode->cluster) {
+        char a[11], b[11];
+        fs->shortNameFromLong(oldName, a);
+        fs->shortNameFromLong(newName, b);
+        bool same = true;
+        for (int i = 0; i < 11; i++) { if (a[i] != b[i]) { same = false; break; } }
+        if (same) return 0;
+    }
+
+    // Handle an existing destination (POSIX rename replaces it).
+    FAT32DirEntry dstEntry;
+    if (fs->findEntry(newParentNode->cluster, newName, &dstEntry, nullptr, nullptr)) {
+        const bool dstIsDir = (dstEntry.attr & FAT32_ATTR_DIRECTORY) != 0;
+        // Source and destination must be of compatible types.
+        if (srcIsDir != dstIsDir) {
+            return -1;  // EISDIR / ENOTDIR territory
+        }
+        if (dstIsDir) {
+            // Destination directory must be empty.
+            uint32_t dstCluster = ((uint32_t)dstEntry.fstClusHI << 16) | dstEntry.fstClusLO;
+            void* dbuf = kmalloc(fs->clusterSize);
+            if (!dbuf) return -1;
+            if (!fs->readCluster(dstCluster, dbuf)) { kfree(dbuf); return -1; }
+            FAT32DirEntry* de = (FAT32DirEntry*)dbuf;
+            uint32_t per = fs->clusterSize / sizeof(FAT32DirEntry);
+            bool empty = true;
+            for (uint32_t i = 2; i < per; i++) {
+                if (de[i].name[0] == 0x00) break;
+                if ((unsigned char)de[i].name[0] != 0xE5 && de[i].attr != FAT32_ATTR_LONG_NAME) {
+                    empty = false; break;
+                }
+            }
+            kfree(dbuf);
+            if (!empty) return -1;
+            if (!fs->deleteEntry(newParentNode->cluster, newName)) return -1;
+            if (dstCluster >= 2) fs->freeClusterChain(dstCluster);
+        } else {
+            // Replace destination file: remove its entry and reclaim its data.
+            uint32_t dstCluster = ((uint32_t)dstEntry.fstClusHI << 16) | dstEntry.fstClusLO;
+            if (!fs->deleteEntry(newParentNode->cluster, newName)) return -1;
+            if (dstCluster >= 2) fs->freeClusterChain(dstCluster);
+        }
+    }
+
+    // Create the destination entry pointing at the same cluster chain.
+    FAT32DirEntry created;
+    if (!fs->createEntry(newParentNode->cluster, newName, srcAttr, srcCluster, &created)) {
+        return -1;
+    }
+    // createEntry() zeroes fileSize; restore the original size (and re-affirm
+    // the first cluster) for files. Directories keep size 0.
+    if (!srcIsDir) {
+        fs->updateDirEntry(newParentNode->cluster, newName, srcSize, srcCluster);
+    }
+
+    // If a directory moved to a different parent, fix its ".." entry so it
+    // points at the new parent cluster.
+    if (srcIsDir && oldParentNode->cluster != newParentNode->cluster && srcCluster >= 2) {
+        void* buf = kmalloc(fs->clusterSize);
+        if (buf) {
+            if (fs->readCluster(srcCluster, buf)) {
+                FAT32DirEntry* e = (FAT32DirEntry*)buf;
+                // entry[1] is ".."
+                uint32_t np = newParentNode->cluster;
+                e[1].fstClusHI = (np >> 16) & 0xFFFF;
+                e[1].fstClusLO = np & 0xFFFF;
+                fs->writeCluster(srcCluster, buf);
+            }
+            kfree(buf);
+        }
+    }
+
+    // Remove the source directory entry (does NOT free the cluster chain).
+    if (!fs->deleteEntry(oldParentNode->cluster, oldName)) {
+        // Best-effort rollback: drop the just-created destination entry.
+        fs->deleteEntry(newParentNode->cluster, newName);
+        return -1;
+    }
+
+    return 0;
+}
+
+int FAT32FS::nodeChmod(VNode* node, uint32_t mode) {
+    // FAT has no Unix permission bits. Accept and ignore (mirrors Linux's vfat
+    // driver), so chmod / install / cp -p do not spuriously fail.
+    (void)node;
+    (void)mode;
+    return 0;
+}
+
+int FAT32FS::nodeUtime(VNode* node, uint64_t atime, uint64_t mtime) {
+    // FAT stores only coarse timestamps; accept as a no-op so touch / cp -p
+    // succeed. (A future improvement could persist mtime into the dir entry.)
+    (void)node;
+    (void)atime;
+    (void)mtime;
+    return 0;
+}
+
+int FAT32FS::nodeStatfs(VNode* node, FsStats* stats) {
+    if (!node || !stats) return -1;
+    FAT32FS* fs = (FAT32FS*)node->getFS();
+    if (!fs) return -1;
+
+    uint32_t totalClusters = (fs->bpb.totalSectors32 - fs->dataStart) / fs->bpb.sectorsPerCluster;
+
+    // Count free clusters by scanning the FAT.
+    uint64_t freeClusters = 0;
+    for (uint32_t i = 2; i < totalClusters + 2; i++) {
+        uint32_t value;
+        if (fs->readFATEntry(i, &value) && value == FAT32_FREE) {
+            freeClusters++;
+        }
+    }
+
+    stats->blockSize = fs->clusterSize;
+    stats->totalBlocks = totalClusters;
+    stats->freeBlocks = freeClusters;
+    stats->totalInodes = 0;   // FAT has no fixed inode table
+    stats->freeInodes = 0;
+    stats->nameMax = 255;
+    stats->fsType = 0x4d44;   // "MD" - MSDOS_SUPER_MAGIC
+    return 0;
+}
+
+int FAT32FS::nodeChown(VNode* node, uint32_t uid, uint32_t gid) {
+    // FAT has no Unix ownership; accept as a no-op (mirrors Linux's vfat) so
+    // chown / chgrp / cp -p do not spuriously fail.
+    (void)node;
+    (void)uid;
+    (void)gid;
     return 0;
 }
 

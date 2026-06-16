@@ -403,12 +403,28 @@ bool AHCIPort::executeCommand(uint8_t cmd, uint64_t lba, uint32_t count, void* b
 
     while (true) {
         if ((port->ci & (1 << slot)) == 0) break;
-        if (port->is & HBA_PxIS_TFES) return false;
+        if (port->is & HBA_PxIS_TFES) {
+            recoverFromError();
+            return false;
+        }
     }
 
-    if (port->is & HBA_PxIS_TFES) return false;
+    if (port->is & HBA_PxIS_TFES) {
+        recoverFromError();
+        return false;
+    }
 
     return true;
+}
+
+void AHCIPort::recoverFromError() {
+    // A task-file error sets PxIS.TFES and stops the command engine. Per AHCI
+    // spec, clear the error status and restart the engine so subsequent commands
+    // are not permanently wedged.
+    stopCmd();
+    port->serr = (uint32_t)-1;   // clear all SError bits (write-1-to-clear)
+    port->is = (uint32_t)-1;     // clear all interrupt status bits
+    startCmd();
 }
 
 bool AHCIPort::read(uint64_t sector, uint32_t count, void* buffer) {
@@ -527,9 +543,24 @@ AHCIPort* AHCIController::getPort(int index) {
     return ports[index];
 }
 
-SATABlockDevice::SATABlockDevice(AHCIPort* port) : port(port), totalSize(0) {
+SATABlockDevice::SATABlockDevice(AHCIPort* port) : port(port), totalSize(0), dmaBuffer(nullptr), dmaCapacity(0) {
     if (port) {
         totalSize = port->getSectorCount() * 512;
+    }
+
+    // Allocate a persistent, identity-mapped DMA bounce buffer. The AHCI engine
+    // needs the data buffer's physical address (via the PRDT). IDENTIFY works
+    // because it uses an identity-mapped PMM frame; the old read()/write() used
+    // kmalloc_aligned() memory, whose physical mapping is not guaranteed to be
+    // usable for DMA here. Using an identity-mapped frame mirrors the proven
+    // IDENTIFY path. 64 KiB matches the PRDT capacity (8 entries * 8 KiB).
+    const uint64_t kDmaBytes = 64 * 1024;
+    const uint64_t pages = (kDmaBytes + PMM::PAGE_SIZE - 1) / PMM::PAGE_SIZE;
+    uint64_t frame = PMM::AllocFrames(pages);
+    if (frame) {
+        mapIdentityRange(frame, pages * PMM::PAGE_SIZE, kDmaPageFlags);
+        dmaBuffer = reinterpret_cast<void*>(frame);
+        dmaCapacity = pages * PMM::PAGE_SIZE;
     }
 }
 
@@ -537,57 +568,87 @@ SATABlockDevice::~SATABlockDevice() {
 }
 
 bool SATABlockDevice::read(uint64_t offset, void* buffer, uint64_t size) {
-    if (!port || !buffer) return false;
+    if (!port || !buffer || !dmaBuffer) return false;
+    if (size == 0) return true;
 
-    uint64_t sector = offset / 512;
-    uint64_t sectorOffset = offset % 512;
-    uint32_t sectorCount = (size + sectorOffset + 511) / 512;
+    uint8_t* dst = reinterpret_cast<uint8_t*>(buffer);
+    uint64_t remaining = size;
+    uint64_t curOffset = offset;
 
-    size_t dmaSize = sectorCount * 512;
-    void* dmaBuf = kmalloc_aligned(dmaSize, 4096);
-    if (!dmaBuf) return false;
+    while (remaining > 0) {
+        uint64_t sector = curOffset / 512;
+        uint64_t sectorOffset = curOffset % 512;
 
-    bool result = port->read(sector, sectorCount, dmaBuf);
+        // Bytes we can satisfy in this iteration, bounded by the bounce buffer.
+        uint64_t maxBytes = dmaCapacity - sectorOffset;
+        uint64_t chunk = remaining < maxBytes ? remaining : maxBytes;
 
-    if (result) {
-        uint8_t* src = reinterpret_cast<uint8_t*>(dmaBuf) + sectorOffset;
-        uint8_t* dst = reinterpret_cast<uint8_t*>(buffer);
-        for (uint64_t i = 0; i < size; i++) {
+        uint32_t sectorCount = (uint32_t)((chunk + sectorOffset + 511) / 512);
+        if ((uint64_t)sectorCount * 512 > dmaCapacity) {
+            sectorCount = (uint32_t)(dmaCapacity / 512);
+            chunk = (uint64_t)sectorCount * 512 - sectorOffset;
+        }
+
+        if (!port->read(sector, sectorCount, dmaBuffer)) {
+            return false;
+        }
+
+        const uint8_t* src = reinterpret_cast<const uint8_t*>(dmaBuffer) + sectorOffset;
+        for (uint64_t i = 0; i < chunk; i++) {
             dst[i] = src[i];
         }
+
+        dst += chunk;
+        curOffset += chunk;
+        remaining -= chunk;
     }
 
-    kfree(dmaBuf);
-    return result;
+    return true;
 }
 
 bool SATABlockDevice::write(uint64_t offset, const void* buffer, uint64_t size) {
-    if (!port || !buffer) return false;
+    if (!port || !buffer || !dmaBuffer) return false;
+    if (size == 0) return true;
 
-    uint64_t sector = offset / 512;
-    uint64_t sectorOffset = offset % 512;
-    uint32_t sectorCount = (size + sectorOffset + 511) / 512;
+    const uint8_t* src = reinterpret_cast<const uint8_t*>(buffer);
+    uint64_t remaining = size;
+    uint64_t curOffset = offset;
 
-    size_t dmaSize = sectorCount * 512;
-    void* dmaBuf = kmalloc_aligned(dmaSize, 4096);
-    if (!dmaBuf) return false;
+    while (remaining > 0) {
+        uint64_t sector = curOffset / 512;
+        uint64_t sectorOffset = curOffset % 512;
 
-    if (sectorOffset != 0 || (size % 512) != 0) {
-        if (!port->read(sector, sectorCount, dmaBuf)) {
-            kfree(dmaBuf);
+        uint64_t maxBytes = dmaCapacity - sectorOffset;
+        uint64_t chunk = remaining < maxBytes ? remaining : maxBytes;
+
+        uint32_t sectorCount = (uint32_t)((chunk + sectorOffset + 511) / 512);
+        if ((uint64_t)sectorCount * 512 > dmaCapacity) {
+            sectorCount = (uint32_t)(dmaCapacity / 512);
+            chunk = (uint64_t)sectorCount * 512 - sectorOffset;
+        }
+
+        // Read-modify-write when the transfer is not sector-aligned.
+        if (sectorOffset != 0 || (chunk % 512) != 0) {
+            if (!port->read(sector, sectorCount, dmaBuffer)) {
+                return false;
+            }
+        }
+
+        uint8_t* dmaDst = reinterpret_cast<uint8_t*>(dmaBuffer) + sectorOffset;
+        for (uint64_t i = 0; i < chunk; i++) {
+            dmaDst[i] = src[i];
+        }
+
+        if (!port->write(sector, sectorCount, dmaBuffer)) {
             return false;
         }
+
+        src += chunk;
+        curOffset += chunk;
+        remaining -= chunk;
     }
 
-    uint8_t* dst = reinterpret_cast<uint8_t*>(dmaBuf) + sectorOffset;
-    const uint8_t* src = reinterpret_cast<const uint8_t*>(buffer);
-    for (uint64_t i = 0; i < size; i++) {
-        dst[i] = src[i];
-    }
-
-    bool result = port->write(sector, sectorCount, dmaBuf);
-    kfree(dmaBuf);
-    return result;
+    return true;
 }
 
 uint64_t SATABlockDevice::getSize() {

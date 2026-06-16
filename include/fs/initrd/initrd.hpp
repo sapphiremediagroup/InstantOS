@@ -30,6 +30,7 @@ public:
     static int64_t nodeWrite(VNode* node, const void* buffer, uint64_t size, uint64_t offset);
     static int nodeStat(VNode* node, FileStats* stats);
     static int nodeReaddir(VNode* node, DirEntry* entries, uint64_t count, uint64_t* read);
+    static int nodeStatfs(VNode* node, FsStats* stats);
     static VNode* nodeLookup(VNode* node, const char* name);
     
 private:
@@ -42,5 +43,5 @@ private:
     char rootPrefix[64];
     InitrdHeader* header;
     VNode* rootNode;
-    VNodeOps ops;
+    VNodeOps ops{};
 };

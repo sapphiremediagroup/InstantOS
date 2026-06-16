@@ -14,6 +14,8 @@ constexpr int kOpenReadWrite = 0x2;
 constexpr int kMaxSymlinkDepth = 40;
 constexpr int kErrNoEntry = 2;
 constexpr int kErrLoop = 40;
+constexpr int kErrCrossDevice = 18;  // EXDEV
+constexpr int kErrNoSys = 38;        // ENOSYS
 
 bool pathIsRoot(const char* path) {
     return path && path[0] == '/' && path[1] == '\0';
@@ -517,6 +519,13 @@ int64_t VFS::seek(FileDescriptor* fd, int64_t offset, SeekMode mode) {
     
     VNode* node = fd->getNode();
     if (!node) return -1;
+
+    // TTYs/char devices and pipes are not seekable. Returning a negative value
+    // makes sys_seek() report ESPIPE, which is what mlibc relies on to classify
+    // the stream as pipe-like (and thus pick line/no buffering for a tty).
+    if (node->getType() == FileType::CharDevice || node->getType() == FileType::Pipe) {
+        return -1;
+    }
     
     FileStats stats;
     if (node->ops && node->ops->stat) {
@@ -612,6 +621,58 @@ int VFS::stat(const char* path, FileStats* stats) {
     if (!node->ops || !node->ops->stat) return -1;
     
     return node->ops->stat(node, stats);
+}
+
+int VFS::statfs(const char* path, FsStats* stats) {
+    if (!initialized || !stats) { setLastError(kErrNoEntry); return -1; }
+    VNode* node = resolvePath(path, nullptr);
+    if (!node) { setLastError(kErrNoEntry); return -1; }
+    if (!node->ops || !node->ops->statfs) { setLastError(kErrNoSys); return -1; }
+    return node->ops->statfs(node, stats);
+}
+
+int VFS::statfs(FileDescriptor* fd, FsStats* stats) {
+    if (!initialized || !fd || !stats) { setLastError(kErrNoEntry); return -1; }
+    VNode* node = fd->getNode();
+    if (!node || !node->ops || !node->ops->statfs) { setLastError(kErrNoSys); return -1; }
+    return node->ops->statfs(node, stats);
+}
+
+int VFS::chown(const char* path, uint32_t uid, uint32_t gid, bool followSymlink) {
+    if (!initialized || !path) { setLastError(kErrNoEntry); return -1; }
+    VNode* node = resolvePath(path, nullptr, followSymlink);
+    if (!node) { setLastError(kErrNoEntry); return -1; }
+    if (!node->ops || !node->ops->chown) { setLastError(kErrNoSys); return -1; }
+    return node->ops->chown(node, uid, gid);
+}
+
+int VFS::chown(FileDescriptor* fd, uint32_t uid, uint32_t gid) {
+    if (!initialized || !fd) { setLastError(kErrNoEntry); return -1; }
+    VNode* node = fd->getNode();
+    if (!node || !node->ops || !node->ops->chown) { setLastError(kErrNoSys); return -1; }
+    return node->ops->chown(node, uid, gid);
+}
+
+int VFS::mknod(const char* path, uint32_t mode, uint64_t dev) {
+    if (!initialized || !path) { setLastError(kErrNoEntry); return -1; }
+
+    char parent[256];
+    char name[256];
+    splitPath(path, parent, name);
+    if (name[0] == '\0') { setLastError(kErrNoEntry); return -1; }
+
+    VNode* parentNode = resolvePath(parent, nullptr);
+    if (!parentNode) { setLastError(kErrNoEntry); return -1; }
+    if (!parentNode->ops || !parentNode->ops->mknod) { setLastError(kErrNoSys); return -1; }
+
+    VNode* result = nullptr;
+    int rc = parentNode->ops->mknod(parentNode, name, mode, dev, &result);
+    if (rc == 0 && result) {
+        // The node is persisted in the FS tree; we don't keep the VNode here.
+        delete result;
+    }
+    if (rc != 0) setLastError(kErrNoEntry);
+    return rc;
 }
 
 int VFS::lstat(const char* path, FileStats* stats) {
@@ -711,7 +772,7 @@ int VFS::rmdir(const char* path) {
 }
 
 int VFS::rename(const char* oldPath, const char* newPath) {
-    if (!initialized || !oldPath || !newPath) return -1;
+    if (!initialized || !oldPath || !newPath) { setLastError(kErrNoEntry); return -1; }
 
     char oldParent[256];
     char oldName[256];
@@ -719,15 +780,17 @@ int VFS::rename(const char* oldPath, const char* newPath) {
     char newName[256];
     splitPath(oldPath, oldParent, oldName);
     splitPath(newPath, newParent, newName);
-    if (oldName[0] == '\0' || newName[0] == '\0') return -1;
+    if (oldName[0] == '\0' || newName[0] == '\0') { setLastError(kErrNoEntry); return -1; }
 
     VNode* oldParentNode = resolvePath(oldParent, nullptr);
     VNode* newParentNode = resolvePath(newParent, nullptr);
-    if (!oldParentNode || !newParentNode) return -1;
-    if (oldParentNode->getFS() != newParentNode->getFS()) return -1;
-    if (!oldParentNode->ops || !oldParentNode->ops->rename) return -1;
+    if (!oldParentNode || !newParentNode) { setLastError(kErrNoEntry); return -1; }
+    if (oldParentNode->getFS() != newParentNode->getFS()) { setLastError(kErrCrossDevice); return -1; }
+    if (!oldParentNode->ops || !oldParentNode->ops->rename) { setLastError(kErrNoSys); return -1; }
 
-    return oldParentNode->ops->rename(oldParentNode, oldName, newParentNode, newName);
+    int rc = oldParentNode->ops->rename(oldParentNode, oldName, newParentNode, newName);
+    if (rc != 0) setLastError(kErrNoEntry);
+    return rc;
 }
 
 int VFS::link(const char* oldPath, const char* newPath) {

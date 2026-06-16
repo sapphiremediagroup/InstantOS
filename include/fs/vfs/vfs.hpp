@@ -28,12 +28,28 @@ struct FileStats {
     uint64_t atime;
     uint64_t mtime;
     uint64_t ctime;
+    uint32_t uid;
+    uint32_t gid;
+    uint64_t rdev;
+    uint64_t dev;   // device id of the containing filesystem (unique per mount)
 };
 
 struct DirEntry {
     char name[256];
     uint64_t inode;
     FileType type;
+};
+
+// Filesystem-wide statistics (statfs/statvfs). Block counts are in units of
+// `blockSize` bytes.
+struct FsStats {
+    uint64_t blockSize;    // fundamental block size (f_bsize / f_frsize)
+    uint64_t totalBlocks;  // total data blocks (f_blocks)
+    uint64_t freeBlocks;   // free blocks (f_bfree / f_bavail)
+    uint64_t totalInodes;  // total file nodes (f_files), 0 if N/A
+    uint64_t freeInodes;   // free file nodes (f_ffree), 0 if N/A
+    uint64_t nameMax;      // maximum filename length (f_namemax)
+    uint32_t fsType;       // filesystem magic/type id (f_type)
 };
 
 class VNode;
@@ -58,6 +74,9 @@ struct VNodeOps {
     int (*link)(VNode* oldParent, const char* oldName, VNode* newParent, const char* newName);
     int (*symlink)(VNode* parent, const char* name, const char* target, VNode** result);
     int64_t (*readlink)(VNode* node, char* buffer, uint64_t size);
+    int (*statfs)(VNode* node, FsStats* stats);
+    int (*chown)(VNode* node, uint32_t uid, uint32_t gid);
+    int (*mknod)(VNode* parent, const char* name, uint32_t mode, uint64_t dev, VNode** result);
 };
 
 class VNode {
@@ -146,6 +165,11 @@ public:
     int utime(const char* path, uint64_t atime, uint64_t mtime);
     int stat(const char* path, FileStats* stats);
     int lstat(const char* path, FileStats* stats);
+    int statfs(const char* path, FsStats* stats);
+    int statfs(FileDescriptor* fd, FsStats* stats);
+    int chown(const char* path, uint32_t uid, uint32_t gid, bool followSymlink);
+    int chown(FileDescriptor* fd, uint32_t uid, uint32_t gid);
+    int mknod(const char* path, uint32_t mode, uint64_t dev);
     int64_t readlink(const char* path, char* buffer, uint64_t size);
     int readdir(const char* path, DirEntry* entries, uint64_t count, uint64_t* read);
     
@@ -157,6 +181,22 @@ public:
     int link(const char* oldPath, const char* newPath);
     int symlink(const char* target, const char* linkPath);
     int getLastError() const { return lastError; }
+
+    // Resolve a path to its VNode (following the final symlink unless
+    // followFinal is false). Used by the syscall layer for special files (FIFOs)
+    // that need the underlying node without a FileDescriptor.
+    VNode* lookup(const char* path, bool followFinal = true) {
+        return resolvePath(path, nullptr, followFinal);
+    }
+
+    // Enumerate active mount points. Calls fn(path, fsTypeName) for each mount.
+    // Used by the boot code to seed /etc/mtab.
+    template <typename Fn>
+    void forEachMount(Fn fn) {
+        for (MountPoint* mp = mountPoints; mp; mp = mp->next) {
+            fn(mp->path, mp->fs ? mp->fs->getName() : "unknown");
+        }
+    }
     
 private:
     VNode* resolvePath(const char* path, char* lastComponent, bool followFinal = true, int symlinkDepth = 0);

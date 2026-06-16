@@ -40,6 +40,7 @@ InitrdFS::InitrdFS(void* data, size_t size, const char* prefix)
     ops.chmod = nullptr;
     ops.utime = nullptr;
     ops.link = nullptr;
+    ops.statfs = nodeStatfs;
 }
 
 InitrdFS::~InitrdFS() {
@@ -136,12 +137,16 @@ int InitrdFS::nodeStat(VNode* node, FileStats* stats) {
     InitrdFS* fs = static_cast<InitrdFS*>(node->getFS());
     if (!fs || !fs->header) return -1;
     
+    *stats = FileStats{};
     stats->type = node->getType();
     stats->inode = node->getInode();
+    stats->links = 1;
+    stats->dev = reinterpret_cast<uint64_t>(fs);
     
     if (node->getType() == FileType::Directory) {
         stats->size = 0;
         stats->mode = 0755;
+        stats->links = 2;
     } else {
         uint64_t inode = node->getInode();
         if (inode > fs->header->fileCount) return -1;
@@ -151,6 +156,22 @@ int InitrdFS::nodeStat(VNode* node, FileStats* stats) {
         stats->mode = 0644;
     }
     
+    return 0;
+}
+
+int InitrdFS::nodeStatfs(VNode* node, FsStats* stats) {
+    if (!node || !stats) return -1;
+    InitrdFS* fs = (InitrdFS*)node->getFS();
+    // Read-only image: report its byte size as a fully-used volume.
+    uint64_t bs = 4096;
+    uint64_t blocks = fs ? (fs->dataSize + bs - 1) / bs : 0;
+    stats->blockSize = bs;
+    stats->totalBlocks = blocks;
+    stats->freeBlocks = 0;  // read-only, nothing free
+    stats->totalInodes = 0;
+    stats->freeInodes = 0;
+    stats->nameMax = 255;
+    stats->fsType = 0x494e5244;  // "INRD"
     return 0;
 }
 
@@ -217,8 +238,7 @@ VNode* InitrdFS::nodeLookup(VNode* node, const char* name) {
             continue;
         }
 
-        if (isDirectory) {
-            const size_t prefixLength = strlen(prefix);
+        if (isDirectory) {            const size_t prefixLength = strlen(prefix);
             const size_t nameLength = strlen(name);
             const size_t fullLength = prefixLength == 0 ? nameLength : prefixLength + 1 + nameLength;
             char* childPrefix = new char[fullLength + 1];

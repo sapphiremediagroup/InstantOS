@@ -15,6 +15,9 @@ struct RamFSNode {
     uint64_t atime;
     uint64_t mtime;
     uint64_t ctime;
+    uint32_t uid;
+    uint32_t gid;
+    uint64_t rdev;
 };
 
 struct RamFSFileData {
@@ -51,6 +54,9 @@ public:
     static int nodeRename(VNode* oldParent, const char* oldName, VNode* newParent, const char* newName);
     static int nodeChmod(VNode* node, uint32_t mode);
     static int nodeUtime(VNode* node, uint64_t atime, uint64_t mtime);
+    static int nodeChown(VNode* node, uint32_t uid, uint32_t gid);
+    static int nodeStatfs(VNode* node, FsStats* stats);
+    static int nodeMknod(VNode* parent, const char* name, uint32_t mode, uint64_t dev, VNode** result);
     static int nodeLink(VNode* oldParent, const char* oldName, VNode* newParent, const char* newName);
     static int nodeSymlink(VNode* parent, const char* name, const char* target, VNode** result);
     static int64_t nodeReadlink(VNode* node, char* buffer, uint64_t size);
@@ -59,7 +65,7 @@ private:
     VNode* rootNode;
     RamFSNode* rootData;
     uint64_t nextInode;
-    VNodeOps ops;
+    VNodeOps ops{};
     
     RamFSNode* createNode(const char* name, FileType type, uint32_t mode);
     void destroyNode(RamFSNode* node);

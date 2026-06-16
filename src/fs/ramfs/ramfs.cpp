@@ -106,6 +106,9 @@ RamFS::RamFS() : FileSystem("ramfs"), rootNode(nullptr), rootData(nullptr), next
     ops.link = nodeLink;
     ops.symlink = nodeSymlink;
     ops.readlink = nodeReadlink;
+    ops.chown = nodeChown;
+    ops.statfs = nodeStatfs;
+    ops.mknod = nodeMknod;
 }
 
 RamFS::~RamFS() {
@@ -159,6 +162,9 @@ RamFSNode* RamFS::createNode(const char* name, FileType type, uint32_t mode) {
     node->atime = now;
     node->mtime = now;
     node->ctime = now;
+    node->uid = 0;
+    node->gid = 0;
+    node->rdev = 0;
 
     if (type == FileType::Regular) {
         RamFSFileData* file = (RamFSFileData*)kmalloc(sizeof(RamFSFileData));
@@ -372,6 +378,30 @@ int RamFS::nodeUtime(VNode* node, uint64_t atime, uint64_t mtime) {
     return 0;
 }
 
+int RamFS::nodeChown(VNode* node, uint32_t uid, uint32_t gid) {
+    if (!node) return -1;
+    RamFSNode* ramNode = (RamFSNode*)node->getData();
+    if (!ramNode) return -1;
+    // -1 (0xFFFFFFFF) means "don't change" per POSIX chown semantics.
+    if (uid != 0xFFFFFFFFu) ramNode->uid = uid;
+    if (gid != 0xFFFFFFFFu) ramNode->gid = gid;
+    ramNode->ctime = ramfsNow();
+    return 0;
+}
+
+int RamFS::nodeStatfs(VNode* node, FsStats* stats) {
+    if (!node || !stats) return -1;
+    // RamFS is memory-backed with no fixed size; report a nominal volume.
+    stats->blockSize = 4096;
+    stats->totalBlocks = 0;
+    stats->freeBlocks = 0;
+    stats->totalInodes = 0;
+    stats->freeInodes = 0;
+    stats->nameMax = 255;
+    stats->fsType = 0x858458f6;  // RAMFS_MAGIC
+    return 0;
+}
+
 int RamFS::nodeStat(VNode* node, FileStats* stats) {
     if (!node || !stats) return -1;
     
@@ -387,6 +417,10 @@ int RamFS::nodeStat(VNode* node, FileStats* stats) {
     stats->atime = file ? file->atime : ramNode->atime;
     stats->mtime = file ? file->mtime : ramNode->mtime;
     stats->ctime = file ? file->ctime : ramNode->ctime;
+    stats->uid = ramNode->uid;
+    stats->gid = ramNode->gid;
+    stats->rdev = ramNode->rdev;
+    stats->dev = reinterpret_cast<uint64_t>(node->getFS());
     
     return 0;
 }
@@ -483,6 +517,50 @@ int RamFS::nodeCreate(VNode* parent, const char* name, uint32_t mode, VNode** re
     vnode->setData(newNode);
     vnode->ops = parent->ops;
     
+    *result = vnode;
+    return 0;
+}
+
+int RamFS::nodeMknod(VNode* parent, const char* name, uint32_t mode, uint64_t dev, VNode** result) {
+    if (!parent || !name || !result) return -1;
+    if (ramfsNameIsDotOrDotDot(name)) return -1;
+
+    RamFSNode* parentNode = (RamFSNode*)parent->getData();
+    if (!parentNode || parentNode->type != FileType::Directory) return -1;
+    if (name[0] == '\0' || ramfsFindChild(parentNode, name)) return -1;
+
+    // Pick the node type from the format bits of `mode`.
+    constexpr uint32_t kSIFMT  = 0xF000;
+    constexpr uint32_t kSIFIFO = 0x1000;
+    constexpr uint32_t kSIFCHR = 0x2000;
+    constexpr uint32_t kSIFBLK = 0x6000;
+    constexpr uint32_t kSIFREG = 0x8000;
+    FileType type;
+    switch (mode & kSIFMT) {
+        case kSIFIFO: type = FileType::Pipe; break;
+        case kSIFCHR: type = FileType::CharDevice; break;
+        case kSIFBLK: type = FileType::BlockDevice; break;
+        case 0:       // POSIX: mode without a type means regular file
+        case kSIFREG: type = FileType::Regular; break;
+        default: return -1;  // sockets/unsupported
+    }
+
+    RamFS* fs = (RamFS*)parent->getFS();
+    RamFSNode* newNode = fs->createNode(name, type, mode & 07777);
+    if (!newNode) return -1;
+    newNode->rdev = (type == FileType::CharDevice || type == FileType::BlockDevice) ? dev : 0;
+
+    newNode->parent = parentNode;
+    newNode->nextSibling = parentNode->firstChild;
+    parentNode->firstChild = newNode;
+    const uint64_t now = ramfsNow();
+    parentNode->mtime = now;
+    parentNode->ctime = now;
+
+    VNode* vnode = new VNode(parent->getFS(), newNode->inode, type);
+    vnode->setData(newNode);
+    vnode->ops = parent->ops;
+
     *result = vnode;
     return 0;
 }
