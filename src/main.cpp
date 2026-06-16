@@ -23,6 +23,7 @@
 #include <graphics/gpu.hpp>
 #include <graphics/console.hpp>
 #include <cpu/acpi/acpi.hpp>
+#include <cpu/acpi/pci_bus.hpp>
 #include <cpu/apic/apic.hpp>
 #include <cpu/apic/pic.hpp>
 #include <cpu/cpuid.hpp>
@@ -863,6 +864,11 @@ extern "C" void InstantOS(BootInfo* bootInfo) {
     drawTextLine("[BOOT] before mapIRQ mouse");
     apic.mapIRQ(IRQ_MOUSE, VECTOR_MOUSE, targetCore);
     drawTextLine("[BOOT] after mapIRQ mouse");
+    drawTextLine("[BOOT] before PCI bus scan");
+    {
+        const size_t pciDevices = PciBus::get().scan();
+        drawHexLine("[BOOT] PCI devices=", pciDevices);
+    }
     USBInput::get().initialize();
     I2CHIDController::get().initialize();
 #ifdef INSTANTOS_BOOT_SPINNER

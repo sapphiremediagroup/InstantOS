@@ -1,6 +1,11 @@
 #include <drivers/usb/xhci.hpp>
 
 #include <cpu/acpi/pci.hpp>
+#include <cpu/acpi/pci_bus.hpp>
+#include <cpu/apic/apic.hpp>
+#include <cpu/apic/lapic.hpp>
+#include <cpu/apic/irqs.hpp>
+#include <cpu/idt/isr.hpp>
 #include <cpu/cereal/cereal.hpp>
 #include <cpu/idt/interrupt.hpp>
 #include <cpu/process/scheduler.hpp>
@@ -2951,6 +2956,57 @@ void log_capabilities(
     log_str("\n");
 }
 
+// Bind this controller's legacy INTx interrupt using the ACPI _PRT routing
+// resolved by the shared PCI enumerator. On APIC systems the firmware-
+// programmed interrupt line is unreliable, so we route the controller's INTx
+// pin to its Global System Interrupt through the IOAPIC. Returns false when the
+// device has no _PRT entry (the caller then falls back to the legacy line).
+bool bind_prt_interrupt(uint8_t bus, uint8_t slot, uint8_t function, XHCIControllerState& state) {
+    PciBus& pci = PciBus::get();
+    const PciDeviceInfo* match = nullptr;
+    const size_t deviceCount = pci.deviceCount();
+    const PciDeviceInfo* devs = pci.devices();
+    for (size_t i = 0; i < deviceCount; ++i) {
+        if (devs[i].segment == 0 && devs[i].bus == bus &&
+            devs[i].device == slot && devs[i].function == function) {
+            match = &devs[i];
+            break;
+        }
+    }
+    if (!match) {
+        return false;
+    }
+
+    uint32_t gsi = 0;
+    uint16_t flags = 0;
+    if (!pci.resolveInterruptGsi(*match, &gsi, &flags)) {
+        return false;
+    }
+
+    static uint8_t nextPrtVector = VECTOR_PCI_BASE;
+    if (nextPrtVector >= VECTOR_MSI_BASE) {
+        return false;
+    }
+    const uint8_t vector = nextPrtVector++;
+    const uint8_t targetCore = static_cast<uint8_t>(LAPIC::get().getId());
+
+    ISR::registerIRQ(vector, &get_xhci_interrupt_handler());
+    if (!APICManager::get().mapGSI(gsi, vector, targetCore, flags)) {
+        return false;
+    }
+
+    state.irqRegistered = true;
+    state.msiEnabled = false;
+    state.irqVector = vector;
+    state.irqLine = static_cast<uint8_t>(gsi);
+    log_str("[usb:xhci] irq _PRT gsi=");
+    log_dec(gsi);
+    log_str(" vector=");
+    log_dec(vector);
+    log_str("\n");
+    return true;
+}
+
 bool initialize_register_model(uint8_t bus, uint8_t slot, uint8_t function, uint64_t mmioBase, const XHCICapabilityRegisters& caps, XHCIControllerState& state) {
     const uint8_t maxSlots = static_cast<uint8_t>(caps.hcsParams1 & 0xFF);
     const uint8_t maxPorts = static_cast<uint8_t>((caps.hcsParams1 >> 24) & 0xFF);
@@ -3095,6 +3151,8 @@ bool initialize_register_model(uint8_t bus, uint8_t slot, uint8_t function, uint
         log_str("[usb:xhci] irq msi vector=");
         log_dec(state.irqVector);
         log_str("\n");
+    } else if (bind_prt_interrupt(bus, slot, function, state)) {
+        // _PRT-routed legacy INTx via the IOAPIC GSI (correct on APIC systems).
     } else if (PCI::get().registerLegacyInterrupt(0, bus, slot, function, &get_xhci_interrupt_handler(),
                                                   &state.irqLine, &state.irqVector)) {
         state.irqRegistered = true;
@@ -3207,37 +3265,37 @@ bool XHCIController::initialize() {
     controllersFound = 0;
     initializedControllers = 0;
 
-    for (uint16_t bus16 = 0; bus16 < 256; ++bus16) {
-        const uint8_t bus = static_cast<uint8_t>(bus16);
-        for (uint8_t slot = 0; slot < 32; ++slot) {
-            for (uint8_t func = 0; func < 8; ++func) {
-                const uint16_t vendor = PCI::get().readConfig16(0, bus, slot, func, PCI_VENDOR_ID);
-                if (vendor == 0xFFFF) {
-                    if (func == 0) {
-                        break;
-                    }
-                    continue;
-                }
+    // Discover xHCI controllers through the shared PCI enumerator, which walks
+    // every ECAM segment and follows PCI-to-PCI bridges, rather than re-running
+    // a hardcoded segment-0 scan here. Scan on demand if the bus has not been
+    // enumerated yet (e.g. when called before the boot-time scan).
+    PciBus& pci = PciBus::get();
+    if (pci.deviceCount() == 0) {
+        pci.scan();
+    }
 
-                const uint8_t classCode = PCI::get().readConfig8(0, bus, slot, func, PCI_CLASS);
-                const uint8_t subclass = PCI::get().readConfig8(0, bus, slot, func, PCI_SUBCLASS);
-                const uint8_t progIf = PCI::get().readConfig8(0, bus, slot, func, PCI_PROG_IF);
+    const size_t deviceCount = pci.deviceCount();
+    const PciDeviceInfo* devs = pci.devices();
+    for (size_t i = 0; i < deviceCount; ++i) {
+        const PciDeviceInfo& dev = devs[i];
+        if (dev.classCode != PCI_CLASS_SERIAL_BUS ||
+            dev.subclass != PCI_SUBCLASS_USB ||
+            dev.progIf != PCI_PROGIF_XHCI) {
+            continue;
+        }
 
-                if (classCode == PCI_CLASS_SERIAL_BUS &&
-                    subclass == PCI_SUBCLASS_USB &&
-                    progIf == PCI_PROGIF_XHCI) {
-                    ++controllersFound;
-                    if (initializedControllers < XHCI_MAX_TRACKED_CONTROLLERS &&
-                        probe_controller(bus, slot, func, &g_controllers[initializedControllers])) {
-                        ++initializedControllers;
-                    }
-                }
+        // The existing register model addresses controllers on segment 0 only;
+        // skip controllers on other segments rather than mis-program them.
+        if (dev.segment != 0) {
+            log_boot_str("[usb:xhci] skipping controller on non-zero PCI segment\n");
+            continue;
+        }
 
-                const uint8_t headerType = PCI::get().readConfig8(0, bus, slot, func, PCI_HEADER_TYPE);
-                if (func == 0 && (headerType & 0x80) == 0) {
-                    break;
-                }
-            }
+        ++controllersFound;
+        if (initializedControllers < XHCI_MAX_TRACKED_CONTROLLERS &&
+            probe_controller(dev.bus, dev.device, dev.function,
+                             &g_controllers[initializedControllers])) {
+            ++initializedControllers;
         }
     }
 
