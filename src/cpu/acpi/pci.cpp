@@ -1,4 +1,5 @@
 #include <cpu/acpi/pci.hpp>
+#include <cpu/acpi/acpi.hpp>
 #include <cpu/apic/apic.hpp>
 #include <cpu/apic/irqs.hpp>
 #include <cpu/idt/isr.hpp>
@@ -63,6 +64,14 @@ PCILegacyIRQDispatcher* getLegacyDispatchers() {
     static PCILegacyIRQDispatcher dispatchers[16];
     return dispatchers;
 }
+
+// Resolve the MMIO config-space address for a function via ECAM (MCFG). Returns
+// 0 when no ECAM region covers the target, in which case callers fall back to
+// legacy 0xCF8/0xCFC port access (segment 0, offsets < 256 only).
+uint64_t ecamAddr(uint16_t segment, uint8_t bus, uint8_t device, uint8_t function,
+                  uint16_t offset) {
+    return ACPI::get().ecamAddress(segment, bus, device, function, offset);
+}
 }
 
 PCI& PCI::get() {
@@ -79,7 +88,11 @@ uint32_t PCI::makeAddress(uint8_t bus, uint8_t device, uint8_t function, uint16_
 }
 
 uint8_t PCI::readConfig8(uint16_t segment, uint8_t bus, uint8_t device, uint8_t function, uint16_t offset) {
-    if (segment != 0) {
+    if (uint64_t mmio = ecamAddr(segment, bus, device, function, offset)) {
+        return *reinterpret_cast<volatile uint8_t*>(mmio);
+    }
+
+    if (segment != 0 || offset >= 256) {
         return 0xFF;
     }
     
@@ -93,7 +106,11 @@ uint8_t PCI::readConfig8(uint16_t segment, uint8_t bus, uint8_t device, uint8_t 
 }
 
 uint16_t PCI::readConfig16(uint16_t segment, uint8_t bus, uint8_t device, uint8_t function, uint16_t offset) {
-    if (segment != 0) {
+    if (uint64_t mmio = ecamAddr(segment, bus, device, function, offset)) {
+        return *reinterpret_cast<volatile uint16_t*>(mmio);
+    }
+
+    if (segment != 0 || offset >= 256) {
         return 0xFFFF;
     }
     
@@ -107,7 +124,11 @@ uint16_t PCI::readConfig16(uint16_t segment, uint8_t bus, uint8_t device, uint8_
 }
 
 uint32_t PCI::readConfig32(uint16_t segment, uint8_t bus, uint8_t device, uint8_t function, uint16_t offset) {
-    if (segment != 0) {
+    if (uint64_t mmio = ecamAddr(segment, bus, device, function, offset)) {
+        return *reinterpret_cast<volatile uint32_t*>(mmio);
+    }
+
+    if (segment != 0 || offset >= 256) {
         return 0xFFFFFFFF;
     }
     
@@ -121,7 +142,12 @@ uint32_t PCI::readConfig32(uint16_t segment, uint8_t bus, uint8_t device, uint8_
 }
 
 void PCI::writeConfig8(uint16_t segment, uint8_t bus, uint8_t device, uint8_t function, uint16_t offset, uint8_t value) {
-    if (segment != 0) {
+    if (uint64_t mmio = ecamAddr(segment, bus, device, function, offset)) {
+        *reinterpret_cast<volatile uint8_t*>(mmio) = value;
+        return;
+    }
+
+    if (segment != 0 || offset >= 256) {
         return;
     }
     
@@ -138,7 +164,12 @@ void PCI::writeConfig8(uint16_t segment, uint8_t bus, uint8_t device, uint8_t fu
 }
 
 void PCI::writeConfig16(uint16_t segment, uint8_t bus, uint8_t device, uint8_t function, uint16_t offset, uint16_t value) {
-    if (segment != 0) {
+    if (uint64_t mmio = ecamAddr(segment, bus, device, function, offset)) {
+        *reinterpret_cast<volatile uint16_t*>(mmio) = value;
+        return;
+    }
+
+    if (segment != 0 || offset >= 256) {
         return;
     }
     
@@ -155,7 +186,12 @@ void PCI::writeConfig16(uint16_t segment, uint8_t bus, uint8_t device, uint8_t f
 }
 
 void PCI::writeConfig32(uint16_t segment, uint8_t bus, uint8_t device, uint8_t function, uint16_t offset, uint32_t value) {
-    if (segment != 0) {
+    if (uint64_t mmio = ecamAddr(segment, bus, device, function, offset)) {
+        *reinterpret_cast<volatile uint32_t*>(mmio) = value;
+        return;
+    }
+
+    if (segment != 0 || offset >= 256) {
         return;
     }
     

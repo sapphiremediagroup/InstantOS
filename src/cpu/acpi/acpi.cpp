@@ -50,6 +50,26 @@ struct GenericAddressStructure {
     uint64_t address;
 } __attribute__((packed));
 
+// MCFG: PCI Express Memory Mapped Configuration Space Base Address Description
+// Table (ACPI 6.x, "Static Resource Allocation Structures"). The fixed header
+// is followed by one allocation entry per (segment, bus-range) ECAM window.
+struct McfgAllocation {
+    uint64_t baseAddress;
+    uint16_t segmentGroup;
+    uint8_t startBus;
+    uint8_t endBus;
+    uint32_t reserved;
+} __attribute__((packed));
+
+struct Mcfg {
+    AcpiHeader header;
+    uint64_t reserved;
+    McfgAllocation allocations[];
+} __attribute__((packed));
+
+static_assert(sizeof(McfgAllocation) == 16);
+static_assert(offsetof(Mcfg, allocations) == 44);
+
 struct Fadt {
     AcpiHeader header;
     uint32_t firmwareCtrl;
@@ -199,6 +219,17 @@ static size_t acpiRootEntryCount(const AcpiHeader* header, bool useXsdt) {
     return (header->length - sizeof(AcpiHeader)) / entrySize;
 }
 
+// A root-table entry must point at something that can plausibly hold an ACPI
+// header. Reject the obvious sentinels (null and the all-ones value used by
+// unmapped firmware regions) before any dereference; full structural and
+// checksum validation still happens in acpiTableValid().
+static bool acpiEntryPointerPlausible(uint64_t physAddr) {
+    if (physAddr == 0 || physAddr == UINT32_MAX || physAddr == UINT64_MAX) {
+        return false;
+    }
+    return true;
+}
+
 static bool fadtHasField(const Fadt* fadt, size_t offset, size_t length) {
     if (!fadt || !acpiTableHeaderLooksValid(&fadt->header)) {
         return false;
@@ -316,6 +347,58 @@ static AcpiRegister fadtResetRegister(const Fadt* fadt) {
     return {};
 }
 
+// Prefer the 64-bit Generic Address Structure form of the ACPI PM timer when
+// the FADT is long enough to contain it and it describes a usable block;
+// otherwise fall back to the legacy 32-bit I/O port field. The PM timer is a
+// 24/32-bit counter, so request a 32-bit-wide register.
+static AcpiRegister fadtPmTimerRegister(const Fadt* fadt) {
+    if (!fadt) {
+        return {};
+    }
+    if (fadtHasField(fadt, offsetof(Fadt, xPmTimerBlock), sizeof(fadt->xPmTimerBlock)) &&
+        acpiGasSupported(fadt->xPmTimerBlock) &&
+        (fadt->xPmTimerBlock.bitWidth == 0 || fadt->xPmTimerBlock.bitWidth >= 24)) {
+        return acpiRegisterFromGas(fadt->xPmTimerBlock);
+    }
+    if (fadtHasField(fadt, offsetof(Fadt, pmTimerBlock), sizeof(fadt->pmTimerBlock))) {
+        return acpiIoRegister(fadt->pmTimerBlock, 32);
+    }
+    return {};
+}
+
+// GPE (General Purpose Event) blocks drive wake/runtime events for devices such
+// as USB controllers and GPIO-attached peripherals, so resolving them via the
+// 64-bit GAS where available matters for future power-management work.
+static AcpiRegister fadtGpe0Register(const Fadt* fadt) {
+    if (!fadt) {
+        return {};
+    }
+    if (fadtHasField(fadt, offsetof(Fadt, xGpe0Block), sizeof(fadt->xGpe0Block)) &&
+        acpiGasSupported(fadt->xGpe0Block)) {
+        return acpiRegisterFromGas(fadt->xGpe0Block);
+    }
+    if (fadtHasField(fadt, offsetof(Fadt, gpe0Block), sizeof(fadt->gpe0Block)) &&
+        fadt->gpe0Block) {
+        return acpiIoRegister(fadt->gpe0Block, 8);
+    }
+    return {};
+}
+
+static AcpiRegister fadtGpe1Register(const Fadt* fadt) {
+    if (!fadt) {
+        return {};
+    }
+    if (fadtHasField(fadt, offsetof(Fadt, xGpe1Block), sizeof(fadt->xGpe1Block)) &&
+        acpiGasSupported(fadt->xGpe1Block)) {
+        return acpiRegisterFromGas(fadt->xGpe1Block);
+    }
+    if (fadtHasField(fadt, offsetof(Fadt, gpe1Block), sizeof(fadt->gpe1Block)) &&
+        fadt->gpe1Block) {
+        return acpiIoRegister(fadt->gpe1Block, 8);
+    }
+    return {};
+}
+
 static bool acpiWriteRegister8(const AcpiRegister& reg, uint8_t value) {
     if (!reg.valid) {
         return false;
@@ -341,6 +424,21 @@ static bool acpiWriteRegister16(const AcpiRegister& reg, uint16_t value) {
     }
     if (reg.addressSpace == kAcpiAddressSpaceSystemMemory) {
         *reinterpret_cast<volatile uint16_t*>(reg.address) = value;
+        return true;
+    }
+    return false;
+}
+
+static bool acpiReadRegister32(const AcpiRegister& reg, uint32_t* value) {
+    if (!reg.valid || !value) {
+        return false;
+    }
+    if (reg.addressSpace == kAcpiAddressSpaceSystemIo) {
+        *value = inl(static_cast<uint16_t>(reg.address));
+        return true;
+    }
+    if (reg.addressSpace == kAcpiAddressSpaceSystemMemory) {
+        *value = *reinterpret_cast<volatile uint32_t*>(reg.address);
         return true;
     }
     return false;
@@ -447,6 +545,8 @@ bool ACPI::initialize(uint64_t rsdpAddr) {
 
     initialized = true;
 
+    parseMcfg();
+
     if (!amlInitialized && amlInterpreter.initialize()) {
         void* dsdt = findDsdt();
         if (dsdt) {
@@ -469,6 +569,9 @@ void* ACPI::findTable(const char* signature) {
     if (rootUsesXsdt) {
         Xsdt* xsdtPtr = reinterpret_cast<Xsdt*>(rsdt);
         for (size_t i = 0; i < entries; i++) {
+            if (!acpiEntryPointerPlausible(xsdtPtr->pointers[i])) {
+                continue;
+            }
             AcpiHeader* h = reinterpret_cast<AcpiHeader*>(xsdtPtr->pointers[i]);
             if (acpiTableValid(h, signature)) {
                 return h;
@@ -477,6 +580,9 @@ void* ACPI::findTable(const char* signature) {
     } else {
         Rsdt* rsdtPtr = reinterpret_cast<Rsdt*>(rsdt);
         for (size_t i = 0; i < entries; i++) {
+            if (!acpiEntryPointerPlausible(rsdtPtr->pointers[i])) {
+                continue;
+            }
             AcpiHeader* h = reinterpret_cast<AcpiHeader*>((uint64_t)rsdtPtr->pointers[i]);
             if (acpiTableValid(h, signature)) {
                 return h;
@@ -494,10 +600,31 @@ void ACPI::forEachTable(TableCallback callback, void* context) {
     AcpiHeader* header = reinterpret_cast<AcpiHeader*>(rsdt);
     size_t entries = acpiRootEntryCount(header, rootUsesXsdt);
 
+    // Some firmware lists the same table pointer more than once. De-duplicate so
+    // a callback (e.g. AML SSDT loading) does not process a table twice.
+    constexpr size_t kMaxSeen = 64;
+    uint64_t seen[kMaxSeen];
+    size_t seenCount = 0;
+    auto alreadySeen = [&](uint64_t addr) -> bool {
+        for (size_t j = 0; j < seenCount; ++j) {
+            if (seen[j] == addr) {
+                return true;
+            }
+        }
+        if (seenCount < kMaxSeen) {
+            seen[seenCount++] = addr;
+        }
+        return false;
+    };
+
     if (rootUsesXsdt) {
         Xsdt* xsdtPtr = reinterpret_cast<Xsdt*>(rsdt);
         for (size_t i = 0; i < entries; i++) {
-            AcpiHeader* h = reinterpret_cast<AcpiHeader*>(xsdtPtr->pointers[i]);
+            const uint64_t addr = xsdtPtr->pointers[i];
+            if (!acpiEntryPointerPlausible(addr) || alreadySeen(addr)) {
+                continue;
+            }
+            AcpiHeader* h = reinterpret_cast<AcpiHeader*>(addr);
             if (acpiTableValid(h)) {
                 callback(h->signature, h, context);
             }
@@ -505,7 +632,11 @@ void ACPI::forEachTable(TableCallback callback, void* context) {
     } else {
         Rsdt* rsdtPtr = reinterpret_cast<Rsdt*>(rsdt);
         for (size_t i = 0; i < entries; i++) {
-            AcpiHeader* h = reinterpret_cast<AcpiHeader*>((uint64_t)rsdtPtr->pointers[i]);
+            const uint64_t addr = static_cast<uint64_t>(rsdtPtr->pointers[i]);
+            if (!acpiEntryPointerPlausible(addr) || alreadySeen(addr)) {
+                continue;
+            }
+            AcpiHeader* h = reinterpret_cast<AcpiHeader*>(addr);
             if (acpiTableValid(h)) {
                 callback(h->signature, h, context);
             }
@@ -532,6 +663,124 @@ AML::Interpreter& ACPI::aml() {
     return amlInterpreter;
 }
 
+void ACPI::parseMcfg() {
+    ecamCount = 0;
+
+    Mcfg* mcfg = static_cast<Mcfg*>(findTable("MCFG"));
+    if (!mcfg) {
+        return;
+    }
+
+    const uint32_t headerLength = mcfg->header.length;
+    if (headerLength < offsetof(Mcfg, allocations)) {
+        return;
+    }
+
+    const size_t allocBytes = headerLength - offsetof(Mcfg, allocations);
+    const size_t allocations = allocBytes / sizeof(McfgAllocation);
+
+    for (size_t i = 0; i < allocations && ecamCount < kMaxEcamRegions; ++i) {
+        const McfgAllocation& entry = mcfg->allocations[i];
+        if (!entry.baseAddress || entry.endBus < entry.startBus) {
+            continue;
+        }
+
+        AcpiEcamRegion& region = ecam[ecamCount];
+        region.base = entry.baseAddress;
+        region.segment = entry.segmentGroup;
+        region.startBus = entry.startBus;
+        region.endBus = entry.endBus;
+
+        // Map the ECAM window as uncached MMIO so config reads/writes bypass the
+        // CPU cache. Each (bus, device, function) occupies a 4 KiB config page,
+        // i.e. 1 MiB per bus.
+        const uint32_t busCount = static_cast<uint32_t>(entry.endBus - entry.startBus) + 1;
+        const uint64_t bytes = static_cast<uint64_t>(busCount) << 20; // busCount * 1 MiB
+        const uint64_t pages = (bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+        VMM::MapRange(region.base, region.base, pages,
+                      Present | ReadWrite | CacheDisab | WriteThru);
+
+        ++ecamCount;
+    }
+}
+
+uint64_t ACPI::ecamAddress(uint16_t segment, uint8_t bus, uint8_t device,
+                           uint8_t function, uint16_t offset) const {
+    if (device >= 32 || function >= 8 || offset >= 4096) {
+        return 0;
+    }
+
+    for (size_t i = 0; i < ecamCount; ++i) {
+        const AcpiEcamRegion& region = ecam[i];
+        if (region.segment != segment || bus < region.startBus || bus > region.endBus) {
+            continue;
+        }
+
+        const uint64_t busOffset = static_cast<uint64_t>(bus - region.startBus);
+        return region.base +
+            ((busOffset << 20) |
+             (static_cast<uint64_t>(device) << 15) |
+             (static_cast<uint64_t>(function) << 12) |
+             offset);
+    }
+
+    return 0;
+}
+
+bool ACPI::readPmTimer(uint32_t* outValue) const {
+    if (!initialized || !outValue) {
+        return false;
+    }
+    Fadt* fadt = static_cast<Fadt*>(const_cast<ACPI*>(this)->findTable("FACP"));
+    return acpiReadRegister32(fadtPmTimerRegister(fadt), outValue);
+}
+
+bool ACPI::gpe0Address(uint64_t* outAddress, uint8_t* outAddressSpace) const {
+    if (!initialized || !outAddress) {
+        return false;
+    }
+    Fadt* fadt = static_cast<Fadt*>(const_cast<ACPI*>(this)->findTable("FACP"));
+    const AcpiRegister reg = fadtGpe0Register(fadt);
+    if (!reg.valid) {
+        return false;
+    }
+    *outAddress = reg.address;
+    if (outAddressSpace) {
+        *outAddressSpace = reg.addressSpace;
+    }
+    return true;
+}
+
+bool ACPI::gpe1Address(uint64_t* outAddress, uint8_t* outAddressSpace) const {
+    if (!initialized || !outAddress) {
+        return false;
+    }
+    Fadt* fadt = static_cast<Fadt*>(const_cast<ACPI*>(this)->findTable("FACP"));
+    const AcpiRegister reg = fadtGpe1Register(fadt);
+    if (!reg.valid) {
+        return false;
+    }
+    *outAddress = reg.address;
+    if (outAddressSpace) {
+        *outAddressSpace = reg.addressSpace;
+    }
+    return true;
+}
+
+void ACPI::enumerate() {
+    if (!initialized) {
+        return;
+    }
+    if (!amlInitialized && amlInterpreter.initialize()) {
+        void* dsdt = findDsdt();
+        if (dsdt) {
+            amlInterpreter.loadTable(dsdt);
+        }
+        forEachTable(loadAmlTableCallback, this);
+        amlInitialized = true;
+    }
+}
+
 bool ACPI::evaluateAml(const char* path, AML::Object* result) {
     if (!amlInitialized || !path || !result) {
         return false;
@@ -545,6 +794,7 @@ void ACPI::shutdown() {
     rootUsesXsdt = false;
     initialized = false;
     amlInitialized = false;
+    ecamCount = 0;
 }
 
 void ACPI::reboot() {
