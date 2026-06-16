@@ -7,9 +7,11 @@
 #include "fs/ahci/ahci.hpp"
 #include "fs/ahci/detect.hpp"
 #include "fs/fat32/fat32.hpp"
+#include "fs/partition/partition.hpp"
 #include "fs/ramfs/ramfs.hpp"
 #include <fs/storage/storage.hpp>
 #include <fs/initrd/initrd.hpp>
+#include <fs/devfs/devfs.hpp>
 #include <iboot/memory.hpp>
 #include <cpu/gdt/gdt.hpp>
 #include <cpu/idt/idt.hpp>
@@ -33,6 +35,8 @@
 #include <interrupts/timer.hpp>
 #include <time/time.hpp>
 #include <graphics/virtio_gpu.hpp>
+#include <graphics/venus.hpp>
+#include <graphics/intel_gen9.hpp>
 unsigned long long runtimeBase;
 
 namespace {
@@ -316,26 +320,28 @@ void waitForKeyboardBeforeBoot() {
     }
 
     Console::get().setTextColor(0xFFDD66);
-    logBootText("[input] no keyboard detected; waiting for PS/2, USB, or I2C keyboard input\n");
+    logBootText("[input] no keyboard detected after initial probe; continuing boot with diagnostics enabled\n");
     Console::get().setTextColor(0xFFFFFF);
     drawKeyboardStatus("[input] state:");
     drawKeyboardFailureHints();
 
     uint32_t polls = 0;
-    while (!hasAnyKeyboard()) {
+    while (!hasAnyKeyboard() && polls < 2000000) {
         pollInputBackends();
         if ((polls % 50000) == 0) {
             tickBootSpinner();
         }
-        if (++polls == 2000000) {
-            drawKeyboardStatus("[input] still waiting:");
-            drawKeyboardFailureHints();
-            polls = 0;
-        }
+        ++polls;
         asm volatile("pause");
     }
 
-    drawKeyboardStatus("[input] keyboard detected:");
+    if (hasAnyKeyboard()) {
+        drawKeyboardStatus("[input] keyboard detected:");
+    } else {
+        Console::get().setTextColor(0xFFDD66);
+        logBootText("[input] proceeding without a detected keyboard; use serial logs or input-probe ISO for driver debugging\n");
+        Console::get().setTextColor(0xFFFFFF);
+    }
 }
 
 void dumpVirtIOGPUCaps(VirtIOGPUDriver& virtioGpu) {
@@ -344,6 +350,7 @@ void dumpVirtIOGPUCaps(VirtIOGPUDriver& virtioGpu) {
     drawBoolLine("[VGPU] resource_blob=", virtioGpu.supportsBlobResources());
     drawBoolLine("[VGPU] resource_uuid=", virtioGpu.supportsResourceUUID());
     drawBoolLine("[VGPU] scanout_blob_active=", virtioGpu.isUsingBlobScanout());
+    drawBoolLine("[VGPU] venus=", venus::Venus::get().negotiate());
 
     Console::get().drawText("[VGPU] capsets=");
     Console::get().drawNumber(static_cast<int64_t>(virtioGpu.getNumCapsets()));
@@ -430,6 +437,212 @@ void runVirtIOGPUProbe(VirtIOGPUDriver& virtioGpu) {
     Console::get().drawText(" completed=");
     Console::get().drawHex(probe.completedFence);
     Console::get().drawText("\n");
+}
+
+// Probe for an Intel HD Graphics 530 / Skylake (Gen9) integrated GPU and report
+// what was found. Output is prefixed with [i915] so smoke tests can grep the
+// serial log. This is non-fatal and harmless on hosts without an Intel iGPU
+// (e.g. QEMU): it simply reports "not present" and boot continues on virtio.
+void reportIntelGen9() {
+    intel_gen9::IntelGen9Driver& drv = intel_gen9::IntelGen9Driver::get();
+    if (!drv.probe()) {
+        Console::get().drawText("[i915] Intel Gen9 GPU: not present\n");
+        return;
+    }
+    const intel_gen9::Gen9DeviceInfo* dev = drv.deviceInfo();
+    Console::get().drawText("[i915] Intel Gen9 GPU detected: ");
+    Console::get().drawText(dev ? dev->name : "unknown");
+    Console::get().drawText(dev && dev->isHd530 ? " [HD 530]\n" : "\n");
+}
+
+// Bring up Venus (Vulkan over virtio-gpu) and run a synchronous
+// vkEnumerateInstanceVersion round trip against the host renderer. All output
+// is prefixed with [VENUS] so smoke tests can grep the serial log.
+void runVenusProbe(VirtIOGPUDriver& virtioGpu) {
+    venus::Venus& vk = venus::Venus::get();
+    if (!vk.negotiate()) {
+        Console::get().drawText("[VENUS] capset: unavailable (host renderer not in venus mode)\n");
+        return;
+    }
+
+    venus::VenusProbeResult probe = {};
+    const bool ok = vk.probe(&probe);
+
+    Console::get().drawText("[VENUS] probe: ");
+    Console::get().drawText(ok ? "ok" : "incomplete");
+    Console::get().drawText("\n");
+
+    Console::get().drawText("[VENUS] capset wire=");
+    Console::get().drawNumber(static_cast<int64_t>(probe.wireFormatVersion));
+    Console::get().drawText(" vk_xml=");
+    Console::get().drawHex(probe.vkXmlVersion);
+    Console::get().drawText(" protocol=");
+    Console::get().drawNumber(static_cast<int64_t>(probe.venusProtocolVersion));
+    Console::get().drawText("\n");
+
+    Console::get().drawText("[VENUS] stages: capset=");
+    Console::get().drawText(probe.capsetVersionOk ? "ok" : "fail");
+    Console::get().drawText(" ctx=");
+    Console::get().drawText(probe.contextOk ? "ok" : "fail");
+    Console::get().drawText(" blob=");
+    Console::get().drawText(probe.blobOk ? "ok" : "fail");
+    Console::get().drawText(" submit=");
+    Console::get().drawText(probe.submitOk ? "ok" : "fail");
+    Console::get().drawText(" fence=");
+    Console::get().drawText(probe.fenceOk ? "ok" : "fail");
+    Console::get().drawText(" reply=");
+    Console::get().drawText(probe.replyOk ? "ok" : "fail");
+    Console::get().drawText("\n");
+
+    if (probe.replyOk) {
+        const uint32_t v = probe.instanceVersion;
+        Console::get().drawText("[VENUS] vkEnumerateInstanceVersion=");
+        Console::get().drawNumber(static_cast<int64_t>((v >> 22) & 0x7F));
+        Console::get().drawText(".");
+        Console::get().drawNumber(static_cast<int64_t>((v >> 12) & 0x3FF));
+        Console::get().drawText(".");
+        Console::get().drawNumber(static_cast<int64_t>(v & 0xFFF));
+        Console::get().drawText(" (raw=");
+        Console::get().drawHex(v);
+        Console::get().drawText(")\n");
+    }
+
+    Console::get().drawText("[VENUS] response=");
+    Console::get().drawText(VirtIOGPUDriver::describeResponseType(probe.responseType));
+    Console::get().drawText("\n");
+
+    // Fuller Vulkan bring-up over the async ring: instance, physical devices,
+    // properties, and a logical device.
+    venus::VenusVulkanResult vkr = {};
+    const bool vkOk = vk.bringUpVulkan(&vkr);
+    Console::get().drawText("[VENUS] vulkan: ");
+    Console::get().drawText(vkOk ? "ok" : "incomplete");
+    Console::get().drawText("\n");
+
+    Console::get().drawText("[VENUS] vk stages: ring=");
+    Console::get().drawText(vkr.ringOk ? "ok" : "fail");
+    Console::get().drawText(" instance=");
+    Console::get().drawText(vkr.instanceOk ? "ok" : "fail");
+    Console::get().drawText(" phys_devs=");
+    Console::get().drawNumber(static_cast<int64_t>(vkr.physDevCount));
+    Console::get().drawText(" props=");
+    Console::get().drawText(vkr.propsOk ? "ok" : "fail");
+    Console::get().drawText(" device=");
+    Console::get().drawText(vkr.deviceOk ? "ok" : "fail");
+    Console::get().drawText(" compute=");
+    Console::get().drawText(vkr.computeOk ? "ok" : "fail");
+    Console::get().drawText("\n");
+
+    if (vkr.deviceOk) {
+        Console::get().drawText("[VENUS] compute: elements=");
+        Console::get().drawNumber(static_cast<int64_t>(vkr.computeElements));
+        Console::get().drawText(" mismatches=");
+        Console::get().drawNumber(static_cast<int64_t>(vkr.computeMismatches));
+        Console::get().drawText(" data[3]=");
+        Console::get().drawNumber(static_cast<int64_t>(vkr.computeSample));
+        Console::get().drawText(" (expect 10)\n");
+    }
+
+    if (vkr.propsOk) {
+        const uint32_t a = vkr.device0.apiVersion;
+        Console::get().drawText("[VENUS] gpu0 name='");
+        Console::get().drawText(vkr.device0.deviceName);
+        Console::get().drawText("' type=");
+        Console::get().drawNumber(static_cast<int64_t>(vkr.device0.deviceType));
+        Console::get().drawText(" vendor=");
+        Console::get().drawHex(vkr.device0.vendorId);
+        Console::get().drawText(" api=");
+        Console::get().drawNumber(static_cast<int64_t>((a >> 22) & 0x7F));
+        Console::get().drawText(".");
+        Console::get().drawNumber(static_cast<int64_t>((a >> 12) & 0x3FF));
+        Console::get().drawText(".");
+        Console::get().drawNumber(static_cast<int64_t>(a & 0xFFF));
+        Console::get().drawText("\n");
+    }
+    if (vkr.instanceOk) {
+        Console::get().drawText("[VENUS] instance=");
+        Console::get().drawHex(vkr.instanceHandle);
+        Console::get().drawText(" device=");
+        Console::get().drawHex(vkr.deviceHandle);
+        Console::get().drawText("\n");
+    }
+
+    // Visual demo: render a real GPU triangle (graphics pipeline) and blit it to
+    // the display so it is actually visible on screen. Held briefly so it can be
+    // seen / screenshotted before the boot continues into the compositor.
+    const bool drew = vk.renderTriangleToScreen(480);
+    Console::get().drawText("[VENUS] triangle on screen: ");
+    Console::get().drawText(drew ? "ok" : "fail");
+    Console::get().drawText("\n");
+    if (drew) {
+        // Hold the rendered frame ~3s (busy wait on the PIT/TSC-independent loop)
+        // so the GPU triangle is visible. Re-flush periodically in case the
+        // console scrolls over it.
+        for (volatile uint64_t i = 0; i < 6000000000ULL; ++i) {
+            __asm__ __volatile__("pause" ::: "memory");
+        }
+    }
+}
+
+// Write a small text file via the VFS (used to seed /etc/passwd, /etc/group).
+// Creates/truncates the file and writes the contents; best-effort.
+void writeSystemFile(const char* path, const char* contents) {
+    FileDescriptor* fd = nullptr;
+    // O_WRONLY | O_CREAT | O_TRUNC == 0x1 | 0100 | 01000
+    if (VFS::get().open(path, 0x1 | 0100 | 01000, &fd, 0644) != 0 || !fd) {
+        return;
+    }
+    uint64_t len = 0;
+    while (contents[len]) len++;
+    if (len > 0) {
+        VFS::get().write(fd, contents, len);
+    }
+    VFS::get().close(fd);
+}
+
+// Mirror of struct utmpx (abi-bits/utmpx.h) used for the login records below;
+// see writeUtmpRecord, which writes the 400-byte layout at fixed offsets.
+
+// Write /var/run/utmp with login records (BOOT_TIME, USER_PROCESS) so
+// uptime/who/users have data. The record is written at fixed byte offsets to
+// exactly match struct utmpx (abi-bits/utmpx.h), which is 400 bytes:
+//   off 0   short ut_type
+//   off 4   int   ut_pid
+//   off 8   char  ut_line[32]
+//   off 40  char  ut_id[4]
+//   off 44  char  ut_user[32]
+//   off 76  char  ut_host[256]
+//   off 344 long  ut_tv.tv_sec    (8-aligned after ut_exit/session/pad)
+//   off 352 long  ut_tv.tv_usec
+void writeUtmpRecord(short type, const char* user, const char* line, uint64_t unixTime) {
+    uint8_t rec[400];
+    for (unsigned i = 0; i < sizeof(rec); ++i) rec[i] = 0;
+
+    auto put16 = [&](unsigned off, uint16_t v) {
+        rec[off] = v & 0xFF; rec[off + 1] = (v >> 8) & 0xFF;
+    };
+    auto put64 = [&](unsigned off, uint64_t v) {
+        for (int i = 0; i < 8; ++i) rec[off + i] = (v >> (i * 8)) & 0xFF;
+    };
+    auto putStr = [&](unsigned off, unsigned cap, const char* s) {
+        unsigned i = 0;
+        for (; s && s[i] && i + 1 < cap; ++i) rec[off + i] = (uint8_t)s[i];
+    };
+
+    put16(0, (uint16_t)type);   // ut_type
+    putStr(8, 32, line);        // ut_line
+    rec[40] = '~'; rec[41] = '~';  // ut_id
+    putStr(44, 32, user);       // ut_user
+    put64(344, unixTime);       // ut_tv.tv_sec
+    put64(352, 0);              // ut_tv.tv_usec
+
+    FileDescriptor* fd = nullptr;
+    // O_WRONLY | O_CREAT | O_APPEND == 0x1 | 0100 | 02000
+    if (VFS::get().open("/var/run/utmp", 0x1 | 0100 | 02000, &fd, 0644) != 0 || !fd) {
+        return;
+    }
+    VFS::get().write(fd, rec, sizeof(rec));
+    VFS::get().close(fd);
 }
 
 void launchInitrdService(const char* binaryPath) {
@@ -669,6 +882,7 @@ extern "C" void InstantOS(BootInfo* bootInfo) {
 
     GPU& gpu = GPU::get();
     VirtIOGPUDriver& virtioGpu = VirtIOGPUDriver::get();
+    reportIntelGen9();
     Console::get().drawText("[BOOT] framebuffer fallback=");
     Console::get().drawNumber(static_cast<int64_t>(fb.getWidth()));
     Console::get().drawText("x");
@@ -699,9 +913,17 @@ extern "C" void InstantOS(BootInfo* bootInfo) {
         Console::get().drawText("\n");
         dumpVirtIOGPUCaps(virtioGpu);
         runVirtIOGPUProbe(virtioGpu);
+        runVenusProbe(virtioGpu);
         dumpVirtIOGPUFences(virtioGpu);
     } else {
-        Console::get().drawText("[BOOT] VirtIO GPU: unavailable, using boot framebuffer\n");
+        Console::get().drawText("[BOOT] active GPU backend: ");
+        Console::get().drawText(gpu.getActiveBackendName());
+        Console::get().drawText("\n");
+        if (gpu.getActiveBackendKind() == GPUBackendKind::IntelGen9) {
+            Console::get().drawText("[BOOT] Intel Gen9 display: [ OK ]\n");
+        } else {
+            Console::get().drawText("[BOOT] VirtIO GPU: unavailable, using boot framebuffer\n");
+        }
     }
 #ifdef INSTANTOS_BOOT_SPINNER
     bootSpinner.step();
@@ -740,12 +962,26 @@ extern "C" void InstantOS(BootInfo* bootInfo) {
             static SATABlockDevice _device(port);
             device = &_device;
             KernelStorage::setDevice("ahci0", device, device->getSize(), 512, true, true);
-            static FAT32FS _fs(device);
-            fs = &_fs;
-            int mountResult = VFS::get().mount(fs, "/");
-            KernelStorage::setMount("/", "fat32", mountResult);
-            if(mountResult != 0){
-                Console::get().drawText("Filesystem mounted: [ ");
+
+            uint64_t partStart = 0;
+            uint64_t partLength = 0;
+            uint8_t partType = 0;
+            if (mbrFindFatPartition(device, &partStart, &partLength, &partType)) {
+                static PartitionBlockDevice _partition(device, partStart, partLength);
+                static FAT32FS _fs(&_partition);
+                fs = &_fs;
+                int mountResult = VFS::get().mount(fs, "/");
+                KernelStorage::setMount("/", "fat32", mountResult);
+                if(mountResult != 0){
+                    Console::get().drawText("Filesystem mounted: [ ");
+                    Console::get().setTextColor(0xFF0000);
+                    Console::get().drawText("FAIL");
+                    Console::get().setTextColor(0xFFFFFF);
+                    Console::get().drawText(" ]\n");
+                }
+            } else {
+                KernelStorage::setMount("/", "fat32", -1);
+                Console::get().drawText("Partition table: [ ");
                 Console::get().setTextColor(0xFF0000);
                 Console::get().drawText("FAIL");
                 Console::get().setTextColor(0xFFFFFF);
@@ -771,6 +1007,15 @@ extern "C" void InstantOS(BootInfo* bootInfo) {
     bootSpinner.step();
 #endif
     
+    {
+        static DevFS devfs;
+        int devMountResult = VFS::get().mount(&devfs, "/dev");
+        Console::get().drawText("DevFS at /dev: [ ");
+        Console::get().setTextColor(devMountResult == 0 ? 0x49ceee : 0xFF0000);
+        Console::get().drawText(devMountResult == 0 ? "OK" : "FAIL");
+        Console::get().setTextColor(0xFFFFFF);
+        Console::get().drawText(" ]\n");
+    }
     
     if (bootInfo->initrdBase && bootInfo->initrdSize) {
         Console::get().drawText("Mounting initrdfs...\n");
@@ -800,12 +1045,133 @@ extern "C" void InstantOS(BootInfo* bootInfo) {
             Console::get().setTextColor(0xFFFFFF);
             Console::get().drawText(" ]\n");
 
+            // Mount the initrd's system include headers (used by tcc and any
+            // hosted compiler) at /include, matching tcc's sysinclude search path.
+            static InitrdFS includeInitrdfs(
+                reinterpret_cast<void*>(bootInfo->initrdBase),
+                bootInfo->initrdSize,
+                "include"
+            );
+            int includeMountResult = VFS::get().mount(&includeInitrdfs, "/include");
+            Console::get().drawText("InitrdFS at /include: [ ");
+            Console::get().setTextColor(includeMountResult == 0 ? 0x49ceee : 0xFF0000);
+            Console::get().drawText(includeMountResult == 0 ? "OK" : "FAIL");
+            Console::get().setTextColor(0xFFFFFF);
+            Console::get().drawText(" ]\n");
+
+            // Mount the NetSurf browser resource tree (HTML/CSS/images/fonts
+            // bundled under "netsurf/" in the initrd) at /netsurf, matching the
+            // path NetSurf is compiled with (NETSURF_FRAMEBUFFER_RESOURCES=
+            // /netsurf/res/). Without this mount the browser cannot find its
+            // stylesheets and the welcome page renders unstyled / fails.
+            static InitrdFS netsurfInitrdfs(
+                reinterpret_cast<void*>(bootInfo->initrdBase),
+                bootInfo->initrdSize,
+                "netsurf"
+            );
+            int netsurfMountResult = VFS::get().mount(&netsurfInitrdfs, "/netsurf");
+            Console::get().drawText("InitrdFS at /netsurf: [ ");
+            Console::get().setTextColor(netsurfMountResult == 0 ? 0x49ceee : 0xFF0000);
+            Console::get().drawText(netsurfMountResult == 0 ? "OK" : "FAIL");
+            Console::get().setTextColor(0xFFFFFF);
+            Console::get().drawText(" ]\n");
+
+            // A writable in-memory /tmp (tmpfs). RamFS supports the full Unix
+            // surface (ownership, mknod/mkfifo, etc.) that FAT32 cannot.
+            static RamFS tmpfs;
+            int tmpMountResult = VFS::get().mount(&tmpfs, "/tmp");
+            Console::get().drawText("RamFS at /tmp: [ ");
+            Console::get().setTextColor(tmpMountResult == 0 ? 0x49ceee : 0xFF0000);
+            Console::get().drawText(tmpMountResult == 0 ? "OK" : "FAIL");
+            Console::get().setTextColor(0xFFFFFF);
+            Console::get().drawText(" ]\n");
+
+            // A small in-memory /etc holding the user/group databases so libc's
+            // getpwuid()/getgrgid() resolve numeric ids to names (id, whoami,
+            // ls -l). RamFS is always available (no disk dependency).
+            static RamFS etcfs;
+            int etcMountResult = VFS::get().mount(&etcfs, "/etc");
+            if (etcMountResult == 0) {
+                writeSystemFile("/etc/passwd",
+                    "root:x:0:0:root:/:/bin/bash\n");
+                writeSystemFile("/etc/group",
+                    "root:x:0:\n");
+                writeSystemFile("/etc/hostname",
+                    "instantos\n");
+                // Resolver configuration for mlibc's built-in DNS stub.
+                // QEMU user-mode networking exposes a DNS forwarder at
+                // 10.0.2.3; the resolver reads the first nameserver line.
+                writeSystemFile("/etc/resolv.conf",
+                    "nameserver 10.0.2.3\n");
+                // /etc/services: the DNS resolver looks up the "domain"
+                // service to obtain UDP port 53. Without this entry
+                // getaddrinfo() fails with EAI_SERVICE.
+                writeSystemFile("/etc/services",
+                    "domain\t53/tcp\n"
+                    "domain\t53/udp\n"
+                    "http\t80/tcp\n"
+                    "https\t443/tcp\n");
+                // /etc/hosts: local name -> address mappings consulted before
+                // DNS (so "localhost" resolves without a query).
+                writeSystemFile("/etc/hosts",
+                    "127.0.0.1\tlocalhost\n"
+                    "10.0.2.15\tinstantos\n");
+                // Seed /etc/mtab from the live VFS mount table so df (no args)
+                // and mount can enumerate filesystems. Each line has the six
+                // standard fields: fsname dir type opts freq passno.
+                {
+                    char mtab[1024];
+                    size_t off = 0;
+                    auto appendStr = [&](const char* s) {
+                        for (const char* p = s; *p && off + 1 < sizeof(mtab); ++p) {
+                            mtab[off++] = *p;
+                        }
+                    };
+                    VFS::get().forEachMount([&](const char* path, const char* type) {
+                        appendStr(type);   // mnt_fsname (device) - use fs type name
+                        appendStr(" ");
+                        appendStr(path);   // mnt_dir
+                        appendStr(" ");
+                        appendStr(type);   // mnt_type
+                        appendStr(" rw 0 0\n");  // opts freq passno
+                    });
+                    mtab[off] = '\0';
+                    writeSystemFile("/etc/mtab", mtab);
+                }
+            }
+            Console::get().drawText("RamFS at /etc: [ ");
+            Console::get().setTextColor(etcMountResult == 0 ? 0x49ceee : 0xFF0000);
+            Console::get().drawText(etcMountResult == 0 ? "OK" : "FAIL");
+            Console::get().setTextColor(0xFFFFFF);
+            Console::get().drawText(" ]\n");
+
+            // A writable /var (tmpfs) holding login records (/var/run/utmp).
+            // Seeded with a BOOT_TIME record + a root USER_PROCESS record so
+            // uptime shows the real "up" duration and who/users list a session.
+            static RamFS varfs;
+            int varMountResult = VFS::get().mount(&varfs, "/var");
+            if (varMountResult == 0) {
+                VFS::get().mkdir("/var/run", 0755);
+                VFS::get().mkdir("/var/log", 0755);
+                uint64_t bootUnix = time_get_boot_unix();
+                writeUtmpRecord(2 /*BOOT_TIME*/, "reboot", "~", bootUnix);
+                writeUtmpRecord(7 /*USER_PROCESS*/, "root", "console", time_get_unix());
+            }
+            Console::get().drawText("RamFS at /var: [ ");
+            Console::get().setTextColor(varMountResult == 0 ? 0x49ceee : 0xFF0000);
+            Console::get().drawText(varMountResult == 0 ? "OK" : "FAIL");
+            Console::get().setTextColor(0xFFFFFF);
+            Console::get().drawText(" ]\n");
+
+
+
             if (libMountResult == 0) {
                 Debug::initializeKernelSymbols();
                 // graphics-compositor takes over the framebuffer, so login starts it after authentication.
                 launchInitrdService("/bin/input-manager");
                 launchInitrdService("/bin/storage-manager");
                 launchInitrdService("/bin/process-manager");
+                launchInitrdService("/bin/network-manager");
                 launchInitrdService("/bin/font-manager");
                 launchInitrdService("/bin/session-manager");
                 launchInitrdService("/bin/login");

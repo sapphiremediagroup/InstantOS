@@ -5,3 +5,4 @@ builddir
 vboxserial.txt
 .*
 testing
+outside/iUserApps/outside/mlibc/

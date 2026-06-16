@@ -8,6 +8,7 @@ A rewrite of the closed source graphical x86_64 operating system
 - [x] Keyboard support
 - [x] Mouse support
 - [x] Window Manager
+- [x] virtio-gpu 3D (VirGL) + Vulkan over virtio-gpu (Venus) — see `docs/venus.md`
 
 # Upcoming features
 - [ ] Custom FileSystem
