@@ -59,10 +59,40 @@ bool LAPIC::initialize() {
     uint32_t flags;
   } __attribute__((packed));
 
+  const uint32_t madt_length =
+      *reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(table) + 4);
+
   auto *madt = reinterpret_cast<madt_header *>(
       reinterpret_cast<uint8_t *>(table) + 36);
 
   uint64_t lapic_phys = madt->lapic_address;
+
+  // Scan MADT entries for a Local APIC Address Override (type 5), which carries
+  // a 64-bit base that supersedes the 32-bit field in the fixed header. The
+  // length-guarded walk also avoids spinning on a malformed zero-length entry.
+  if (madt_length > 44) {
+    uint8_t* entries = reinterpret_cast<uint8_t*>(table) + 44;
+    uint8_t* end = reinterpret_cast<uint8_t*>(table) + madt_length;
+    while (entries + 2 <= end) {
+      const uint8_t type = entries[0];
+      const uint8_t length = entries[1];
+      if (length < 2 || entries + length > end) {
+        break;
+      }
+      if (type == 5 && length >= 12) {
+        struct lapic_override {
+          uint8_t type;
+          uint8_t length;
+          uint16_t reserved;
+          uint64_t address;
+        } __attribute__((packed));
+        lapic_phys = reinterpret_cast<lapic_override*>(entries)->address;
+        break;
+      }
+      entries += length;
+    }
+  }
+
   uint64_t lapic_virt = lapic_phys; // identity map
 
   VMM::MapPage(lapic_virt, lapic_phys,
@@ -235,6 +265,12 @@ bool APICManager::initialize() {
     uint8_t type = madt_entries[0];
     uint8_t length = madt_entries[1];
 
+    // A zero/short length or an entry that runs past the table end means the
+    // MADT is malformed; stop rather than spin forever or read out of bounds.
+    if (length < 2 || madt_entries + length > madt_end) {
+      break;
+    }
+
     if (type == 0 && cpuCount < 16) {
       struct lapic_entry {
         uint8_t type;
@@ -291,6 +327,23 @@ bool APICManager::initialize() {
       traceHex(entry->flags);
       traceStr("\n");
       overrideCount++;
+    } else if (type == 9 && cpuCount < 16) {
+      // Processor Local x2APIC: used when the firmware reports CPUs with 32-bit
+      // APIC IDs (typically >255 logical processors). We track the ones whose ID
+      // fits the existing 8-bit storage so SMP bring-up still sees them.
+      struct x2apic_entry {
+        uint8_t type;
+        uint8_t length;
+        uint16_t reserved;
+        uint32_t x2apic_id;
+        uint32_t flags;
+        uint32_t acpi_uid;
+      } __attribute__((packed));
+
+      auto *entry = reinterpret_cast<x2apic_entry *>(madt_entries);
+      if ((entry->flags & 1) && entry->x2apic_id <= 0xFF) {
+        apicIds[cpuCount++] = static_cast<uint8_t>(entry->x2apic_id);
+      }
     }
 
     madt_entries += length;
