@@ -1,9 +1,35 @@
 #include <memory/vmm.hpp>
 #include <memory/heap.hpp>
 #include <memory/pmm.hpp>
+#include <graphics/console.hpp>
 
 PageTable* VMM::s_pml4        = nullptr;
 bool       VMM::s_initialized = false;
+
+// Returns true if `frame` is the kernel master page table (s_pml4) itself or
+// one of its directly-referenced sub-tables (PDPT/PD/PT). Used by free_table()
+// to avoid returning a still-kernel-referenced frame to the PMM (see the note
+// there). Walks two levels, which covers the shallow-copied tables in practice.
+static bool frameIsKernelTable(uint64_t frame) {
+    PageTable* k = VMM::GetKernelAddressSpace();
+    if (!k) return false;
+    uint64_t f = frame & ~0xFFFULL;
+    if (reinterpret_cast<uint64_t>(k) == f) return true;
+    for (int i = 0; i < 512; ++i) {
+        uint64_t e = k->entries[i];
+        if (!(e & 1)) continue;               // Present
+        if (e & 0x80) continue;               // LargePage
+        uint64_t pdpt = e & 0x000FFFFFFFFFF000ULL;
+        if (pdpt == f) return true;
+        auto* pt = reinterpret_cast<PageTable*>(pdpt);
+        for (int j = 0; j < 512; ++j) {
+            uint64_t e2 = pt->entries[j];
+            if (!(e2 & 1) || (e2 & 0x80)) continue;
+            if ((e2 & 0x000FFFFFFFFFF000ULL) == f) return true;
+        }
+    }
+    return false;
+}
 
 static PageTable* current_pml4() {
     uint64_t cr3 = 0;
@@ -46,6 +72,25 @@ static bool is_heap_table(PageTable* table) {
 
 static void free_table(PageTable* table) {
     if (!table) {
+        return;
+    }
+
+    // Safety net against the shallow-copy teardown bug: initializeAddressSpace
+    // makes each per-process low-half PDPT a shallow copy of the kernel's, so a
+    // process address space can share PD/PT sub-table frames with the kernel
+    // master page table (s_pml4). FreeAddressSpace/freePrivateTable can then try
+    // to return a still-kernel-referenced frame to the PMM; once reallocated and
+    // overwritten it corrupts kernel page tables (observed as a triple fault on
+    // the next process creation). Never free a frame the kernel still
+    // references. Logged once so the underlying ownership bug stays visible.
+    if (!is_heap_table(table) && frameIsKernelTable(reinterpret_cast<uint64_t>(table))) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            Console::get().drawText("\n[VMM] skipped freeing kernel-referenced frame 0x");
+            Console::get().drawHex(reinterpret_cast<uint64_t>(table));
+            Console::get().drawText(" (shallow-copy teardown bug; see vmm.cpp free_table)\n");
+        }
         return;
     }
 
