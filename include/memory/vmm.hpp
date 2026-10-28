@@ -80,6 +80,10 @@ public:
     // frame in place when it is the last referer) and returns true.  Returns
     // false if the address is not a COW page (caller handles it as a real fault).
     static bool HandleCowFault(PageTable* pml4, uint64_t faultAddr);
+    // Whether `pml4` now permits the access a page fault with error code
+    // `errCode` reported at `faultAddr`. True means the fault came from a stale
+    // TLB entry (another CPU widened the mapping meanwhile): flush and retry.
+    static bool PermitsFaultedAccess(PageTable* pml4, uint64_t faultAddr, uint64_t errCode);
     static void UnmapPageFrom(PageTable* pml4, uint64_t virtualAddr);
     static void UnmapRangeFrom(PageTable* pml4, uint64_t virtualBase, uint64_t pageCount);
 

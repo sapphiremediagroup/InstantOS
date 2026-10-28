@@ -30,22 +30,37 @@ extern irqHandler
     pop rbx      
 %endmacro
 
+; Kernel GS invariant: inside the kernel the GS base is this CPU's PerCPUData.
+; On entry from user mode (saved CS has RPL 3) swap it in; on exit swap the
+; user's back only if the frame being returned to is a user frame. The check on
+; exit reads the frame again because the scheduler may have rewritten it to
+; resume a different context.
+;   entry: [rsp+0] vector, [rsp+8] error code, [rsp+16] rip, [rsp+24] cs
+;   exit (after add rsp, 16): [rsp+0] rip, [rsp+8] cs
 handleISR:
+    test qword [rsp + 24], 3
+    jz .from_kernel
+    swapgs
+.from_kernel:
     pushad
-    
+
     mov rcx, rsp
 
     mov rbp, rsp
     and rsp, ~0xF
     sub rsp, 32
-    
-    cld 
+
+    cld
     call exceptionHandler
-    
+
     mov rsp, rbp
-    
+
     popad
     add rsp, 16
+    test qword [rsp + 8], 3
+    jz .to_kernel
+    swapgs
+.to_kernel:
     iretq
 
 %macro isrYErr 1
@@ -97,21 +112,29 @@ isrYErr 30
 isrNErr 31
 
 handleIRQ:
+    test qword [rsp + 24], 3
+    jz .from_kernel
+    swapgs
+.from_kernel:
     pushad
-    
+
     mov rcx, rsp
-    
+
     mov rbp, rsp
     and rsp, ~0xF
     sub rsp, 32
-    
+
     cld
     call irqHandler
-    
+
     mov rsp, rbp
-    
+
     popad
     add rsp, 16
+    test qword [rsp + 8], 3
+    jz .to_kernel
+    swapgs
+.to_kernel:
     iretq
 
 %assign i 32

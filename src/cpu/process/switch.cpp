@@ -66,6 +66,14 @@ extern "C" __attribute__((naked)) void processTrampoline() {
     asm volatile (
         ".intel_syntax noprefix\n"
         "cli\n"
+        // Entering user mode: drop the big kernel lock the switching context
+        // handed us. Aligned stack + shadow space below the frame we read next;
+        // r12 is preserved by the callee and reloaded/zeroed afterwards.
+        "mov r12, rsp\n"
+        "and rsp, -16\n"
+        "sub rsp, 32\n"
+        "call kernelLockExitToUser\n"
+        "mov rsp, r12\n"
         "mov rax, [rsp + 0]\n"
         "mov rbx, [rsp + 8]\n"
         "add rsp, 16\n"
@@ -91,14 +99,7 @@ extern "C" __attribute__((naked)) void processTrampoline() {
         "xor r13, r13\n"
         "xor r14, r14\n"
         "xor r15, r15\n"
-        "mov ecx, 0xC0000102\n"
-        "rdmsr\n"
-        "test eax, eax\n"
-        "jne 1f\n"
-        "test edx, edx\n"
-        "jne 1f\n"
-        "swapgs\n"
-        "1:\n"
+        "swapgs\n"   // kernel GS -> user GS (see percpu.hpp)
         "mov rcx, [rbx]\n"
         "lea rdx, [rbx + 8]\n"
         "iretq\n"
@@ -114,6 +115,14 @@ extern "C" __attribute__((naked)) void forkChildTrampoline() {
     asm volatile(
         ".intel_syntax noprefix\n"
         "cli\n"
+        // Entering user mode: drop the big kernel lock the switching context
+        // handed us. Aligned stack + shadow space below the frame we read next;
+        // r12 is preserved by the callee and reloaded/zeroed afterwards.
+        "mov r12, rsp\n"
+        "and rsp, -16\n"
+        "sub rsp, 32\n"
+        "call kernelLockExitToUser\n"
+        "mov rsp, r12\n"
         "mov rax, [rsp + 120]\n"   // fsbase
         "mov rdx, rax\n"
         "shr rdx, 32\n"
@@ -145,6 +154,14 @@ extern "C" __attribute__((naked)) void threadTrampoline() {
     asm volatile (
         ".intel_syntax noprefix\n"
         "cli\n"
+        // Entering user mode: drop the big kernel lock the switching context
+        // handed us. Aligned stack + shadow space below the frame we read next;
+        // r12 is preserved by the callee and reloaded/zeroed afterwards.
+        "mov r12, rsp\n"
+        "and rsp, -16\n"
+        "sub rsp, 32\n"
+        "call kernelLockExitToUser\n"
+        "mov rsp, r12\n"
         "mov rax, [rsp + 0]\n"
         "mov rbx, [rsp + 8]\n"
         "mov rdi, [rsp + 16]\n"
@@ -170,14 +187,7 @@ extern "C" __attribute__((naked)) void threadTrampoline() {
         "xor r13, r13\n"
         "xor r14, r14\n"
         "xor r15, r15\n"
-        "mov ecx, 0xC0000102\n"
-        "rdmsr\n"
-        "test eax, eax\n"
-        "jne 1f\n"
-        "test edx, edx\n"
-        "jne 1f\n"
-        "swapgs\n"
-        "1:\n"
+        "swapgs\n"   // kernel GS -> user GS (see percpu.hpp)
         "mov rcx, rdi\n"
         "iretq\n"
         ".att_syntax prefix\n"

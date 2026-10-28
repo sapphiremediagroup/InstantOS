@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <common/spinlock.hpp>
 
 class USBInput {
 public:
@@ -29,7 +30,10 @@ private:
     uint8_t keyboardEndpoint = 0;
     uint8_t keyboardMaxPacket = 8;
     uint8_t keyboardInterface = 0;
+    uint8_t keyboardEp0MaxPacket = 8;
     uint8_t lastReport[8] = {};
+    uint8_t ledsSent = 0xFF;      // as Keyboard::lockLeds(); 0xFF: unknown
+    uint8_t ledFailures = 0;
 
     void* hcca = nullptr;
     void* interruptEd = nullptr;
@@ -48,6 +52,7 @@ private:
     bool enumerateDevice(uint8_t port, bool lowSpeed);
     void submitInterruptTransfer();
     void completeInterruptTransfer();
+    void syncKeyboardLeds();
 
-    volatile bool polling_lock = false;
+    Spinlock polling_lock{"ohci-poll"};
 };

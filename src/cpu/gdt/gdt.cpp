@@ -1,17 +1,27 @@
 #include <cpu/gdt/gdt.hpp>
+#include <cpu/percpu.hpp>
+#include <common/ports.hpp>
 #include <memory/vmm.hpp>
 // #include <cstddef>
 
 namespace {
 alignas(16) uint8_t doubleFaultStack[PAGE_SIZE * 4];
+constexpr uint32_t MSR_GS_BASE = 0xC0000101;
 }
 
 GDT& GDT::get(){
+    if (GDT* gdt = getPerCPU()->gdt) {
+        return *gdt;
+    }
+    return boot();
+}
+
+GDT& GDT::boot(){
     static GDT instance;
     return instance;
 }
 
-void GDT::initialize(){
+void GDT::initialize(uint64_t doubleFaultStackTop){
     gdtp.limit = (sizeof(GDTEntry) * 8) - 1;
     gdtp.base = (uint64_t)&gdt;
     
@@ -28,7 +38,9 @@ void GDT::initialize(){
     }
     
     tss.iopb = sizeof(TSS);
-    tss.ist1 = reinterpret_cast<uint64_t>(doubleFaultStack + sizeof(doubleFaultStack));
+    tss.ist1 = doubleFaultStackTop
+        ? doubleFaultStackTop
+        : reinterpret_cast<uint64_t>(doubleFaultStack + sizeof(doubleFaultStack));
     
     uint64_t tssBase = (uint64_t)&tss;
     uint32_t tssLimit = sizeof(TSS) - 1;
@@ -36,7 +48,11 @@ void GDT::initialize(){
     setTSS(5, tssBase, tssLimit);
     
     asm volatile("lgdt %0" : : "m"(gdtp));
-    
+
+    // Reloading GS below clears the GS base, which may already point at this
+    // CPU's PerCPUData; preserve it across the reload.
+    const uint64_t gsBase = rdmsr(MSR_GS_BASE);
+
     uint16_t data = (uint16_t)SegmentSelectors::KernelData;
     uint64_t code = (uint16_t)SegmentSelectors::KernelCode;
 
@@ -55,6 +71,8 @@ void GDT::initialize(){
         : "r"(data), "r"(code)
         : "rax", "memory"
     );
+
+    wrmsr(MSR_GS_BASE, gsBase);
 
     asm volatile("ltr %0" : : "r"((uint16_t)SegmentSelectors::TaskState));
 }

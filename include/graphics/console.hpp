@@ -1,5 +1,6 @@
 #pragma once
 #include <stdint.h>
+#include <common/spinlock.hpp>
 #include <common/tuple.hpp>
 #include <cpu/cereal/cereal.hpp>
 #include <graphics/framebuffer.hpp>
@@ -11,7 +12,7 @@ private:
     uint64_t posY;
     Color drawColor;
     Color backgroundColor;
-    int writeLock;
+    Spinlock writeLock{"console"};
     Pair<uint64_t, uint64_t> savedCursorPointer { 0, 0 };
     bool useVirtIO;
     bool copyScrollEnabled;

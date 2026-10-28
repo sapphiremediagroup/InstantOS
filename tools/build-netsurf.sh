@@ -2,12 +2,14 @@
 # Cross-build the NetSurf framebuffer browser against the InstantOS mlibc sysroot.
 #
 # Uses the NetSurf buildsystem (TARGET=framebuffer) with a minimal feature set:
-# no curl/openssl (built-in fetchers only for now), no JS (duktape), internal
-# bitmap font, our 'instant' libnsfb surface backend. Links against the NetSurf
-# core libs (build-netsurf-libs.sh) and the image stack (zlib/png/jpeg).
+# http(s) through libcurl + mbedTLS (CA bundle /etc/ssl/certs/ca-certificates.crt),
+# no JS (duktape), internal bitmap font, our 'instant' libnsfb surface backend.
+# Links against the NetSurf core libs (build-netsurf-libs.sh) and the image
+# stack (zlib/png/jpeg). Rerun cmake afterwards to bundle /bin/nsfb.
 #
 # Prerequisites: build-mlibc.sh, build-zlib.sh, build-libpng.sh, build-libjpeg.sh,
-#                build-netsurf-libs.sh
+#                build-mbedtls.sh, build-libcurl.sh, build-netsurf-libs.sh
+#                (host: gperf, bison, flex, and libpng headers for a build tool)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -52,6 +54,7 @@ apply_patch_once "$SRC_DIR" "$PORT_DIR/patches/netsurf-gui.patch"
 apply_patch_once "$SRC_DIR" "$PORT_DIR/patches/netsurf-fetch.patch"
 apply_patch_once "$SRC_DIR" "$PORT_DIR/patches/netsurf-config-mmap.patch"
 apply_patch_once "$SRC_DIR" "$PORT_DIR/patches/netsurf-cabundle.patch"
+apply_patch_once "$SRC_DIR" "$PORT_DIR/patches/netsurf-textinput.patch"
 
 # pkg-config must find our cross .pc files and NOTHING from the host. Point it
 # exclusively at the NetSurf+mlibc sysroots.

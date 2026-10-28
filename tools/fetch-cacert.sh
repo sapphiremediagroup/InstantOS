@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Fetch the Mozilla CA certificate bundle (PEM) for InstantOS's TLS stack.
 #
-# NetSurf (via libcurl + mbedTLS) does full certificate-chain validation, which
-# needs a set of trusted root CAs. We use the curl project's periodically
-# regenerated extract of Mozilla's CA store (cacert.pem) and bundle it into the
-# initrd at /netsurf/etc/cacert.pem (the /netsurf subtree is already mounted by
-# the kernel, so no new mount point is required).
+# curl and NetSurf (libcurl + mbedTLS) do full certificate-chain validation,
+# which needs a set of trusted root CAs. We use the curl project's periodically
+# regenerated extract of Mozilla's CA store (cacert.pem); CMake bundles it into
+# the initrd as ssl/certs/ca-certificates.crt, which the kernel mounts at
+# /etc/ssl (rerun cmake after fetching).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

@@ -119,7 +119,7 @@ enum event_type {
 
 enum key_action  { KEY_PRESS = 0, KEY_RELEASE = 1, KEY_REPEAT = 2 };
 enum key_mod     { MOD_SHIFT = 1, MOD_CTRL = 2, MOD_ALT = 4,
-                   MOD_CAPS = 8, MOD_SUPER = 16 };
+                   MOD_CAPS = 8, MOD_SUPER = 16, MOD_NUMLOCK = 32 };
 enum ptr_action  { PTR_MOVE = 0, PTR_BUTTON = 1, PTR_SCROLL = 2 };
 enum win_action  { WIN_NONE = 0, WIN_FOCUS_GAINED = 1, WIN_FOCUS_LOST = 2,
                    WIN_CLOSE_REQUESTED = 3, WIN_RESIZED = 4, WIN_MOVED = 5 };
@@ -167,6 +167,11 @@ struct ev {
  * Per-surface private state.
  * ------------------------------------------------------------------------- */
 
+#define PENDING_MAX 32
+
+/* Shift and Ctrl, per side (real_mods, fb_mods). */
+enum { HELD_LSHIFT = 1, HELD_RSHIFT = 2, HELD_LCTRL = 4, HELD_RCTRL = 8 };
+
 struct instant_priv {
     uint64_t compositor;   /* service handle */
     uint64_t surface;      /* surface handle */
@@ -176,7 +181,36 @@ struct instant_priv {
     int last_x;            /* last absolute pointer position */
     int last_y;
     bool close_requested;
+    /* One compositor key event can become several nsfb events (Shift up,
+     * key down, Shift down again); input() hands them out one per call. */
+    nsfb_event_t pending[PENDING_MAX];
+    int pending_head;
+    int pending_count;
+    uint8_t real_mods;     /* Shift/Ctrl keys held (HELD_*) */
+    uint8_t fb_mods;       /* the ones fbtk was told are down */
+    uint16_t held[0xE8];   /* per key held: the nsfb key its press sent */
 };
+
+static void push_event(struct instant_priv *priv, enum nsfb_event_type_e type, int keycode)
+{
+    if (priv->pending_count >= PENDING_MAX)
+        return;
+    nsfb_event_t *ev = &priv->pending[(priv->pending_head + priv->pending_count) % PENDING_MAX];
+    memset(ev, 0, sizeof(*ev));
+    ev->type = type;
+    ev->value.keycode = keycode;
+    priv->pending_count++;
+}
+
+static bool pop_event(struct instant_priv *priv, nsfb_event_t *event)
+{
+    if (priv->pending_count == 0)
+        return false;
+    *event = priv->pending[priv->pending_head];
+    priv->pending_head = (priv->pending_head + 1) % PENDING_MAX;
+    priv->pending_count--;
+    return true;
+}
 
 /* -------------------------------------------------------------------------
  * Compositor helpers.
@@ -363,16 +397,157 @@ static int instant_update(nsfb_t *nsfb, nsfb_bbox_t *box)
     return 0;
 }
 
-/* Map an InstantOS keycode (mostly ASCII, with the special codes above 255)
- * into an nsfb keycode. For the common ASCII range the values coincide. */
-static enum nsfb_key_code_e map_keycode(uint16_t code, const char *text)
+/* InstantOS key codes (USB HID usages, KeyCode in syscall.hpp) of the keys
+ * that type no text, as nsfb keys; NSFB_KEY_UNKNOWN for the rest. */
+static enum nsfb_key_code_e special_key(uint16_t keycode)
 {
-    if (code != 0 && code < 128)
-        return (enum nsfb_key_code_e)code;
-    /* Fall back to the produced text byte if the raw code is non-ASCII. */
-    if (text != NULL && text[0] != '\0' && (unsigned char)text[0] < 128)
-        return (enum nsfb_key_code_e)(unsigned char)text[0];
-    return (enum nsfb_key_code_e)code;
+    if (keycode >= 0x3A && keycode <= 0x45)        /* F1..F12 */
+        return (enum nsfb_key_code_e)(NSFB_KEY_F1 + (keycode - 0x3A));
+    switch (keycode) {
+    case 0x28: case 0x58: return NSFB_KEY_RETURN;  /* Enter, keypad Enter */
+    case 0x29: return NSFB_KEY_ESCAPE;
+    case 0x2A: return NSFB_KEY_BACKSPACE;
+    case 0x2B: return NSFB_KEY_TAB;
+    case 0x49: return NSFB_KEY_INSERT;
+    case 0x4A: return NSFB_KEY_HOME;
+    case 0x4B: return NSFB_KEY_PAGEUP;
+    case 0x4C: return NSFB_KEY_DELETE;
+    case 0x4D: return NSFB_KEY_END;
+    case 0x4E: return NSFB_KEY_PAGEDOWN;
+    case 0x4F: return NSFB_KEY_RIGHT;
+    case 0x50: return NSFB_KEY_LEFT;
+    case 0x51: return NSFB_KEY_DOWN;
+    case 0x52: return NSFB_KEY_UP;
+    default: return NSFB_KEY_UNKNOWN;
+    }
+}
+
+/* The kernel hands us the finished character (Shift already applied), but
+ * NetSurf's toolkit turns key codes into text itself, through an unshifted
+ * and a shifted table (fbtk/event.c keymap/sh_keymap) and the Shift/Ctrl
+ * state it follows from key events. So pick the key that yields the
+ * character and say whether Shift must be down for it. */
+static enum nsfb_key_code_e key_for_char(unsigned char c, bool *shift)
+{
+    *shift = false;
+    if (c >= 'A' && c <= 'Z') {
+        *shift = true;
+        return (enum nsfb_key_code_e)(c - 'A' + 'a');
+    }
+    switch (c) {
+    case '%': *shift = true; return NSFB_KEY_5;
+    case '^': *shift = true; return NSFB_KEY_6;
+    case '{': *shift = true; return NSFB_KEY_LEFTBRACKET;
+    case '|': *shift = true; return NSFB_KEY_BACKSLASH;
+    case '}': *shift = true; return NSFB_KEY_RIGHTBRACKET;
+    default:
+        return (enum nsfb_key_code_e)c;
+    }
+}
+
+/* The Shift and Ctrl keys, as bits of real_mods/fb_mods, their InstantOS key
+ * codes (0xE0 left Ctrl, 0xE1 left Shift, 0xE4 right Ctrl, 0xE5 right Shift)
+ * and nsfb keys. */
+static const struct {
+    uint8_t bit;
+    uint16_t keycode;
+    enum nsfb_key_code_e nsfb;
+} side_mods[] = {
+    { HELD_LSHIFT, 0xE1, NSFB_KEY_LSHIFT },
+    { HELD_RSHIFT, 0xE5, NSFB_KEY_RSHIFT },
+    { HELD_LCTRL, 0xE0, NSFB_KEY_LCTRL },
+    { HELD_RCTRL, 0xE4, NSFB_KEY_RCTRL },
+};
+
+/* Tell fbtk the Shift/Ctrl keys in `want` are down and the rest up. */
+static void set_fb_mods(struct instant_priv *priv, uint8_t want)
+{
+    for (unsigned i = 0; i < sizeof(side_mods) / sizeof(side_mods[0]); i++) {
+        const uint8_t bit = side_mods[i].bit;
+        if ((want & bit) != (priv->fb_mods & bit))
+            push_event(priv, (want & bit) ? NSFB_EVENT_KEY_DOWN : NSFB_EVENT_KEY_UP,
+                       side_mods[i].nsfb);
+    }
+    priv->fb_mods = want;
+}
+
+/* The event's modifier bits are the truth: a Shift or Ctrl released while
+ * another window had the focus never reached us. */
+static void follow_modifiers(struct instant_priv *priv, uint16_t modifiers)
+{
+    if ((modifiers & MOD_SHIFT) == 0)
+        priv->real_mods &= (uint8_t)~(HELD_LSHIFT | HELD_RSHIFT);
+    else if ((priv->real_mods & (HELD_LSHIFT | HELD_RSHIFT)) == 0)
+        priv->real_mods |= HELD_LSHIFT;
+    if ((modifiers & MOD_CTRL) == 0)
+        priv->real_mods &= (uint8_t)~(HELD_LCTRL | HELD_RCTRL);
+    else if ((priv->real_mods & (HELD_LCTRL | HELD_RCTRL)) == 0)
+        priv->real_mods |= HELD_LCTRL;
+}
+
+/* Queue the nsfb events for one key event. Shift and Ctrl go down and up as
+ * the real keys do, other keys go down on each press and repeat and up on
+ * release. fbtk makes the text from the key and its own (UK) shifted table,
+ * so a typed character goes as the key key_for_char picks, with Shift held
+ * or lifted around it as that needs. Keys with Super held are the
+ * compositor's shortcuts. */
+static void queue_key(struct instant_priv *priv, const struct key_event *key)
+{
+    const uint16_t keycode = key->keycode;
+    if (key->action != KEY_RELEASE)
+        follow_modifiers(priv, key->modifiers);
+
+    for (unsigned i = 0; i < sizeof(side_mods) / sizeof(side_mods[0]); i++) {
+        if (keycode == side_mods[i].keycode) {
+            if (key->action == KEY_RELEASE)
+                priv->real_mods &= (uint8_t)~side_mods[i].bit;
+            else
+                priv->real_mods |= side_mods[i].bit;
+            set_fb_mods(priv, priv->real_mods);
+            return;
+        }
+    }
+
+    if (keycode >= sizeof(priv->held) / sizeof(priv->held[0]))
+        return;
+    if (key->action == KEY_RELEASE) {
+        if (priv->held[keycode] != NSFB_KEY_UNKNOWN)
+            push_event(priv, NSFB_EVENT_KEY_UP, priv->held[keycode]);
+        priv->held[keycode] = NSFB_KEY_UNKNOWN;
+        return;
+    }
+    if (key->modifiers & MOD_SUPER)
+        return;
+
+    uint8_t mods = priv->real_mods;   /* Shift+arrows select */
+    enum nsfb_key_code_e code = special_key(keycode);
+    if (code == NSFB_KEY_UNKNOWN) {
+        const unsigned char c = (unsigned char)key->text[0];
+        if (c == 0 || c >= 128)
+            return;   /* nothing fbtk could type */
+        bool shift;
+        code = key_for_char(c, &shift);
+        mods &= (uint8_t)~(HELD_LSHIFT | HELD_RSHIFT);
+        if (shift)
+            mods |= (priv->real_mods & HELD_RSHIFT) ? HELD_RSHIFT : HELD_LSHIFT;
+    }
+    set_fb_mods(priv, mods);
+    push_event(priv, NSFB_EVENT_KEY_DOWN, code);
+    set_fb_mods(priv, priv->real_mods);
+    priv->held[keycode] = (uint16_t)code;
+}
+
+/* The focus went elsewhere, and with it the releases of what is held now:
+ * let go of all of it. */
+static void release_all(struct instant_priv *priv)
+{
+    for (unsigned k = 0; k < sizeof(priv->held) / sizeof(priv->held[0]); k++) {
+        if (priv->held[k] != NSFB_KEY_UNKNOWN)
+            push_event(priv, NSFB_EVENT_KEY_UP, priv->held[k]);
+        priv->held[k] = NSFB_KEY_UNKNOWN;
+    }
+    priv->real_mods = 0;
+    set_fb_mods(priv, 0);
 }
 
 static bool instant_input(nsfb_t *nsfb, nsfb_event_t *event, int timeout)
@@ -391,6 +566,8 @@ static bool instant_input(nsfb_t *nsfb, nsfb_event_t *event, int timeout)
         event->value.controlcode = NSFB_CONTROL_QUIT;
         return true;
     }
+    if (pop_event(priv, event))
+        return true;
 
     /* Wait policy:
      *   timeout < 0  -> block in queue_receive until an event arrives.
@@ -432,13 +609,8 @@ static bool instant_input(nsfb_t *nsfb, nsfb_event_t *event, int timeout)
 
     switch (e.type) {
     case EVT_KEY:
-        if (e.u.key.action == KEY_RELEASE) {
-            event->type = NSFB_EVENT_KEY_UP;
-        } else {
-            event->type = NSFB_EVENT_KEY_DOWN; /* press or repeat */
-        }
-        event->value.keycode = map_keycode(e.u.key.keycode, e.u.key.text);
-        return true;
+        queue_key(priv, &e.u.key);
+        return pop_event(priv, event);
 
     case EVT_POINTER:
         if (e.u.pointer.action == PTR_SCROLL) {
@@ -480,7 +652,11 @@ static bool instant_input(nsfb_t *nsfb, nsfb_event_t *event, int timeout)
             event->value.controlcode = NSFB_CONTROL_QUIT;
             return true;
         }
-        /* Other window events (focus, resize, commit-ack) are not surfaced. */
+        if (e.u.window.action == WIN_FOCUS_LOST) {
+            release_all(priv);
+            return pop_event(priv, event);
+        }
+        /* Other window events (focus gained, resize) are not surfaced. */
         return false;
 
     default:

@@ -5,6 +5,7 @@
 #include <cpu/process/scheduler.hpp>
 #include <debug/diag.hpp>
 #include <memory/vmm.hpp>
+#include <fs/storage/storage_lock.hpp>
 #include <common/ports.hpp>
 #include <cpu/cpuid.hpp>
 extern "C" void atexit(){
@@ -16,9 +17,6 @@ constexpr uint32_t MSR_LSTAR  = 0xC0000082;
 constexpr uint32_t MSR_SFMASK = 0xC0000084;
 
 Syscall syscallInstance;
-
-extern "C" uint64_t userRSP = 0;
-extern "C" uint64_t kernelStackTop = 0;
 
 extern "C" void saveSyscallState(uint64_t* stack);
 extern "C" void restoreSyscallState(uint64_t* stack, uint64_t result);
@@ -115,6 +113,10 @@ void Syscall::initialize() {
         while(1);
     }
 
+    initializeCpu();
+}
+
+void Syscall::initializeCpu() {
     uint64_t efer = rdmsr(MSR_EFER);
     wrmsr(MSR_EFER, efer | 0x1);
 
@@ -125,12 +127,9 @@ void Syscall::initialize() {
     wrmsr(MSR_LSTAR, reinterpret_cast<uint64_t>(&syscallEntry));
 
     wrmsr(MSR_SFMASK, 0x200);
-
-    initPerCPU(kernelStackTop);
 }
 
 void Syscall::setKernelStack(uint64_t stack) {
-    kernelStackTop = stack;
     getPerCPU()->kernelStack = stack;
     GDT::get().setKernelStack(stack);
 }
@@ -172,6 +171,14 @@ uint64_t Syscall::handle(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
             return sys_mprotect(arg1, arg2, arg3);
         case Yield:
             return sys_yield();
+        case SchedSetAffinity:
+            return sys_sched_setaffinity(arg1, arg2, arg3);
+        case SchedGetAffinity:
+            return sys_sched_getaffinity(arg1, arg2, arg3);
+        case GetCpu:
+            return sys_getcpu();
+        case CpuInfo:
+            return sys_cpu_info(arg1, arg2);
         case Sleep:
             return sys_sleep(arg1);
         case GetTime:
@@ -372,6 +379,28 @@ uint64_t Syscall::handle(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
             return sys_net_process_packets();
         case NetGetPingReply:
             return sys_net_get_ping_reply(arg1);
+        case NetGetConfig:
+            return sys_net_get_config(arg1, arg2, arg3);
+        case NetSetConfig:
+            return sys_net_set_config(arg1, arg2);
+        case SendTo:
+            return sys_sendto(arg1, arg2, arg3, arg4, arg5);
+        case RecvFrom:
+            return sys_recvfrom(arg1, arg2, arg3, arg4, arg5);
+        case GetTimeNs:
+            return sys_gettime_ns();
+        case SetItimer:
+            return sys_setitimer(arg1, arg2, arg3);
+        case GetItimer:
+            return sys_getitimer(arg1, arg2);
+        case GetUnixTimeNs:
+            return sys_get_unix_time_ns();
+        case SetUnixTime:
+            return sys_set_unix_time(arg1);
+        case WindowPostEvent:
+            return sys_window_post_event(arg1, arg2);
+        case KernelLog:
+            return sys_kernel_log(arg1, arg2);
         case ThreadCreate:
             return sys_thread_create(arg1, arg2, arg3);
         case ThreadClone:
@@ -514,6 +543,34 @@ bool Syscall::copyUserString(uint64_t ptr, char* dest, size_t destSize) {
     return copyStringFromUser(ptr, dest, destSize);
 }
 
+namespace {
+// Syscalls whose disk I/O may run without the big kernel lock (StorageLock).
+// Each keeps only stack copies across its VFS calls, plus fds it pins itself,
+// so other CPUs may run kernel code while it waits for the disk.
+bool storageMayRunUnlocked(uint64_t syscallNum) {
+    switch (static_cast<SyscallNumber>(syscallNum)) {
+        using enum SyscallNumber;
+        case Read:
+        case Write:
+        case Open:
+        case Stat:
+        case Lstat:
+        case Fstat:
+        case Access:
+        case Unlink:
+        case Mkdir:
+        case Rmdir:
+        case Rename:
+        case Readdir:
+        case Readlink:
+        case Fsync:
+            return true;
+        default:
+            return false;
+    }
+}
+} // namespace
+
 extern "C" uint64_t syscallHandler(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t arg4, uint64_t arg5) {
     Process* current = Scheduler::get().getCurrentProcess();
     
@@ -522,7 +579,11 @@ extern "C" uint64_t syscallHandler(uint64_t syscall_num, uint64_t arg1, uint64_t
     }
 
     Debug::beginSyscallTrace(current, syscall_num, arg1, arg2, arg3, arg4, arg5);
-    uint64_t result = Syscall::get().handle(syscall_num, arg1, arg2, arg3, arg4, arg5);
+    uint64_t result;
+    {
+        StorageLock::AllowUnlocked unlocked(storageMayRunUnlocked(syscall_num));
+        result = Syscall::get().handle(syscall_num, arg1, arg2, arg3, arg4, arg5);
+    }
     Debug::endSyscallTrace(current);
 
     if (current && static_cast<SyscallNumber>(syscall_num) != SyscallNumber::SigReturn) {

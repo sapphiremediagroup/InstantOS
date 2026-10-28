@@ -14,6 +14,50 @@ struct OSInfo {
     uint64_t buildnum;
 };
 
+// One CPU, as reported by the CpuInfo syscall.
+struct CpuInfoEntry {
+    uint32_t index;         // SMP index (0 = boot CPU)
+    uint32_t lapicId;
+    uint64_t deviceIrqs;    // device interrupts this CPU served
+    uint32_t currentPid;    // 0 while idle
+    uint32_t reserved;
+};
+
+// Interface configuration, read with NetGetConfig and set with NetSetConfig.
+// Addresses are IPv4 in network byte order, as in sockaddr_in.
+constexpr uint32_t NET_CONFIG_MAX_DNS = 3;
+constexpr uint32_t NET_CONFIG_DOMAIN_SIZE = 64;
+
+enum NetConfigFlags : uint32_t {
+    NetConfigUp = 1u << 0,      // an address is configured
+    NetConfigDhcp = 1u << 1,    // ... and it came from a DHCP lease
+};
+
+// NetSetConfig modes.
+enum NetConfigMode : uint64_t {
+    NetConfigStatic = 0,        // use address/netmask/gateway/dns from the struct
+    NetConfigDhcpStart = 1,     // drop the address and ask DHCP from scratch
+    NetConfigDhcpRenew = 2,     // renew the current lease now
+    NetConfigDown = 3,          // no address, DHCP off
+};
+
+struct NetConfig {
+    uint32_t flags;           // NetConfigFlags
+    uint32_t address;
+    uint32_t netmask;
+    uint32_t gateway;
+    uint32_t dns[NET_CONFIG_MAX_DNS];
+    uint32_t dnsCount;
+    uint32_t dhcpServer;      // 0 unless from DHCP
+    uint32_t leaseSeconds;    // granted lease, 0xFFFFFFFF = infinite
+    uint32_t leaseRemaining;  // seconds left on it
+    uint32_t ntpServer;       // NTP server (DHCP option 42), 0 if none
+    uint64_t generation;      // changes whenever the configuration does
+    char domain[NET_CONFIG_DOMAIN_SIZE];   // DHCP domain name, "" if none
+    uint32_t linkUp;          // 1 while the NIC has a link
+    char device[16];          // driver of the NIC in use ("e1000", "rtl8168h", ...), "" if none
+};
+
 struct ProcInfoEntry {
     uint32_t pid;
     uint32_t parentPID;
@@ -190,7 +234,30 @@ enum KeyModifiers : uint16_t {
     KeyModifierControl = 1 << 1,
     KeyModifierAlt = 1 << 2,
     KeyModifierCapsLock = 1 << 3,
-    KeyModifierSuper = 1 << 4
+    KeyModifierSuper = 1 << 4,
+    KeyModifierNumLock = 1 << 5
+};
+
+// Key codes: the USB HID keyboard usage (page 0x07) of the physical key,
+// whichever keyboard it came from (PS/2 scancodes are translated). They name
+// keys, not characters: KeyEvent.text carries what the key typed.
+enum KeyCode : uint16_t {
+    KeyNone = 0x00,
+    KeyA = 0x04, KeyB, KeyC, KeyD, KeyE, KeyF, KeyG, KeyH, KeyI, KeyJ, KeyK, KeyL, KeyM,
+    KeyN, KeyO, KeyP, KeyQ, KeyR, KeyS, KeyT, KeyU, KeyV, KeyW, KeyX, KeyY, KeyZ,
+    Key1 = 0x1E, Key2, Key3, Key4, Key5, Key6, Key7, Key8, Key9, Key0,
+    KeyEnter = 0x28, KeyEscape, KeyBackspace, KeyTab, KeySpace,
+    KeyMinus = 0x2D, KeyEqual, KeyLeftBracket, KeyRightBracket, KeyBackslash,
+    KeySemicolon = 0x33, KeyApostrophe, KeyGrave, KeyComma, KeyPeriod, KeySlash,
+    KeyCapsLock = 0x39,
+    KeyF1 = 0x3A, KeyF2, KeyF3, KeyF4, KeyF5, KeyF6, KeyF7, KeyF8, KeyF9, KeyF10, KeyF11, KeyF12,
+    KeyPrintScreen = 0x46, KeyScrollLock, KeyPause, KeyInsert, KeyHome, KeyPageUp,
+    KeyDelete, KeyEnd, KeyPageDown, KeyRight, KeyLeft, KeyDown, KeyUp,
+    KeyNumLock = 0x53, KeypadSlash, KeypadAsterisk, KeypadMinus, KeypadPlus, KeypadEnter,
+    Keypad1 = 0x59, Keypad2, Keypad3, Keypad4, Keypad5, Keypad6, Keypad7, Keypad8, Keypad9, Keypad0,
+    KeypadPeriod = 0x63, KeyNonUsBackslash, KeyApplication,
+    KeyLeftControl = 0xE0, KeyLeftShift, KeyLeftAlt, KeyLeftSuper,
+    KeyRightControl, KeyRightShift, KeyRightAlt, KeyRightSuper,
 };
 
 enum class PointerEventAction : uint16_t {
@@ -208,6 +275,11 @@ enum class WindowEventAction : uint16_t {
     Moved
 };
 
+// action: Press, Release, or Repeat while held. keycode: a KeyCode.
+// modifiers: KeyModifiers held or locked at the time. text: the UTF-8 the key
+// typed, NUL-terminated, "" for keys that type nothing printable (Enter,
+// Backspace, Tab and Escape included: tell those by keycode). With Control
+// held, text is still the plain character ("c" for Ctrl+C).
 struct KeyEvent {
     KeyEventAction action;
     uint16_t modifiers;
@@ -509,6 +581,21 @@ enum class SyscallNumber : uint64_t {
     FdTableStash,
     FdTableFetch,
     ThreadClone,
+    SchedSetAffinity,
+    SchedGetAffinity,
+    GetCpu,
+    CpuInfo,
+    NetGetConfig,
+    NetSetConfig,
+    SendTo,
+    RecvFrom,
+    GetTimeNs,
+    SetItimer,
+    GetItimer,
+    GetUnixTimeNs,
+    SetUnixTime,
+    WindowPostEvent,
+    KernelLog,
 };
 
 enum MemoryProtection : uint64_t {
@@ -518,7 +605,9 @@ enum MemoryProtection : uint64_t {
 };
 
 enum SyscallErrno : int {
+    SysErrPermission = 1,
     SysErrNoEntry = 2,
+    SysErrNoProcess = 3,
     SysErrInterrupted = 4,
     SysErrBadFile = 9,
     SysErrNoChild = 10,
@@ -539,13 +628,21 @@ enum SyscallErrno : int {
     SysErrNotEmpty = 39,
     SysErrLoop = 40,
     SysErrNotSocket = 88,
+    SysErrMessageSize = 90,
     SysErrProtoOpt = 92,
     SysErrProtocolNotSupported = 93,
     SysErrOperationNotSupported = 95,
     SysErrAddressFamilyNotSupported = 97,
     SysErrAddressInUse = 98,
+    SysErrNetUnreachable = 101,
     SysErrConnectionReset = 104,
+    SysErrIsConnected = 106,
     SysErrTimedOut = 110,
+    SysErrConnectionRefused = 111,
+    SysErrHostDown = 112,
+    SysErrHostUnreachable = 113,
+    SysErrAlready = 114,
+    SysErrInProgress = 115,
     SysErrNotConnected = 107,
 };
 
@@ -578,6 +675,9 @@ public:
     static Syscall& get();
     
     void initialize();
+    // Programs the syscall MSRs (EFER.SCE, STAR, LSTAR, SFMASK) on the
+    // executing CPU; initialize() does this for the boot CPU.
+    void initializeCpu();
     void setKernelStack(uint64_t stack);
     uint64_t handle(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t arg4, uint64_t arg5);
     
@@ -613,6 +713,10 @@ private:
     uint64_t sys_munmap(uint64_t addr, uint64_t length);
     uint64_t sys_mprotect(uint64_t addr, uint64_t length, uint64_t prot);
     uint64_t sys_yield();
+    uint64_t sys_sched_setaffinity(uint64_t pid, uint64_t size, uint64_t maskPtr);
+    uint64_t sys_sched_getaffinity(uint64_t pid, uint64_t size, uint64_t maskPtr);
+    uint64_t sys_getcpu();
+    uint64_t sys_cpu_info(uint64_t index, uint64_t entryPtr);
     uint64_t sys_sleep(uint64_t ms);
     uint64_t sys_gettime();
     uint64_t sys_getunixtime();
@@ -733,6 +837,17 @@ private:
     uint64_t sys_net_ping(uint64_t dest_ip, uint64_t id, uint64_t seq);
     uint64_t sys_net_process_packets();
     uint64_t sys_net_get_ping_reply(uint64_t reply_ptr);
+    uint64_t sys_net_get_config(uint64_t config_ptr, uint64_t known_generation, uint64_t timeout_ms);
+    uint64_t sys_net_set_config(uint64_t config_ptr, uint64_t mode);
+    uint64_t sys_sendto(uint64_t socket, uint64_t buffer, uint64_t length, uint64_t flags, uint64_t address);
+    uint64_t sys_recvfrom(uint64_t socket, uint64_t buffer, uint64_t length, uint64_t flags, uint64_t address_out);
+    uint64_t sys_gettime_ns();
+    uint64_t sys_setitimer(uint64_t which, uint64_t new_value, uint64_t old_value);
+    uint64_t sys_getitimer(uint64_t which, uint64_t value);
+    uint64_t sys_get_unix_time_ns();
+    uint64_t sys_set_unix_time(uint64_t unix_ns);
+    uint64_t sys_window_post_event(uint64_t window_id, uint64_t event_ptr);
+    uint64_t sys_kernel_log(uint64_t buffer, uint64_t length);
 };
 
 extern "C" void syscallEntry();

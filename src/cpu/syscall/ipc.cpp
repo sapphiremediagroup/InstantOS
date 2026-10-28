@@ -215,6 +215,15 @@ uint64_t Syscall::sys_shared_free(uint64_t handle) {
         return static_cast<uint64_t>(-1);
     }
 
+    // A surface handle too: its pixels leave this process's address space and
+    // the handle is closed (a window keeps the surface while it shows it).
+    if (auto* surface = reinterpret_cast<SurfaceObject*>(current->getHandleObject(handle, HandleType::Surface))) {
+        if (surface->getBacking()) {
+            surface->getBacking()->unmapAllFrom(current);
+        }
+        return current->closeHandle(handle, HandleType::Surface) ? 0 : static_cast<uint64_t>(-1);
+    }
+
     auto* object = reinterpret_cast<SharedMemoryObject*>(current->getHandleObject(handle, HandleType::SharedMemory));
     if (!object) {
         return static_cast<uint64_t>(-1);
@@ -435,6 +444,10 @@ uint64_t Syscall::sys_window_list(uint64_t entriesPtr, uint64_t capacity) {
         return static_cast<uint64_t>(-1);
     }
 
+    // The list the compositor gets now names no dead surface, so the ones
+    // that died since the last call can leave its address space.
+    IPCManager::get().releaseRetiredSurfaces(current);
+
     memset(gWindowListScratch, 0, sizeof(gWindowListScratch));
     const size_t count = IPCManager::get().listWindows(gWindowListScratch, static_cast<size_t>(capacity));
 
@@ -490,6 +503,21 @@ uint64_t Syscall::sys_window_control(uint64_t windowId, uint64_t action) {
     return IPCManager::get().controlWindow(windowId, static_cast<WindowControlAction>(action), maxWidth, maxHeight)
         ? 0
         : static_cast<uint64_t>(-1);
+}
+
+// The compositor hands pointer input to the window under the pointer, in
+// that window's coordinates (the kernel only knows the screen position).
+uint64_t Syscall::sys_window_post_event(uint64_t windowId, uint64_t eventPtr) {
+    Process* current = Scheduler::get().getCurrentProcess();
+    if (!isCompositorProcess(current)) {
+        return static_cast<uint64_t>(-1);
+    }
+    Event event = {};
+    if (!copyFromUser(&event, eventPtr, sizeof(event)) ||
+        (event.type != EventType::Pointer && event.type != EventType::Key)) {
+        return static_cast<uint64_t>(-1);
+    }
+    return IPCManager::get().postEventToWindow(windowId, event) ? 0 : static_cast<uint64_t>(-1);
 }
 
 uint64_t Syscall::sys_queue_create() {

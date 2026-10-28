@@ -64,8 +64,13 @@ private:
     GDTPointer gdtp;
     TSS tss;
 public:
+    // The executing CPU's GDT (the boot CPU's until per-CPU data is set up).
     static GDT& get();
-    void initialize();
+    // The boot CPU's GDT.
+    static GDT& boot();
+    // Loads this GDT + TSS on the executing CPU. doubleFaultStackTop is the
+    // IST1 stack for #DF; 0 uses the boot CPU's static stack.
+    void initialize(uint64_t doubleFaultStackTop = 0);
 
     void setTSS(int index, uint64_t base, uint32_t limit);
     void setGate64(int num, uint8_t access, uint8_t gran);

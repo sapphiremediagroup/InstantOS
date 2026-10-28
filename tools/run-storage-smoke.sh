@@ -68,7 +68,7 @@ run_case() {
     -serial chardev:serial0 \
     -monitor none \
     -m 1G \
-    -smp 2 \
+    -smp "${QEMU_SMP:-2}" \
     -no-shutdown \
     -no-reboot \
     ${QEMU_EXTRA_ARGS:-}

@@ -1,6 +1,7 @@
 #include <fs/storage/storage.hpp>
 #include <fs/fat32/fat32.hpp>
 #include <fs/vfs/vfs.hpp>
+#include <fs/storage/storage_lock.hpp>
 #include <memory/heap.hpp>
 
 namespace {
@@ -101,6 +102,7 @@ StorageInfo snapshot()
 
 int formatFat32()
 {
+    StorageLock::Section section;
     if (!storageDevice || storageInfo.sectorSize != 512 || storageInfo.totalSize < 4 * 1024 * 1024) {
         return -1;
     }

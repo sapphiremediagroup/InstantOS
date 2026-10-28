@@ -1,6 +1,7 @@
 #include <debug/diag.hpp>
 #include <memory/heap.hpp>
 #include <memory/pmm.hpp>
+#include <common/spinlock.hpp>
 
 static constexpr uint64_t HEADER_MAGIC = 0xC001CAFEDEADBEEF;
 static constexpr uint64_t FOOTER_MAGIC = 0xFEE1DEADBAADF00D;
@@ -38,35 +39,12 @@ struct FreeNode {
     FreeNode* prev;
 };
 
-struct Spinlock {
-    int locked = 0;
-    unsigned long savedFlags = 0;
-    void lock() {
-        // Disable interrupts while holding the lock so a timer/IRQ handler that
-        // also allocates (e.g. the scheduler reaping a process via kfree) cannot
-        // deadlock against a thread that already holds this non-reentrant lock.
-        unsigned long flags;
-        __asm__ volatile("pushfq; pop %q0" : "=r"(flags) :: "memory");
-        __asm__ volatile("cli" ::: "memory");
-        while (__sync_lock_test_and_set(&locked, 1)) {
-            __asm__ volatile("pause" ::: "memory");
-        }
-        savedFlags = flags;
-    }
-    void unlock() {
-        unsigned long flags = savedFlags;
-        __sync_lock_release(&locked);
-        if (flags & 0x200) {
-            __asm__ volatile("sti" ::: "memory");
-        }
-    }
-};
 
 static uintptr_t heap_base_addr = 0;   // first arena base (for heap_base())
 static size_t heap_total_size = 0;     // first arena size (for heap_size())
 static FreeNode* free_lists[MAX_ORDER + 1] = {nullptr};
 static HeapStats stats = {0, 0, 0};
-static Spinlock heap_lock;
+static IrqSpinlock heap_lock("heap");
 
 static HeapArena g_arenas[MAX_ARENAS];
 static int g_arenaCount = 0;
@@ -279,7 +257,7 @@ void* kmalloc_aligned(size_t size, size_t align) {
 
     if (order > MAX_ORDER) return nullptr;
 
-    heap_lock.lock();
+    const uint64_t heapFlags = heap_lock.lock();
 
     void* result = alloc_locked(order, size, align);
     if (!result) {
@@ -290,7 +268,7 @@ void* kmalloc_aligned(size_t size, size_t align) {
         }
     }
 
-    heap_lock.unlock();
+    heap_lock.unlock(heapFlags);
     return result;
 }
 
@@ -321,7 +299,7 @@ void kfree(void* ptr) {
         kernel_panic("heap footer corruption");
     }
 
-    heap_lock.lock();
+    const uint64_t heapFlags = heap_lock.lock();
     
     stats.total_allocated -= hdr->user_size;
     poisonRange(ptr, hdr->user_size, FREE_POISON);
@@ -372,7 +350,7 @@ void kfree(void* ptr) {
 
     stats.free_block_count++;
 
-    heap_lock.unlock();
+    heap_lock.unlock(heapFlags);
 }
 
 void* krealloc(void* ptr, size_t new_size) {
@@ -389,11 +367,11 @@ void* krealloc(void* ptr, size_t new_size) {
 
     size_t old_size = hdr->user_size;
     if (new_size <= old_size) {
-        heap_lock.lock();
+        const uint64_t heapFlags = heap_lock.lock();
         stats.total_allocated -= old_size;
         stats.total_allocated += new_size;
         hdr->user_size = new_size;
-        heap_lock.unlock();
+        heap_lock.unlock(heapFlags);
         return ptr;
     }
 
@@ -401,13 +379,13 @@ void* krealloc(void* ptr, size_t new_size) {
     size_t capacity = block_end - (uintptr_t)ptr;
 
     if (new_size <= capacity) {
-        heap_lock.lock();
+        const uint64_t heapFlags = heap_lock.lock();
         stats.total_allocated += (new_size - old_size);
         hdr->user_size = new_size;
         if (stats.total_allocated > stats.peak_usage) {
             stats.peak_usage = stats.total_allocated;
         }
-        heap_lock.unlock();
+        heap_lock.unlock(heapFlags);
         return ptr;
     }
 
@@ -425,9 +403,9 @@ void* krealloc(void* ptr, size_t new_size) {
 }
 
 HeapStats heap_stats() {
-    heap_lock.lock();
+    const uint64_t heapFlags = heap_lock.lock();
     HeapStats s = stats;
-    heap_lock.unlock();
+    heap_lock.unlock(heapFlags);
     return s;
 }
 

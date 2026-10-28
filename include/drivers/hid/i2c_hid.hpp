@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <common/spinlock.hpp>
 
 class I2CHIDController {
 public:
@@ -133,7 +134,7 @@ private:
     bool initialized = false;
     bool devicesProbed = false;
     bool gpioInterruptsRegistered = false;
-    volatile bool pollingLock = false;
+    Spinlock pollingLock{"i2c-hid-poll"};
     uint8_t controllerCount = 0;
     uint8_t hidHintCount = 0;
     uint8_t deviceCount = 0;

@@ -174,56 +174,6 @@ bool td_ok(const OHCITransferDescriptor* td) {
     uint32_t cc = td_cc(td);
     return cc == 0 || cc == 0xD;
 }
-
-char hid_usage_to_char(uint8_t usage, bool shift) {
-    static constexpr char normal[] = {
-        0, 0, 0, 0,
-        'a','b','c','d','e','f','g','h','i','j','k','l','m',
-        'n','o','p','q','r','s','t','u','v','w','x','y','z',
-        '1','2','3','4','5','6','7','8','9','0',
-        '\n', 0, '\b', '\t', ' ', '-', '=', '[', ']', '\\',
-        0, ';', '\'', '`', ',', '.', '/'
-    };
-    static constexpr char shifted[] = {
-        0, 0, 0, 0,
-        'A','B','C','D','E','F','G','H','I','J','K','L','M',
-        'N','O','P','Q','R','S','T','U','V','W','X','Y','Z',
-        '!','@','#','$','%','^','&','*','(',')',
-        '\n', 0, '\b', '\t', ' ', '_', '+', '{', '}', '|',
-        0, ':', '"', '~', '<', '>', '?'
-    };
-
-    if (usage >= sizeof(normal)) {
-        return 0;
-    }
-    return shift ? shifted[usage] : normal[usage];
-}
-
-uint16_t hid_modifier_byte_to_key_modifiers(uint8_t modifiers) {
-    uint16_t out = KeyModifierNone;
-    if (modifiers & 0x22) {
-        out |= KeyModifierShift;
-    }
-    if (modifiers & 0x11) {
-        out |= KeyModifierControl;
-    }
-    if (modifiers & 0x44) {
-        out |= KeyModifierAlt;
-    }
-    if (modifiers & 0x88) {
-        out |= KeyModifierSuper;
-    }
-    return out;
-}
-
-bool report_had_key(const uint8_t* report, uint8_t usage) {
-    for (int i = 2; i < 8; ++i) {
-        if (report[i] == usage) {
-            return true;
-        }
-    }
-    return false;
-}
 }
 
 USBInput& USBInput::get() {
@@ -263,18 +213,19 @@ void USBInput::poll() {
         return;
     }
 
-    if (__atomic_test_and_set(&polling_lock, __ATOMIC_ACQUIRE)) {
+    if (!polling_lock.tryLock()) {
         return;
     }
 
     if (!interruptPending) {
         submitInterruptTransfer();
-        __atomic_clear(&polling_lock, __ATOMIC_RELEASE);
+        polling_lock.unlock();
         return;
     }
 
     completeInterruptTransfer();
-    __atomic_clear(&polling_lock, __ATOMIC_RELEASE);
+    syncKeyboardLeds();
+    polling_lock.unlock();
 }
 
 bool USBInput::hasKeyboard() const {
@@ -747,6 +698,7 @@ bool USBInput::enumerateDevice(uint8_t port, bool lowSpeed) {
 
     keyboardAddress = address;
     keyboardLowSpeed = lowSpeed;
+    keyboardEp0MaxPacket = ep0MaxPacket;
     keyboardEndpoint = static_cast<uint8_t>(endpointAddress & 0x0F);
     keyboardMaxPacket = endpointMaxPacket;
     keyboardInterface = interfaceNumber;
@@ -801,6 +753,29 @@ void USBInput::submitInterruptTransfer() {
     interruptPending = true;
 }
 
+// The lock lights: a boot-protocol SET_REPORT whenever the keyboard core's
+// differ from what the keyboard shows. The control list runs beside the
+// interrupt transfer.
+void USBInput::syncKeyboardLeds() {
+    const uint8_t leds = Keyboard::get().lockLeds();
+    if (!keyboardReady || ledFailures >= 3 || leds == ledsSent) {
+        return;
+    }
+    UsbSetupPacket setup = {};
+    setup.requestType = 0x21;
+    setup.request = USB_REQUEST_SET_REPORT;
+    setup.value = 0x0200;   // output report, no ID
+    setup.index = keyboardInterface;
+    setup.length = 1;
+    uint8_t report = leds;
+    if (ohci_control_transfer(regs, keyboardAddress, keyboardLowSpeed, keyboardEp0MaxPacket, setup, &report, 1)) {
+        ledsSent = leds;
+        ledFailures = 0;
+    } else if (++ledFailures == 3) {
+        log_str("[usb:kbd] keyboard does not take its lights\n");
+    }
+}
+
 void USBInput::completeInterruptTransfer() {
     auto* ed = reinterpret_cast<OHCIEndpointDescriptor*>(interruptEd);
     if ((ed->headP & 0x1U) != 0) {
@@ -824,21 +799,10 @@ void USBInput::completeInterruptTransfer() {
     }
 
     auto* report = reinterpret_cast<uint8_t*>(interruptBuffer);
-    const uint16_t keyModifiers = hid_modifier_byte_to_key_modifiers(report[0]);
-    const bool shift = (keyModifiers & KeyModifierShift) != 0;
-    for (int i = 2; i < 8; ++i) {
-        uint8_t usage = report[i];
-        if (usage == 0 || report_had_key(lastReport, usage)) {
-            continue;
-        }
-
-        char c = hid_usage_to_char(usage, shift);
-        if (c != 0) {
-            Keyboard::get().injectKey(c, keyModifiers, "[usb:kbd]");
-        }
+    // Boot report: modifier byte, reserved byte, six key usages.
+    if (Keyboard::get().hidKeyboardReport(lastReport[0], report[0], lastReport + 2, report + 2, 6, "[usb:kbd]")) {
+        memcpy(lastReport, report, sizeof(lastReport));
     }
-
-    memcpy(lastReport, report, sizeof(lastReport));
     interruptPending = false;
     submitInterruptTransfer();
 }

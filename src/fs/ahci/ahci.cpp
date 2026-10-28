@@ -3,6 +3,7 @@
 #include <memory/heap.hpp>
 #include <memory/pmm.hpp>
 #include <memory/vmm.hpp>
+#include <cpu/tlb.hpp>
 #include <graphics/console.hpp>
 #include <stddef.h>
 
@@ -395,6 +396,7 @@ bool AHCIPort::executeCommand(uint8_t cmd, uint64_t lba, uint32_t count, void* b
 
     int spin = 0;
     while ((port->tfd & (ATA_DEV_BUSY | ATA_DEV_DRQ)) && spin < 1000000) {
+        TLB::pollPending();
         spin++;
     }
     if (spin == 1000000) return false;
@@ -402,6 +404,9 @@ bool AHCIPort::executeCommand(uint8_t cmd, uint64_t lba, uint32_t count, void* b
     port->ci = 1 << slot;
 
     while (true) {
+        // Storage runs without the big kernel lock (StorageLock), so a TLB
+        // shootdown sender may be waiting for this CPU.
+        TLB::pollPending();
         if ((port->ci & (1 << slot)) == 0) break;
         if (port->is & HBA_PxIS_TFES) {
             recoverFromError();
@@ -465,6 +470,7 @@ bool AHCIPort::flush() {
 
     int spin = 0;
     while ((port->tfd & (ATA_DEV_BUSY | ATA_DEV_DRQ)) && spin < 1000000) {
+        TLB::pollPending();
         spin++;
     }
     if (spin == 1000000) return false;
@@ -472,6 +478,9 @@ bool AHCIPort::flush() {
     port->ci = 1 << slot;
 
     while (true) {
+        // Storage runs without the big kernel lock (StorageLock), so a TLB
+        // shootdown sender may be waiting for this CPU.
+        TLB::pollPending();
         if ((port->ci & (1 << slot)) == 0) break;
         if (port->is & HBA_PxIS_TFES) {
             recoverFromError();

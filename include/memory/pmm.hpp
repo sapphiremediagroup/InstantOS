@@ -55,6 +55,9 @@ public:
     // base is >= minPhys. Returns 0 when no such block exists, so callers fall
     // back to AllocFrames() on small-memory configurations.
     static uint64_t AllocFramesAbove(uint64_t count, uint64_t minPhys);
+    // Contiguous run that ends at or below maxPhys (e.g. real-mode memory for
+    // the SMP startup trampoline). Returns 0 if none.
+    static uint64_t AllocFramesBelow(uint64_t count, uint64_t maxPhys);
 
     // Free `count` contiguous 4 KiB frames starting at `physAddr`.
     static void FreeFrames(uint64_t physAddr, uint64_t count);

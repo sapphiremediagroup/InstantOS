@@ -1,5 +1,6 @@
 #pragma once
 
+#include <common/spinlock.hpp>
 #include <cpu/syscall/syscall.hpp>
 #include <cpu/process/process.hpp>
 #include <memory/vmm.hpp>
@@ -123,6 +124,8 @@ public:
     void setPosition(int32_t newX, int32_t newY);
     void setSize(int32_t newWidth, int32_t newHeight);
     void setFocused(bool focused);
+    // Shown again after a minimize, as it was (maximized stays maximized).
+    void unminimize() { state &= ~WindowStateMinimized; }
     void setZOrder(uint32_t order) { zOrder = order; }
     void control(WindowControlAction action, int32_t maxWidth, int32_t maxHeight);
     bool enqueueWindowEvent(WindowEventAction action);
@@ -174,7 +177,7 @@ private:
     Message messages[MaxMessages];
     size_t head;
     size_t count;
-    volatile bool lock_flag = false;
+    IrqSpinlock lock{"ipc-queue"};
 };
 
 class ServiceObject {
@@ -221,6 +224,8 @@ public:
     bool controlWindow(uint64_t id, WindowControlAction action, int32_t maxWidth, int32_t maxHeight);
     bool postEventToFocusedWindow(const Event& event);
     bool postKeyEventToFocusedWindow(const Event& event);
+    // Queues an input event on one window (the compositor routes the pointer).
+    bool postEventToWindow(uint64_t windowId, const Event& event);
 
     uint64_t registerService(Process* owner, const char* name, MessageQueueObject* queue);
     ServiceObject* connectService(const char* name);
@@ -236,6 +241,12 @@ public:
 
     void forgetSharedObject(SharedMemoryObject* object);
     void forgetSurface(SurfaceObject* object);
+    // A dead surface's memory stays mapped in the compositor, which may be
+    // drawing from it; it is kept here (with the surface's reference) until
+    // the compositor next lists the windows, when no window can show it any
+    // more, and then unmapped from it and released.
+    void retireSurfaceBacking(SharedMemoryObject* backing);
+    void releaseRetiredSurfaces(Process* compositor);
     void forgetWindow(WindowObject* object);
     void forgetQueue(MessageQueueObject* queue);
 
@@ -258,6 +269,8 @@ private:
 
     SharedMemoryObject* sharedObjects[MaxSharedObjects];
     SurfaceObject* surfaces[MaxSurfaces];
+    SharedMemoryObject* retiredSurfaces[MaxSurfaces];
+    size_t retiredSurfaceCount;
     WindowObject* windows[MaxWindows];
     MessageQueueObject* queues[MaxQueues];
     ServiceEntry services[MaxServices];

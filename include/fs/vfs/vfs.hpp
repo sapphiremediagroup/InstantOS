@@ -109,6 +109,9 @@ public:
     virtual int mount(const char* path) = 0;
     virtual int unmount() = 0;
     virtual VNode* getRoot() = 0;
+    // Backed by a block device (ext4, FAT32): its operations run under the
+    // storage lock instead of the big kernel lock (fs/storage/storage_lock.hpp).
+    virtual bool isBlockBacked() const { return false; }
     
     const char* getName() { return name; }
     

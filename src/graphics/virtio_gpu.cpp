@@ -1,3 +1,6 @@
+#include <cpu/klock.hpp>
+#include <cpu/cereal/cereal.hpp>
+#include <time/tsc_timer.hpp>
 #include <graphics/virtio_gpu.hpp>
 #include <cpu/acpi/pci.hpp>
 #include <cpu/idt/interrupt.hpp>
@@ -24,7 +27,8 @@ constexpr uint8_t PCI_CAP_ID_VENDOR_SPECIFIC = 0x09;
 constexpr uint32_t kControlQueueIndex = 0;
 constexpr uint32_t kCursorQueueIndex = 1;
 constexpr uint16_t kQueueSize = 64;
-constexpr uint64_t kCommandTimeout = 1000000ULL;
+constexpr uint64_t kCommandTimeout = 20000000ULL;  // pause spins, without a calibrated TSC
+constexpr uint64_t kCommandTimeoutMs = 2000;
 constexpr uint32_t kPreferredFramebufferWidth = 1280;
 constexpr uint32_t kPreferredFramebufferHeight = 720;
 
@@ -265,8 +269,7 @@ VirtIOGPUDriver::VirtIOGPUDriver()
       configInterruptCount(0),
       irqRegistered(false),
       irqMode(IRQMode::None),
-      interruptLatched(false),
-      commandLock(0) {
+      interruptLatched(false) {
     memset(fenceWaiters, 0, sizeof(fenceWaiters));
     memset(resourceRecords, 0, sizeof(resourceRecords));
     memset(contextRecords, 0, sizeof(contextRecords));
@@ -1765,6 +1768,18 @@ void VirtIOGPUDriver::releaseFenceWaiter(FenceWaiter* waiter) {
 }
 
 void VirtIOGPUDriver::processControlQueueCompletions() {
+    // sendCommand() drains while it already holds the lock.
+    const bool takeLock = !commandLock.heldByThisCpu();
+    if (takeLock) {
+        commandLock.lock();
+    }
+    drainControlQueueLocked();
+    if (takeLock) {
+        commandLock.unlock();
+    }
+}
+
+void VirtIOGPUDriver::drainControlQueueLocked() {
     while (controlQueue.hasUsed()) {
         uint32_t usedLen = 0;
         const uint32_t usedId = controlQueue.getUsed(&usedLen);
@@ -1786,6 +1801,16 @@ void VirtIOGPUDriver::processControlQueueCompletions() {
         }
 
         if (!matched) {
+            continue;
+        }
+
+        if (matched->abandoned) {
+            // Its sender timed out (sendCommand); finish the cleanup now.
+            controlQueue.freeDesc(matched->tailDesc);
+            controlQueue.freeDesc(matched->headDesc);
+            PMM::FreeFrames(matched->cmdPhys, matched->cmdPages);
+            PMM::FreeFrames(matched->respPhys, matched->respPages);
+            releaseFenceWaiter(matched);
             continue;
         }
 
@@ -1816,7 +1841,10 @@ void VirtIOGPUDriver::processControlQueueCompletions() {
 
         matched->completed = true;
 
-        if (matched->ownerPID != 0) {
+        // Scheduler state needs the big kernel lock, which a console flush
+        // from storage code does not hold. (No caller blocks on a fence today;
+        // sendCommand() spins for its own.)
+        if (matched->ownerPID != 0 && KernelLock::heldByThisCpu()) {
             Process* owner = Scheduler::get().getProcessByPID(matched->ownerPID);
             if (owner && owner->getState() == ProcessState::Blocked) {
                 owner->setState(ProcessState::Ready);
@@ -1827,15 +1855,20 @@ void VirtIOGPUDriver::processControlQueueCompletions() {
 }
 
 bool VirtIOGPUDriver::awaitFence(FenceWaiter& waiter) {
-    for (uint64_t i = 0; i < kCommandTimeout; ++i) {
+    // Time-based when the TSC is calibrated: a fixed spin count can be a few
+    // milliseconds, short enough to give up on a host that is merely busy.
+    const uint64_t limit = cycles_per_ms * kCommandTimeoutMs;
+    const uint64_t start = __builtin_ia32_rdtsc();
+    for (uint64_t i = 0;; ++i) {
         processControlQueueCompletions();
         if (!waiter.used || waiter.completed) {
             return waiter.completed && waiter.transportOk;
         }
+        if (limit != 0 ? __builtin_ia32_rdtsc() - start > limit : i >= kCommandTimeout) {
+            return false;
+        }
         cpu_pause();
     }
-
-    return false;
 }
 
 bool VirtIOGPUDriver::sendCommand(const void* cmd, size_t cmdSize, void* resp, size_t respSize) {
@@ -1861,9 +1894,7 @@ bool VirtIOGPUDriver::sendCommand(const void* cmd, size_t cmdSize, void* resp, s
 
     memcpy(cmdBuffer.ptr, cmd, cmdSize);
 
-    while (__sync_lock_test_and_set(&commandLock, 1)) {
-        cpu_pause();
-    }
+    commandLock.lock();
 
     FenceWaiter* waiter = allocateFenceWaiter();
     const int cmdDesc = controlQueue.allocDesc();
@@ -1878,7 +1909,7 @@ bool VirtIOGPUDriver::sendCommand(const void* cmd, size_t cmdSize, void* resp, s
         if (waiter) {
             releaseFenceWaiter(waiter);
         }
-        __sync_lock_release(&commandLock);
+        commandLock.unlock();
         free_dma_buffer(&respBuffer);
         free_dma_buffer(&cmdBuffer);
         return false;
@@ -1908,13 +1939,40 @@ bool VirtIOGPUDriver::sendCommand(const void* cmd, size_t cmdSize, void* resp, s
 
     controlQueue.addAvail(static_cast<uint16_t>(cmdDesc));
     notifyQueue(kControlQueueIndex);
-    __sync_lock_release(&commandLock);
 
+    // Still under commandLock: the wait drains the used ring and the
+    // descriptors go back on the free list below. Another CPU touching either
+    // meanwhile (e.g. a console flush from storage code that runs without the
+    // big kernel lock) could be handed a descriptor that is still in flight.
     const bool completed = awaitFence(*waiter);
+    if (!waiter->completed) {
+        // The device may still read the command and write the response, so
+        // nothing it was handed can be reused yet: the completion pass frees
+        // it all if the device ever answers. (Freed descriptors are zeroed,
+        // and a device that reads a zero-length buffer disables itself.)
+        waiter->abandoned = true;
+        waiter->tailDesc = static_cast<uint16_t>(respDesc);
+        waiter->cmdPhys = cmdBuffer.phys;
+        waiter->cmdPages = cmdBuffer.pages;
+        waiter->respPhys = respBuffer.phys;
+        waiter->respPages = respBuffer.pages;
+        commandLock.unlock();
+        Cereal::get().write("[vgpu] control command timed out\n");
+        return false;
+    }
+    const bool transportOk = waiter->transportOk;
+    const uint32_t usedLength = waiter->usedLength;
+    controlQueue.freeDesc(respDesc);
+    controlQueue.freeDesc(cmdDesc);
+    releaseFenceWaiter(waiter);
+    commandLock.unlock();
+
+    // After the unlock: logging an error goes through the console, which may
+    // flush to this driver again.
     if (completed) {
         memcpy(resp, respBuffer.ptr, respSize);
-        lastCommandStatus.transportOk = waiter->transportOk;
-        lastCommandStatus.usedLength = waiter->usedLength;
+        lastCommandStatus.transportOk = transportOk;
+        lastCommandStatus.usedLength = usedLength;
         if (respSize >= sizeof(VirtIOGPUCtrlHdr)) {
             const auto* responseHdr = reinterpret_cast<const VirtIOGPUCtrlHdr*>(resp);
             lastCommandStatus.responseType = responseHdr->type;
@@ -1928,9 +1986,6 @@ bool VirtIOGPUDriver::sendCommand(const void* cmd, size_t cmdSize, void* resp, s
         }
     }
 
-    controlQueue.freeDesc(respDesc);
-    controlQueue.freeDesc(cmdDesc);
-    releaseFenceWaiter(waiter);
     free_dma_buffer(&respBuffer);
     free_dma_buffer(&cmdBuffer);
     return completed;

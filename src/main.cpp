@@ -16,6 +16,9 @@
 #include <fs/devfs/devfs.hpp>
 #include <iboot/memory.hpp>
 #include <cpu/gdt/gdt.hpp>
+#include <cpu/percpu.hpp>
+#include <cpu/smp.hpp>
+#include <cpu/klock.hpp>
 #include <cpu/idt/idt.hpp>
 #include <cpu/apic/irqs.hpp>
 #include <memory/pmm.hpp>
@@ -36,6 +39,7 @@
 #include <drivers/usb/xhci.hpp>
 #include <interrupts/keyboard.hpp>
 #include <interrupts/timer.hpp>
+#include <drivers/net/net_device.hpp>
 #include <time/time.hpp>
 #include <graphics/virtio_gpu.hpp>
 #include <graphics/venus.hpp>
@@ -759,6 +763,7 @@ extern "C" void InstantOS(BootInfo* bootInfo) {
 #endif
 
     GDT::get().initialize();
+    initBootCPU();
 #ifdef INSTANTOS_BOOT_SPINNER
     bootSpinner.step();
 #endif
@@ -804,6 +809,8 @@ extern "C" void InstantOS(BootInfo* bootInfo) {
         Console::get().drawNumber(static_cast<int64_t>(initrdPages));
         Console::get().drawText("\n");
     }
+    // Before anything else allocates: the AP trampoline needs real-mode pages.
+    SMP::reserveLowMemory();
 #ifdef INSTANTOS_BOOT_SPINNER
     bootSpinner.step();
 #endif
@@ -878,6 +885,7 @@ extern "C" void InstantOS(BootInfo* bootInfo) {
     
     APICManager& apic = APICManager::get();
     uint8_t targetCore = static_cast<uint8_t>(LAPIC::get().getId());
+    getPerCPU()->lapicId = LAPIC::get().getId();
 
     drawTextLine("[BOOT] before mapIRQ timer");
     apic.mapIRQ(IRQ_TIMER, VECTOR_TIMER, targetCore);
@@ -981,6 +989,8 @@ extern "C" void InstantOS(BootInfo* bootInfo) {
 #ifdef INSTANTOS_BOOT_SPINNER
     bootSpinner.step();
 #endif
+
+    SMP::startAPs();
 
     TableRegister gdtr = {};
     TableRegister idtr = {};
@@ -1173,17 +1183,24 @@ extern "C" void InstantOS(BootInfo* bootInfo) {
             static RamFS etcfs;
             int etcMountResult = VFS::get().mount(&etcfs, "/etc");
             if (etcMountResult == 0) {
+                // The TLS trust store (initrd "ssl/certs/ca-certificates.crt",
+                // see tools/fetch-cacert.sh) is read-only, over a RamFS
+                // directory so it shows up when /etc is listed.
+                static InitrdFS sslInitrdfs(
+                    reinterpret_cast<void*>(bootInfo->initrdBase),
+                    bootInfo->initrdSize,
+                    "ssl"
+                );
+                VFS::get().mkdir("/etc/ssl", 0755);
+                VFS::get().mount(&sslInitrdfs, "/etc/ssl");
                 writeSystemFile("/etc/passwd",
                     "root:x:0:0:root:/:/bin/bash\n");
                 writeSystemFile("/etc/group",
                     "root:x:0:\n");
                 writeSystemFile("/etc/hostname",
                     "instantos\n");
-                // Resolver configuration for mlibc's built-in DNS stub.
-                // QEMU user-mode networking exposes a DNS forwarder at
-                // 10.0.2.3; the resolver reads the first nameserver line.
-                writeSystemFile("/etc/resolv.conf",
-                    "nameserver 10.0.2.3\n");
+                // /etc/resolv.conf is written by network-manager once DHCP
+                // hands out the name servers (or NetSetConfig sets them).
                 // /etc/services: the DNS resolver looks up the "domain"
                 // service to obtain UDP port 53. Without this entry
                 // getaddrinfo() fails with EAI_SERVICE.
@@ -1192,11 +1209,25 @@ extern "C" void InstantOS(BootInfo* bootInfo) {
                     "domain\t53/udp\n"
                     "http\t80/tcp\n"
                     "https\t443/tcp\n");
+                // /etc/inputrc: readline learns the editing keys from
+                // terminfo, which InstantOS lacks; it knows the arrows,
+                // Home and End by itself. These are the terminal's and the
+                // console's (xterm) sequences for the rest, Ctrl+Left/Right
+                // moving by word.
+                writeSystemFile("/etc/inputrc",
+                    "\"\\e[3~\": delete-char\n"
+                    "\"\\e[2~\": overwrite-mode\n"
+                    "\"\\e[5~\": beginning-of-history\n"
+                    "\"\\e[6~\": end-of-history\n"
+                    "\"\\e[1;5C\": forward-word\n"
+                    "\"\\e[1;5D\": backward-word\n");
                 // /etc/hosts: local name -> address mappings consulted before
-                // DNS (so "localhost" resolves without a query).
+                // DNS (so "localhost" resolves without a query). The host
+                // name maps to loopback until network-manager writes the
+                // leased address in.
                 writeSystemFile("/etc/hosts",
                     "127.0.0.1\tlocalhost\n"
-                    "10.0.2.15\tinstantos\n");
+                    "127.0.1.1\tinstantos\n");
                 // Seed /etc/mtab from the live VFS mount table so df (no args)
                 // and mount can enumerate filesystems. Each line has the six
                 // standard fields: fsname dir type opts freq passno.
@@ -1266,8 +1297,15 @@ extern "C" void InstantOS(BootInfo* bootInfo) {
     activeBootSpinner = nullptr;
 #endif
 
-    asm volatile("sti");
+    // Bring up the NIC now so the timer tick can pump it from the start.
+    netEnableTimerPump();
 
+    // Hand over to the scheduler. Boot ran without the big kernel lock (the
+    // APs were parked); from here on every CPU schedules and all kernel code
+    // runs under it. The first switch passes the lock to the process (its
+    // trampoline drops it before entering user mode) or to idle.
+    SMP::startScheduling();
+    KernelLock::enter();
     Scheduler::get().yield(); // Start running processes
     while (true) {
         asm volatile("hlt");

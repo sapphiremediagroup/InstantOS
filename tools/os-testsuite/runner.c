@@ -14,9 +14,6 @@
 // riskiest tests (fork/signals/threads) last so earlier results are already on
 // the serial log.
 
-typedef unsigned long u64; typedef long i64;
-typedef unsigned int u32; typedef int i32;
-typedef unsigned short u16; typedef unsigned char u8; typedef short i16;
 
 // Scaled memory soak size (MiB). Default is safe on the 1 GiB CI VM; the
 // dedicated large-RAM boot overrides it via -DSOAK_MB=... (see build script).
@@ -31,146 +28,7 @@ typedef unsigned short u16; typedef unsigned char u8; typedef short i16;
 #define BIGDIR_N 2000
 #endif
 
-// ---- syscall convention: num=rax, args=rbx,r10,rdx,r8,r9, ret=rax ----
-static i64 syscall5(i64 n, i64 a, i64 b, i64 c, i64 d, i64 e){
-    i64 r;
-    register i64 rax asm("rax")=n;
-    register i64 rbx asm("rbx")=a;
-    register i64 r10 asm("r10")=b;
-    register i64 rdx asm("rdx")=c;
-    register i64 r8  asm("r8")=d;
-    register i64 r9  asm("r9")=e;
-    asm volatile("syscall":"=a"(r):"a"(rax),"r"(rbx),"r"(r10),"r"(rdx),"r"(r8),"r"(r9):"rcx","r11","memory");
-    return r;
-}
-#define SC0(n)              syscall5((n),0,0,0,0,0)
-#define SC1(n,a)            syscall5((n),(i64)(a),0,0,0,0)
-#define SC2(n,a,b)          syscall5((n),(i64)(a),(i64)(b),0,0,0)
-#define SC3(n,a,b,c)        syscall5((n),(i64)(a),(i64)(b),(i64)(c),0,0)
-#define SC4(n,a,b,c,d)      syscall5((n),(i64)(a),(i64)(b),(i64)(c),(i64)(d),0)
-#define SC5(n,a,b,c,d,e)    syscall5((n),(i64)(a),(i64)(b),(i64)(c),(i64)(d),(i64)(e))
-
-// syscall numbers (enum ordinals)
-enum {
- N_OSINFO=0,N_PROCINFO=1,N_EXIT=2,N_WRITE=3,N_READ=4,N_OPEN=5,N_CLOSE=6,N_GETPID=7,
- N_FORK=8,N_WAIT=10,N_KILL=11,N_MMAP=12,N_MUNMAP=13,N_YIELD=14,N_SLEEP=15,N_GETTIME=16,
- N_FBINFO=18,N_SIGNAL=20,N_GETUID=24,N_GETGID=25,N_GETSESSIONID=28,N_GETSESSIONINFO=29,
- N_CHDIR=30,N_GETCWD=31,N_MKDIR=32,N_RMDIR=33,N_UNLINK=34,N_STAT=35,N_DUP=36,N_DUP2=37,
- N_PIPE=38,N_GETPPID=39,N_SPAWN=40,N_GETUSERINFO=41,N_READDIR=42,
- N_SHAREDALLOC=44,N_SHAREDMAP=45,N_SHAREDFREE=46,N_SURFCREATE=47,N_SURFMAP=48,N_SURFCOMMIT=49,
- N_QUEUECREATE=60,N_QUEUESEND=61,N_QUEUERECV=62,N_SERVICEREG=65,N_SERVICECONN=66,
- N_NETGETMAC=67,N_NETLINK=70,N_THREADCREATE=74,N_THREADEXIT=75,N_THREADJOIN=76,N_SEEK=77,
- N_GETUNIXTIME=87,N_SERIAL=88,N_FCNTL=89,N_MPROTECT=90,N_POLL=91,N_TRUNCATE=92,N_RENAME=93,
- N_CHMOD=94,N_UTIME=95,N_FSTAT=96,N_LINK=97,N_SYMLINK=98,N_READLINK=99,N_LSTAT=100,
- N_SIGPROCMASK=101,N_SOCKET=102,N_BIND=103,N_CONNECT=104,N_LISTEN=105,N_ACCEPT=106,
- N_SEND=107,N_RECV=108,N_SHUTDOWN=109,N_GETSOCKOPT=110,N_SETSOCKOPT=111,N_STORAGEINFO=112,
- N_SIGACTION=115,N_IOCTL=119,N_ACCESS=120,N_STATFS=121,N_CHOWN=122,N_GETENTROPY=124,
- N_GETSOCKNAME=125,N_GETPEERNAME=126,N_PIPE2=129,N_FSYNC=130,N_MMAPFILE=131,N_MSYNC=132,
- N_FDPATH=133
-};
-
-// flags / constants
-enum { O_RDONLY=0,O_WRONLY=1,O_RDWR=2,O_CREAT=0100,O_EXCL=0200,O_TRUNC=01000,O_APPEND=02000,
-       O_NONBLOCK=04000,O_DIRECTORY=0200000,O_CLOEXEC=02000000 };
-enum { SEEK_SET=0,SEEK_CUR=1,SEEK_END=2 };
-enum { F_OK=0,X_OK=1,W_OK=2,R_OK=4 };
-enum { F_GETFD=1,F_SETFD=2,FD_CLOEXEC=1 };
-enum { POLLIN=1,POLLOUT=4 };
-enum { PROT_R=1,PROT_W=2,PROT_X=4 };
-enum { MAP_SHARED=1,MAP_PRIVATE=2,MAP_FIXED=0x10,MAP_ANON=0x20 };
-enum { E_NOENT=2,E_CHILD=10,E_BADF=9,E_AGAIN=11,E_ACCES=13,E_EXIST=17,E_NOTDIR=20,E_ISDIR=21,E_INVAL=22,
-       E_NAMETOOLONG=36,E_SPIPE=29,E_NOTEMPTY=39,E_OPNOTSUPP=95,E_AFNOSUPPORT=97,E_NOTCONN=107 };
-enum { WNOHANG=1,WUNTRACED=2,WCONTINUED=8 }; // wait() options (kernel: kWaitOptionMask)
-enum { SIG_USR1=10,SIG_KILL=9,SIG_PIPE=13 };
-enum { AF_INET=2,AF_UNIX=1,SOCK_STREAM=1,SOCK_DGRAM=2,SOCK_RAW=3,SOCK_NONBLOCK=04000,
-       SOL_SOCKET=1,SO_REUSEADDR=2,SO_TYPE=3,SHUT_RDWR=2 };
-enum { TIOCGWINSZ=0x5413,TIOCSWINSZ=0x5414,TIOCGPTN=0x80045430,TCGETS=0x5401,TCSETS=0x5402 };
-#define S_IFMT 0170000
-#define S_IFREG 0100000
-#define S_IFDIR 0040000
-#define S_IFCHR 0020000
-#define S_IFLNK 0120000
-
-struct Stat { u64 dev,ino; u32 mode,nlink,uid,gid; u64 rdev,size,blksize,blocks,atime,mtime,ctime; };
-struct DirEntry { char name[256]; u64 inode; i32 type; };
-struct PollFD { i64 fd; i16 events; i16 revents; };
-struct Winsize { u16 row,col,xp,yp; };
-struct Termios { u32 iflag,oflag,cflag,lflag; u8 line; u8 cc[32]; u32 ibaud,obaud; };
-struct sockaddr_in { u16 sin_family; u16 sin_port; u32 sin_addr; u8 zero[8]; };
-struct IPCMessage { u64 id; u32 senderPID; u16 flags; u16 reserved; u64 size; u8 data[256]; };
-// Argument block for the file-backed mmap syscall (must match kernel MmapFileArgs).
-struct MmapFileArgs { u64 addr,length,prot,flags,fd,offset; };
-
-// freestanding primitives (clang lowers some inits to these)
-void* memset(void* d,int c,u64 n){u8* p=(u8*)d;for(u64 i=0;i<n;i++)p[i]=(u8)c;return d;}
-void* memcpy(void* d,const void* s,u64 n){u8* a=(u8*)d;const u8* b=(const u8*)s;for(u64 i=0;i<n;i++)a[i]=b[i];return d;}
-static u64 slen(const char* s){u64 n=0;while(s[n])n++;return n;}
-static int smemcmp(const void* a,const void* b,u64 n){const u8* x=(const u8*)a;const u8* y=(const u8*)b;for(u64 i=0;i<n;i++){if(x[i]!=y[i])return (int)x[i]-(int)y[i];}return 0;}
-static int sstreq(const char* a,const char* b){u64 i=0;for(;a[i]&&b[i];i++)if(a[i]!=b[i])return 0;return a[i]==b[i];}
-static int contains(const char* hay,u64 hn,const char* needle){u64 nn=slen(needle);if(nn>hn)return 0;for(u64 i=0;i+nn<=hn;i++){if(smemcmp(hay+i,needle,nn)==0)return 1;}return 0;}
-
-// serial output
-static void sw(const char* s){SC2(N_SERIAL,s,slen(s));}
-static void swn(const char* s,u64 n){SC2(N_SERIAL,s,n);}
-static void sdec(i64 v){char b[24];int i=23;b[23]=0;if(v==0){sw("0");return;}int neg=0;u64 u=(u64)v;if(v<0){neg=1;u=(u64)(-v);}while(u){b[--i]=(char)('0'+u%10);u/=10;}if(neg)b[--i]='-';sw(&b[i]);}
-
-// ---- scoring ----
-static int g_total=0,g_pass=0,g_secT=0,g_secP=0; static const char* g_sec="";
-static void section(const char* name){
-    if(g_sec[0]){ sw("  ["); sw(g_sec); sw("] "); sdec(g_pass-g_secP); sw("/"); sdec(g_total-g_secT);
-                  sw("  (cum "); sdec(g_pass); sw("/"); sdec(g_total); sw(")\n"); }
-    g_sec=name; g_secT=g_total; g_secP=g_pass;
-    if(name[0]) { sw("\n== "); sw(name); sw(" ==\n"); }
-}
-static void check(int cond,const char* name){
-    g_total++;
-    if(cond){ g_pass++; }
-    else { sw("  FAIL: "); sw(name); sw("\n"); }
-}
-// on-fail print the observed value (helps triage)
-static void checkv(int cond,const char* name,i64 got){
-    g_total++;
-    if(cond){ g_pass++; }
-    else { sw("  FAIL: "); sw(name); sw(" got="); sdec(got); sw("\n"); }
-}
-static void ok(i64 ret,const char* name){ checkv(ret>=0,name,ret); }        // success (>=0)
-static void neg(i64 ret,const char* name){ checkv(ret<0,name,ret); }        // any failure
-static void err(i64 ret,i64 e,const char* name){ checkv(ret==-e,name,ret); }// exact -errno
-
-// ---- syscall helpers ----
-static i64 t_open(const char* p,i64 fl,i64 m){ return SC3(N_OPEN,p,fl,m); }
-static i64 t_close(i64 h){ return SC1(N_CLOSE,h); }
-static i64 t_write(i64 h,const void* b,u64 n){ return SC3(N_WRITE,h,b,n); }
-static i64 t_read(i64 h,void* b,u64 n){ return SC3(N_READ,h,b,n); }
-static i64 t_unlink(const char* p){ return SC1(N_UNLINK,p); }
-static void yield(void){ SC0(N_YIELD); }
-static void msleep(i64 ms){ SC1(N_SLEEP,ms); }
-
-static u16 htons(u16 v){ return (u16)((v<<8)|(v>>8)); }
-
-// write a whole small file on any writable fs; returns 0 on success
-static int put_file(const char* path,const char* data,u64 n){
-    i64 h=t_open(path,O_WRONLY|O_CREAT|O_TRUNC,0644);
-    if(h<0) return -1;
-    i64 w=t_write(h,data,n); t_close(h);
-    return (w==(i64)n)?0:-1;
-}
-
-// fd->path (SyscallNumber::FdPath); writes NUL-terminated abs path, returns len or -errno
-static i64 t_fd_path(i64 h,char* buf,u64 n){ return SC3(N_FDPATH,h,buf,n); }
-
-// file-backed mmap (SyscallNumber::MmapFile); returns mapped address (>0) or -errno
-static i64 t_mmap_file(i64 fd,u64 len,u64 prot,u64 flags,u64 off){
-    struct MmapFileArgs a; a.addr=0; a.length=len; a.prot=prot; a.flags=flags; a.fd=(u64)fd; a.offset=off;
-    return SC1(N_MMAPFILE,&a);
-}
-
-// build "<pfx><n>" into buf (n < 1e9); used for mass file creation tests
-static void iname(char* buf,const char* pfx,int n){
-    int i=0; while(pfx[i]){buf[i]=pfx[i];i++;}
-    char tmp[12]; int j=0; if(n==0)tmp[j++]='0'; while(n){tmp[j++]=(char)('0'+n%10);n/=10;}
-    while(j>0)buf[i++]=tmp[--j]; buf[i]='\0';
-}
+#include "ostest.h"
 
 // ============================ TEST SECTIONS ============================
 
@@ -642,6 +500,31 @@ static void test_sockets(void){
         }
         t_close(C); t_close(L);
     }
+    // A blocking recv must notice the peer going away: by shutdown(SHUT_WR)
+    // (mode 0) or by its last handle closing (mode 1).
+    for(int mode=0;mode<2;mode++){
+        i64 L2=SC3(N_SOCKET,AF_INET,SOCK_STREAM,0);
+        struct sockaddr_in sa; memset(&sa,0,sizeof sa); sa.sin_family=AF_INET; sa.sin_port=htons((u16)(20020+mode)); sa.sin_addr=0x0100007f;
+        SC3(N_BIND,L2,&sa,sizeof sa); SC2(N_LISTEN,L2,4);
+        i64 C2=SC3(N_SOCKET,AF_INET,SOCK_STREAM,0);
+        i64 cr=SC3(N_CONNECT,C2,&sa,sizeof sa);
+        i64 A2=SC3(N_ACCEPT,L2,0,0);
+        if(cr!=0||A2<=0){ checkv(0,mode?"blocking recv wakes on peer close (setup)":"blocking recv wakes on peer shutdown (setup)",A2); continue; }
+        i64 pid=SC0(N_FORK);
+        if(pid==0){
+            if(mode==1) t_close(C2);   // the parent's handle is then the last one
+            struct { i64 s,us; } tv={5,0}; SC5(N_SETSOCKOPT,A2,SOL_SOCKET,20/*SO_RCVTIMEO*/,&tv,sizeof tv);
+            char b[8]; i64 r=SC4(N_RECV,A2,b,sizeof b,0);
+            SC1(N_EXIT,r==0?0:(r==-E_AGAIN?1:2)); for(;;){}
+        }
+        msleep(100);
+        if(mode==0) SC2(N_SHUTDOWN,C2,1/*SHUT_WR*/); else t_close(C2);
+        int st=-1; if(pid>0) SC3(N_WAIT,pid,&st,0);
+        int code=(st>>8)&0xff; if(st>=0&&st<256) code=st;
+        checkv(pid>0&&code==0,mode?"blocking recv wakes with EOF on peer close (1=timed out)":"blocking recv wakes with EOF on peer shutdown (1=timed out)",code);
+        if(mode==0) t_close(C2);
+        t_close(A2); t_close(L2);
+    }
     // NIC presence syscalls (deterministic either way)
     i64 link=SC0(N_NETLINK); checkv(link==0||link==1,"net_link_status 0/1",link);
     u8 mac[6]; memset(mac,0,6); i64 mr=SC1(N_NETGETMAC,mac);
@@ -650,9 +533,13 @@ static void test_sockets(void){
 
 static void test_gated_negative(void){
     section("permission gating (expected failures)");
-    // framebuffer is gated to /bin/graphics-compositor|/bin/nsfb; we are /bin/login
-    u8 fb[128]; memset(fb,0,sizeof fb);
-    neg(SC1(N_FBINFO,fb),"fbinfo gated -> fail (not compositor)");
+    // only /bin/graphics-compositor gets the framebuffer mapped; we are
+    // /bin/login, so fbinfo gives the geometry with addr 0
+    struct { u64 addr; u32 width,height,pitch,format; u64 size; u32 r,g,b; } fb;
+    memset(&fb,0xff,sizeof fb);
+    i64 fr=SC1(N_FBINFO,&fb);
+    check(fr==0&&fb.addr==0&&fb.width>=320&&fb.height>=200,"fbinfo: geometry only, nothing mapped (not compositor)");
+    neg(SC0(N_FBMAP),"fbmap gated -> fail (not compositor)");
     // kill(self, 0) probe succeeds; kill(bogus pid, 0) -> ENOENT
     ok(SC2(N_KILL,0,0),"kill(self,0) probe ok");
     err(SC2(N_KILL,999999,0),E_NOENT,"kill(bogus,0) -> ENOENT");
@@ -795,6 +682,99 @@ static void test_signals(void){
     i64 pr=SC2(N_SIGNAL,SIG_USR1,(i64)sigusr1_handler); ok(pr,"signal() install returns");
 }
 
+// Network step 5: sendto/recvfrom with addresses, ICMP ping sockets, the
+// nanosecond clock and ITIMER_REAL.
+enum { N_SENDTO=143, N_RECVFROM=144, N_GETTIMENS=145, N_SETITIMER=146, N_GETITIMER=147, SIG_ALRM=14 };
+static volatile int g_alarms=0;
+static void sigalrm_handler(int s){ (void)s; g_alarms++; }
+
+static void test_net_p5(void){
+    section("sendto/recvfrom, ping sockets, timers");
+    i64 A=SC3(N_SOCKET,AF_INET,SOCK_DGRAM,0), B=SC3(N_SOCKET,AF_INET,SOCK_DGRAM,0);
+    if(A>0&&B>0){
+        struct { i64 s,us; } tv={2,0};
+        SC5(N_SETSOCKOPT,A,SOL_SOCKET,20,&tv,sizeof tv); SC5(N_SETSOCKOPT,B,SOL_SOCKET,20,&tv,sizeof tv);
+        struct sockaddr_in sa; memset(&sa,0,sizeof sa); sa.sin_family=AF_INET; sa.sin_port=htons(20031); sa.sin_addr=0x0100007f;
+        struct sockaddr_in sb=sa; sb.sin_port=htons(20032);
+        SC3(N_BIND,A,&sa,sizeof sa); SC3(N_BIND,B,&sb,sizeof sb);
+        i64 n=SC5(N_SENDTO,B,"abc",3,0,&sa); checkv(n==3,"sendto on an unconnected UDP socket",n);
+        char buf[16]; struct sockaddr_in from; memset(&from,0,sizeof from);
+        n=SC5(N_RECVFROM,A,buf,sizeof buf,0,&from);
+        check(n==3&&smemcmp(buf,"abc",3)==0,"recvfrom gets the datagram");
+        check(from.sin_family==AF_INET&&from.sin_port==htons(20032)&&from.sin_addr==0x0100007f,"recvfrom reports the sender 127.0.0.1:20032");
+        n=SC5(N_SENDTO,A,"xyz",3,0,&from);
+        memset(&from,0,sizeof from);
+        i64 m=SC5(N_RECVFROM,B,buf,sizeof buf,0,&from);
+        check(n==3&&m==3&&smemcmp(buf,"xyz",3)==0&&from.sin_port==htons(20031),"reply to the reported address arrives");
+        struct sockaddr_in pn; u32 pl=sizeof pn;
+        neg(SC3(N_GETPEERNAME,B,&pn,&pl),"sendto does not connect the socket");
+    }
+    if(A>0) t_close(A);
+    if(B>0) t_close(B);
+
+    i64 P=SC3(N_SOCKET,AF_INET,SOCK_DGRAM,1/*IPPROTO_ICMP*/);
+    checkv(P>0,"socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP)",P);
+    if(P>0){
+        struct { i64 s,us; } tv={2,0}; SC5(N_SETSOCKOPT,P,SOL_SOCKET,20,&tv,sizeof tv);
+        struct sockaddr_in lo; memset(&lo,0,sizeof lo); lo.sin_family=AF_INET; lo.sin_addr=0x0100007f;
+        u8 req[24]={8,0,0,0, 0,0, 0,7}; for(int i=8;i<24;i++) req[i]=(u8)i;
+        i64 n=SC5(N_SENDTO,P,req,sizeof req,0,&lo); checkv(n==24,"echo request to 127.0.0.1",n);
+        u8 rep[64]; struct sockaddr_in from; memset(&from,0,sizeof from);
+        i64 m=SC5(N_RECVFROM,P,rep,sizeof rep,0,&from);
+        check(m==24&&rep[0]==0&&rep[7]==7&&smemcmp(rep+8,req+8,16)==0,"echo reply with the same sequence and data");
+        check(from.sin_addr==0x0100007f,"... from 127.0.0.1");
+        u32 sum=0; for(int i=0;i<24;i+=2) sum+=(u32)((rep[i]<<8)|rep[i+1]); while(sum>>16) sum=(sum&0xffff)+(sum>>16);
+        check(m==24&&sum==0xffff,"... with a valid checksum");
+        u8 bad[8]={13,0,0,0,0,0,0,1};
+        err(SC5(N_SENDTO,P,bad,8,0,&lo),E_INVAL,"a ping socket sends echo requests only");
+        t_close(P);
+    }
+
+    i64 ns1=SC0(N_GETTIMENS), ms=SC0(N_GETTIME), ns2=SC0(N_GETTIMENS);
+    check(ns1>0&&ns2>=ns1,"GetTimeNs is monotonic");
+    i64 diff=ns1/1000000-ms; if(diff<0) diff=-diff;
+    checkv(diff<=20,"GetTimeNs agrees with the ms clock (ms apart)",diff);
+
+    struct SigAct { u64 handler,mask,flags,restorer; } act, old;
+    memset(&act,0,sizeof act); act.handler=(u64)sigalrm_handler; act.flags=SA_RESTORER; act.restorer=(u64)sig_restorer;
+    ok(SC3(N_SIGACTION,SIG_ALRM,&act,&old),"sigaction(SIGALRM)");
+    struct Itv { i64 is,ius,vs,vus; } it={0,0,0,50000}, cur;
+    g_alarms=0; i64 t0=SC0(N_GETTIME);
+    ok(SC3(N_SETITIMER,0,&it,0),"setitimer(ITIMER_REAL, 50 ms)");
+    memset(&cur,0,sizeof cur); SC2(N_GETITIMER,0,&cur);
+    check(cur.vs==0&&cur.vus>0&&cur.vus<=50000,"getitimer shows it running");
+    while(!g_alarms&&SC0(N_GETTIME)-t0<2000) msleep(5);
+    i64 took=SC0(N_GETTIME)-t0;
+    checkv(g_alarms==1&&took>=40&&took<1000,"SIGALRM after ~50 ms (ms)",took);
+    memset(&cur,0,sizeof cur); SC2(N_GETITIMER,0,&cur);
+    check(cur.vs==0&&cur.vus==0,"a one-shot timer is off afterwards");
+    struct Itv rep={0,20000,0,20000}; g_alarms=0; t0=SC0(N_GETTIME);
+    SC3(N_SETITIMER,0,&rep,0);
+    while(g_alarms<3&&SC0(N_GETTIME)-t0<2000) msleep(5);
+    struct Itv off={0,0,0,0}; SC3(N_SETITIMER,0,&off,0);
+    checkv(g_alarms>=3,"an interval timer repeats",g_alarms);
+    int seen=g_alarms; msleep(100);
+    check(g_alarms==seen,"setitimer(0) stops it");
+    SC3(N_SIGACTION,SIG_ALRM,&old,0);
+}
+
+static void test_wallclock(void){
+    section("wall clock (GetUnixTimeNs/SetUnixTime)");
+    i64 s0=SC0(N_GETUNIXTIME), ns=SC0(N_GETUNIXTIMENS), s1=SC0(N_GETUNIXTIME);
+    checkv(ns/1000000000>=s0&&ns/1000000000<=s1,"GetUnixTimeNs matches GetUnixTime",ns);
+    checkv(s0>1700000000,"the RTC gives a date after 2023",s0);
+    i64 a=SC0(N_GETUNIXTIMENS); msleep(20); i64 b=SC0(N_GETUNIXTIMENS);
+    checkv(b-a>=15000000&&b-a<2000000000,"the wall clock advances with sleep (ns)",b-a);
+    ok(SC1(N_SETUNIXTIME,ns+3600LL*1000000000LL),"SetUnixTime one hour ahead");
+    i64 moved=SC0(N_GETUNIXTIME)-s1;
+    checkv(moved>=3599&&moved<=3602,"the clock moved by an hour (s)",moved);
+    ok(SC1(N_SETUNIXTIME,SC0(N_GETUNIXTIMENS)-3600LL*1000000000LL),"SetUnixTime back");
+    moved=SC0(N_GETUNIXTIME)-s1;
+    checkv(moved>=-1&&moved<=2,"the clock is back (s)",moved);
+    err(SC1(N_SETUNIXTIME,5),22,"SetUnixTime before boot: EINVAL");
+    err(SC1(N_SETUNIXTIME,-1),22,"SetUnixTime negative: EINVAL");
+}
+
 static volatile u32 g_thread_val=0;
 static void thread_fn(void* arg){ (void)arg; g_thread_val=0xABCD; SC1(N_THREADEXIT,7); for(;;){} }
 
@@ -816,6 +796,389 @@ static void test_threads(void){
 // reparent+auto-reap, and WNOHANG/WUNTRACED/WCONTINUED option handling. The
 // total process count from procinfo() is the process-leak oracle.
 static u64 proc_count(void){ u64 t=0; SC3(N_PROCINFO,0,0,&t); return t; }
+
+// User GS base must survive every way the kernel is entered and left: syscalls,
+// blocking (context switch), timer preemption (IRQ entry/exit swapgs), and fork.
+// The kernel keeps its per-CPU pointer in GS, so any missing swapgs shows here.
+static int cpu_has_fsgsbase(void){
+    u32 a=7,b=0,c=0,d=0;
+    __asm__ volatile("cpuid":"+a"(a),"=b"(b),"+c"(c),"=d"(d));
+    return (b&1)!=0;
+}
+static u64 rd_gsbase(void){ u64 v; __asm__ volatile("rdgsbase %0":"=r"(v)); return v; }
+static void wr_gsbase(u64 v){ __asm__ volatile("wrgsbase %0"::"r"(v)); }
+static void test_gs_base(void){
+    section("user GS base");
+    if(!cpu_has_fsgsbase()){ sw("  (skipped: CPU has no FSGSBASE)\n"); return; }
+    const u64 magic=0x00005a5a12345000ULL;
+    wr_gsbase(magic);
+
+    for(int i=0;i<64;i++) SC0(N_GETPID);
+    checkv(rd_gsbase()==magic,"GS base kept across syscalls",(i64)rd_gsbase());
+
+    msleep(20); yield();
+    checkv(rd_gsbase()==magic,"GS base kept across sleep/yield",(i64)rd_gsbase());
+
+    // Spin long enough for several timer ticks to preempt us from user mode.
+    for(volatile u64 i=0;i<30000000ULL;i++){}
+    checkv(rd_gsbase()==magic,"GS base kept across preemption",(i64)rd_gsbase());
+
+    i64 pid=SC0(N_FORK);
+    if(pid==0){ SC1(N_EXIT,rd_gsbase()==magic?0:1); for(;;){} }
+    int st=0; i64 w=(pid>0)?SC3(N_WAIT,pid,&st,0):pid;
+    checkv(w==pid && ((st>>8)&0xff)==0,"fork child inherits GS base",st);
+    checkv(rd_gsbase()==magic,"GS base kept in parent after fork",(i64)rd_gsbase());
+
+    wr_gsbase(0);
+}
+
+// TLB shootdown (SMP step 5): a sibling thread keeps writing a page from
+// another CPU while this thread changes the mapping under it. Without a
+// shootdown its CPU keeps the stale writable translation:
+//  - fork: the page turns copy-on-write, but the thread's writes would still
+//    land in the frame the child now shares, so the child's snapshot moves;
+//  - munmap: the thread would keep writing a page that no longer exists
+//    instead of faulting (it dies, which is the expected outcome here).
+// On one CPU the thread only runs when this one is not, so both pass trivially.
+static volatile u64* g_tlb_page;
+static volatile u64 g_tlb_iters;
+static volatile int g_tlb_stop;
+static volatile int g_tlb_done;
+static void tlb_writer(void* arg){
+    (void)arg;
+    u64 n=0;
+    while(!g_tlb_stop){ g_tlb_page[0]=++n; g_tlb_iters=n; }
+    g_tlb_done=1;
+    SC1(N_THREADEXIT,0); for(;;){}
+}
+static int tlb_wait_progress(void){
+    u64 start=g_tlb_iters;
+    for(int i=0;i<500;i++){ if(g_tlb_iters-start>1000) return 1; yield(); msleep(1); }
+    return 0;
+}
+static void test_tlb_shootdown(void){
+    section("TLB shootdown");
+
+    // 1) fork while a sibling thread writes a now-copy-on-write page.
+    g_tlb_page=(volatile u64*)SC3(N_MMAP,0,4096,PROT_R|PROT_W);
+    checkv((i64)g_tlb_page>0,"mmap page for the writer thread",(i64)g_tlb_page);
+    if((i64)g_tlb_page<=0) return;
+    g_tlb_page[0]=0; g_tlb_iters=0; g_tlb_stop=0; g_tlb_done=0;
+    i64 th=SC3(N_THREADCREATE,(i64)tlb_writer,0,0); checkv(th>0,"writer thread created",th);
+    if(th<=0) return;
+    check(tlb_wait_progress(),"writer thread runs");
+    {   // Informational: on one CPU this only shows timer preemption.
+        u64 a=g_tlb_iters; for(volatile u64 i=0;i<2000000ULL;i++){}
+        sw(g_tlb_iters!=a ? "  (writer made progress while we spun)\n" : "  (writer idle while we spun)\n");
+    }
+    // Several rounds: the stale window only shows if the writer's CPU does not
+    // happen to switch address spaces (e.g. to run the child) meanwhile.
+    int forks_ok=1, st=0;
+    for(int round=0;round<4&&forks_ok;round++){
+        i64 pid=SC0(N_FORK);
+        if(pid==0){
+            // Our copy must not move, however long the parent's thread writes.
+            u64 v=g_tlb_page[0]; int stable=1;
+            for(int r=0;r<20&&stable;r++){
+                for(volatile u64 i=0;i<200000ULL;i++){ if(g_tlb_page[0]!=v){ stable=0; break; } }
+                msleep(1);
+            }
+            SC1(N_EXIT,stable?0:1); for(;;){}
+        }
+        i64 w=(pid>0)?SC3(N_WAIT,pid,&st,0):pid;
+        if(w!=pid || ((st>>8)&0xff)!=0) forks_ok=0;
+        if(!tlb_wait_progress()) forks_ok=0;
+    }
+    checkv(forks_ok,"4x fork: child's copy-on-write page is not written by the parent's thread",st);
+    check(tlb_wait_progress(),"writer keeps running after the copy-on-write breaks");
+
+    g_tlb_stop=1;
+    for(int i=0;i<500&&!g_tlb_done;i++) msleep(1);
+
+    // 2) munmap under the writer: once munmap returns it must not complete
+    //    another store to the page (at most the one in flight to g_tlb_iters).
+    //    The writer's fault kills its whole process, so this runs in a child:
+    //    139 (SIGSEGV) = it faulted at once, 11 = it kept writing, 10 = no fault.
+    sw("  (the child's writer thread is expected to crash on the unmapped page)\n");
+    i64 pid=SC0(N_FORK);
+    if(pid==0){
+        g_tlb_page=(volatile u64*)SC3(N_MMAP,0,4096,PROT_R|PROT_W);
+        if((i64)g_tlb_page<=0) SC1(N_EXIT,12);
+        g_tlb_iters=0; g_tlb_stop=0; g_tlb_done=0;
+        if(SC3(N_THREADCREATE,(i64)tlb_writer,0,0)<=0 || !tlb_wait_progress()) SC1(N_EXIT,13);
+        if(SC2(N_MUNMAP,(i64)g_tlb_page,4096)!=0) SC1(N_EXIT,14);
+        u64 a=g_tlb_iters;
+        for(volatile u64 i=0;i<3000000ULL;i++){}
+        if(g_tlb_iters-a>1) SC1(N_EXIT,11);
+        msleep(20);   // on one CPU the writer only runs now
+        SC1(N_EXIT,10); for(;;){}
+    }
+    st=0; i64 w=(pid>0)?SC3(N_WAIT,pid,&st,0):pid;
+    i64 code=(w==pid)?((st>>8)&0xff):-1;
+    checkv(code==139||code==10,"writer stops as soon as its page is unmapped",code);
+    checkv(code==139,"writer died on the fault, taking its process with it",code);
+}
+
+// ---- SMP step 6: ext4 under the storage lock ----
+// Disk-backed filesystem operations run under the storage lock without the big
+// kernel lock, so other CPUs keep running kernel code while one waits for the
+// disk. Forked workers create, verify and delete files in parallel, in their
+// own directories and in one shared directory, and a sibling thread closes an
+// fd while another thread is reading from it.
+enum { PAR_WORKERS=3, PAR_FILES=16, PAR_SIZE=1500 };
+static void par_pattern(u8* b,int k,int i){ for(int j=0;j<PAR_SIZE;j++) b[j]=(u8)(k*31+i*7+j); }
+static int par_worker(int k){
+    static u8 wb[PAR_SIZE], rb[PAR_SIZE];
+    char dir[32], pfx[48], nm[64];
+    iname(dir,"/ext4p/w",k);
+    if(SC2(N_MKDIR,dir,0755)!=0) return 1;
+    int i=0; while(dir[i]){pfx[i]=dir[i];i++;} pfx[i++]='/'; pfx[i++]='f'; pfx[i]='\0';
+    char spfx[48]; iname(spfx,"/ext4p/shared/w",k); i=0; while(spfx[i]) i++; spfx[i++]='_'; spfx[i]='\0';
+    for(int f=0;f<PAR_FILES;f++){
+        par_pattern(wb,k,f);
+        iname(nm,pfx,f); if(put_file(nm,(const char*)wb,PAR_SIZE)!=0) return 2;
+        iname(nm,spfx,f); if(put_file(nm,(const char*)wb,PAR_SIZE)!=0) return 3;
+    }
+    for(int f=0;f<PAR_FILES;f++){
+        par_pattern(wb,k,f); memset(rb,0,PAR_SIZE);
+        iname(nm,pfx,f); i64 h=t_open(nm,O_RDONLY,0); if(h<0) return 4;
+        i64 r=t_read(h,rb,PAR_SIZE); t_close(h);
+        if(r!=PAR_SIZE || smemcmp(rb,wb,PAR_SIZE)!=0) return 5;
+        if(t_unlink(nm)!=0) return 6;
+    }
+    if(SC1(N_RMDIR,dir)!=0) return 7;
+    return 0;
+}
+static volatile i64 g_race_fd;
+static volatile u64 g_race_reads;
+static volatile i64 g_race_result;
+static volatile int g_race_done;
+static void race_reader(void* arg){
+    (void)arg;
+    static u8 b[4096];   // several 512-byte kernel chunks per read
+    for(;;){
+        i64 r=t_read(g_race_fd,b,sizeof b);
+        if(r==0){ SC3(N_SEEK,g_race_fd,0,SEEK_SET); continue; }
+        if(r<0){ g_race_result=r; break; }
+        g_race_reads++;
+    }
+    g_race_done=1;
+    SC1(N_THREADEXIT,0); for(;;){}
+}
+static void test_storage_parallel(void){
+    section("parallel ext4 (SMP storage lock)");
+    i64 mk=SC2(N_MKDIR,"/ext4p",0755);
+    if(mk<0 && mk!=-E_EXIST){ sw("  note: root not writable ext4, skipping\n"); return; }
+    ok(SC2(N_MKDIR,"/ext4p/shared",0755),"mkdir shared dir");
+
+    i64 t0=SC0(N_GETTIME);
+    i64 pids[PAR_WORKERS]; int forked=0;
+    for(int k=0;k<PAR_WORKERS;k++){
+        i64 pid=SC0(N_FORK);
+        if(pid==0){ SC1(N_EXIT,par_worker(k)); for(;;){} }
+        if(pid>0) pids[forked++]=pid;
+    }
+    checkv(forked==PAR_WORKERS,"forked the parallel workers",forked);
+    int codes_ok=1; i64 bad=0;
+    for(int k=0;k<forked;k++){
+        int st=0; i64 w=SC3(N_WAIT,pids[k],&st,0);
+        int code=(st>>8)&0xff;
+        if(w!=pids[k] || code!=0){ codes_ok=0; bad=code; }
+    }
+    checkv(codes_ok,"workers wrote, verified and removed their files",bad);
+    sw("  (3 workers x "); sdec(PAR_FILES*2); sw(" files: "); sdec(SC0(N_GETTIME)-t0); sw(" ms)\n");
+
+    static struct DirEntry de[128]; memset(de,0,sizeof de);
+    i64 n=SC3(N_READDIR,"/ext4p/shared",de,128);
+    checkv(n==2+PAR_WORKERS*PAR_FILES,"shared dir holds every worker's files",n);
+    int content_ok=1, rm=0;
+    static u8 wb[PAR_SIZE], rb[PAR_SIZE];
+    for(int k=0;k<PAR_WORKERS;k++){
+        char spfx[48]; iname(spfx,"/ext4p/shared/w",k); int i=0; while(spfx[i]) i++; spfx[i++]='_'; spfx[i]='\0';
+        for(int f=0;f<PAR_FILES;f++){
+            char nm[64]; iname(nm,spfx,f); par_pattern(wb,k,f); memset(rb,0,PAR_SIZE);
+            i64 h=t_open(nm,O_RDONLY,0); i64 r=(h>=0)?t_read(h,rb,PAR_SIZE):-1; if(h>=0) t_close(h);
+            if(r!=PAR_SIZE || smemcmp(rb,wb,PAR_SIZE)!=0) content_ok=0;
+            if(t_unlink(nm)==0) rm++;
+        }
+    }
+    check(content_ok,"shared-dir files have the right contents");
+    checkv(rm==PAR_WORKERS*PAR_FILES,"shared-dir files unlinked",rm);
+    ok(SC1(N_RMDIR,"/ext4p/shared"),"rmdir shared dir");
+
+    // A thread closes the fd that its sibling is reading from, often while the
+    // read runs without the big kernel lock: the read must end with EBADF, not
+    // crash. A smoke test only: without the fd pin in sys_read the stale fd is
+    // freed memory whose poison happens to make VFS::read bail out, so a
+    // missing pin does not reliably fail here.
+    {
+        static u8 blk[4096]; for(int i=0;i<4096;i++) blk[i]=(u8)i;
+        i64 h=t_open("/ext4p/race.bin",O_WRONLY|O_CREAT|O_TRUNC,0644); int wok=(h>=0);
+        for(int i=0;i<16&&wok;i++) if(t_write(h,blk,4096)!=4096) wok=0;
+        if(h>=0) t_close(h);
+        check(wok,"write the close-race file");
+        int rounds_ok=1;
+        for(int round=0;round<4&&rounds_ok;round++){
+            g_race_fd=t_open("/ext4p/race.bin",O_RDONLY,0);
+            if(g_race_fd<0){ rounds_ok=0; break; }
+            g_race_reads=0; g_race_result=0; g_race_done=0;
+            i64 th=SC3(N_THREADCREATE,(i64)race_reader,0,0);
+            if(th<=0){ rounds_ok=0; t_close(g_race_fd); break; }
+            // Spin rather than sleep: this thread keeps its CPU, so the close
+            // runs while the reader is inside a read on another CPU.
+            for(volatile u64 i=0;i<20000000ULL&&g_race_reads<(u64)(4+round);i++){}
+            t_close(g_race_fd);
+            for(int i=0;i<500&&!g_race_done;i++){ yield(); msleep(2); }
+            if(!g_race_done || g_race_result!=-E_BADF) rounds_ok=0;
+        }
+        checkv(rounds_ok,"4x close under a reading thread: read ends with EBADF",g_race_result);
+        t_unlink("/ext4p/race.bin");
+    }
+    ok(SC1(N_RMDIR,"/ext4p"),"rmdir /ext4p");
+}
+
+// ---- CPU affinity (SMP step 7) ----
+// Must match kernel CpuInfoEntry.
+struct CpuInfoEntry { u32 index,lapicId; u64 deviceIrqs; u32 currentPid,reserved; };
+static i64 set_aff(i64 pid,u64 mask){ return SC3(N_SETAFFINITY,pid,8,&mask); }
+static u64 get_aff(i64 pid){ u64 m=0; return SC3(N_GETAFFINITY,pid,8,&m)==8 ? m : 0; }
+// True when every sample, taken across yields and a sleep, says CPU `cpu`.
+static int stays_on(i64 cpu){
+    for(int i=0;i<20;i++){
+        if(SC0(N_GETCPU)!=cpu) return 0;
+        if(i&1) yield(); else if(i==10) msleep(3);
+    }
+    return 1;
+}
+static volatile i64 g_aff_thread_cpu=-1; static volatile u64 g_aff_thread_mask=0;
+static void aff_thread(void* arg){
+    (void)arg;
+    g_aff_thread_mask=get_aff(0);
+    i64 cpu=SC0(N_GETCPU);
+    for(int i=0;i<10&&cpu==SC0(N_GETCPU);i++) yield();
+    g_aff_thread_cpu = cpu==SC0(N_GETCPU) ? cpu : -2;
+    SC1(N_THREADEXIT,0); for(;;){}
+}
+static void test_affinity(void){
+    section("CPU affinity");
+    i64 n=SC2(N_CPUINFO,0,0);
+    checkv(n>=1&&n<=16,"cpu_info: online CPU count",n);
+    if(n<1||n>16) return;
+    sw("  (cpus="); sdec(n); sw(")\n");
+    u64 all=(1ULL<<n)-1;
+    i64 cpu=SC0(N_GETCPU); checkv(cpu>=0&&cpu<n,"getcpu in range",cpu);
+    checkv(get_aff(0)==all,"default affinity is every CPU",(i64)get_aff(0));
+
+    { u64 m=0; err(SC3(N_GETAFFINITY,0,4,&m),E_INVAL,"getaffinity: size not a whole word -> EINVAL"); }
+    err(set_aff(0,0),E_INVAL,"setaffinity: empty mask -> EINVAL");
+    if(n<64) err(set_aff(0,1ULL<<63),E_INVAL,"setaffinity: only offline CPUs -> EINVAL");
+    err(set_aff(999999,all),3,"setaffinity: no such pid -> ESRCH");
+    { struct CpuInfoEntry e; err(SC2(N_CPUINFO,n,&e),E_INVAL,"cpu_info: index past last CPU -> EINVAL"); }
+
+    // Pin to each CPU in turn: the scheduler must move us there and keep us.
+    int pinned=1; i64 bad=-1;
+    for(i64 c=0;c<n;c++){
+        if(set_aff(0,1ULL<<c)<0 || get_aff(0)!=(1ULL<<c) || !stays_on(c)){ pinned=0; bad=c; break; }
+    }
+    checkv(pinned,"pinned to each CPU, getcpu agrees across yields/sleep",bad);
+
+    // fork and threads inherit the mask.
+    i64 last=n-1;
+    set_aff(0,1ULL<<last);
+    i64 pid=SC0(N_FORK);
+    if(pid==0){ SC1(N_EXIT, get_aff(0)==(1ULL<<last) && stays_on(last) ? 51 : 52); for(;;){} }
+    if(pid>0){ int st=0; SC3(N_WAIT,pid,&st,0); checkv(st==51||((st>>8)&0xff)==51,"fork child inherits affinity and runs there",st); }
+    else checkv(0,"fork for affinity",pid);
+    g_aff_thread_cpu=-1; g_aff_thread_mask=0;
+    i64 th=SC3(N_THREADCREATE,(i64)aff_thread,0,0);
+    if(th>0){ for(int i=0;i<500&&g_aff_thread_cpu==-1;i++){ yield(); msleep(2); } }
+    checkv(th>0&&g_aff_thread_mask==(1ULL<<last)&&g_aff_thread_cpu==last,"new thread inherits affinity and runs there",g_aff_thread_cpu);
+
+    ok(set_aff(0,all),"restore full affinity");
+    checkv(get_aff(0)==all,"affinity restored",(i64)get_aff(0));
+
+    // Informational: who served device interrupts (balanced onto APs).
+    for(i64 c=0;c<n;c++){
+        struct CpuInfoEntry e; memset(&e,0,sizeof(e));
+        if(SC2(N_CPUINFO,c,&e)!=n || e.index!=(u32)c){ checkv(0,"cpu_info entry",c); return; }
+        sw("  (cpu "); sdec(c); sw(" lapic="); sdec(e.lapicId); sw(" device irqs="); sdec((i64)e.deviceIrqs); sw(")\n");
+    }
+    check(1,"cpu_info entry for every CPU");
+}
+
+// exec from a process whose other threads are spinning on another CPU, sleeping
+// and blocked in a pipe read: they must all die before the image is replaced.
+static volatile i64 g_xt_spin=0, g_xt_sleep=0, g_xt_reader=0; static i64 g_xt_cpus=1; static u64 g_xt_pipe[2];
+static void xt_spinner(void* arg){ (void)arg; set_aff(0,1ULL<<(g_xt_cpus-1)); for(;;) g_xt_spin++; }
+static void xt_sleeper(void* arg){ (void)arg; for(;;){ g_xt_sleep++; msleep(3); } }
+static void xt_reader(void* arg){ (void)arg; u8 b; g_xt_reader=1; t_read((i64)g_xt_pipe[0],&b,1); g_xt_reader=2; SC1(N_THREADEXIT,0); for(;;){} }
+static void test_exec_threads(void){
+    section("exec with live threads");
+    g_xt_cpus=SC2(N_CPUINFO,0,0); if(g_xt_cpus<1) g_xt_cpus=1;
+    u64 base=proc_count();
+    int good=0; i64 bad=0;
+    i64 t0=SC0(N_GETTIME);
+    for(int round=0;round<3;round++){
+        i64 pid=SC0(N_FORK);
+        if(pid==0){
+            set_aff(0,1);
+            if(SC1(N_PIPE,g_xt_pipe)!=0) SC1(N_EXIT,61);
+            if(SC3(N_THREADCREATE,(i64)xt_spinner,0,0)<=0 || SC3(N_THREADCREATE,(i64)xt_sleeper,0,0)<=0 ||
+               SC3(N_THREADCREATE,(i64)xt_reader,0,0)<=0) SC1(N_EXIT,62);
+            for(int i=0;i<1000&&!(g_xt_spin&&g_xt_sleep&&g_xt_reader);i++) msleep(2);
+            msleep(10);   // let the reader block
+            static const char* av[]={"ostest-helper","argc","a","b","c",0};
+            static const char* ev[]={"PATH=/bin",0};
+            SC3(N_EXEC,"/bin/ostest-helper",av,ev);
+            SC1(N_EXIT,60); for(;;){}
+        }
+        if(pid<0){ bad=pid; break; }
+        int st=0; i64 w=SC3(N_WAIT,pid,&st,0);
+        if(w==pid && ((st>>8)&0xff)==5) good++; else { bad=(st>>8)&0xff; break; }
+    }
+    sw("  (3 rounds: "); sdec(SC0(N_GETTIME)-t0); sw(" ms)\n");
+    checkv(good==3,"3x exec kills spinning/sleeping/blocked threads, new image runs",bad);
+    { u64 ac=proc_count(); checkv(ac<=base+2,"exec'd-away threads are reaped",(i64)ac-(i64)base); }
+}
+
+// exit() (from any thread) and a crash in a thread end the whole process.
+static void xe_exiter(void* arg){ (void)arg; msleep(5); SC1(N_EXIT,24); for(;;){} }
+static void xe_crasher(void* arg){ (void)arg; msleep(5); *(volatile int*)0=1; for(;;){} }
+// Starts the spinner/sleeper/pipe-reader threads of test_exec_threads.
+static int xt_start_threads(void){
+    g_xt_spin=0; g_xt_sleep=0; g_xt_reader=0;
+    if(SC1(N_PIPE,g_xt_pipe)!=0) return 0;
+    if(SC3(N_THREADCREATE,(i64)xt_spinner,0,0)<=0 || SC3(N_THREADCREATE,(i64)xt_sleeper,0,0)<=0 ||
+       SC3(N_THREADCREATE,(i64)xt_reader,0,0)<=0) return 0;
+    for(int i=0;i<1000&&!(g_xt_spin&&g_xt_sleep&&g_xt_reader);i++) msleep(2);
+    msleep(10);
+    return 1;
+}
+static i64 xe_run(int mode){   // child exit status, or -1
+    i64 pid=SC0(N_FORK);
+    if(pid==0){
+        set_aff(0,1);
+        if(!xt_start_threads()) SC1(N_EXIT,62);
+        if(mode==0) SC1(N_EXIT,23);
+        SC3(N_THREADCREATE,(i64)(mode==1?xe_exiter:xe_crasher),0,0);
+        for(;;) msleep(50);   // the main thread never exits by itself
+    }
+    if(pid<0) return -1;
+    int st=0; i64 w=SC3(N_WAIT,pid,&st,0);
+    return w==pid ? ((st>>8)&0xff) : -1;
+}
+static void test_exit_threads(void){
+    section("exit kills all threads");
+    i64 t0=SC0(N_GETTIME);
+    g_xt_cpus=SC2(N_CPUINFO,0,0); if(g_xt_cpus<1) g_xt_cpus=1;
+    u64 base=proc_count();
+    i64 r=xe_run(0); checkv(r==23,"main thread exit() kills spinning/sleeping/blocked threads",r);
+    { u64 ac=proc_count(); checkv(ac<=base+1,"wait() returns only once the threads are reaped",(i64)ac-(i64)base); }
+    r=xe_run(1); checkv(r==24,"exit() from a thread ends the process with its code",r);
+    r=xe_run(2); checkv(r==128+11,"crash in a thread ends the process (SIGSEGV)",r);
+    sw("  (3 processes: "); sdec(SC0(N_GETTIME)-t0); sw(" ms)\n");
+    { u64 ac=proc_count(); checkv(ac<=base+1,"no threads left behind",(i64)ac-(i64)base); }
+}
 
 static void test_process_stress(void){
     section("process stress (churn/wait-race/kill-storm/orphan)");
@@ -1157,7 +1520,15 @@ void _start(void){
     test_process();
     test_exec_spawn();   // P1.2: argv/env, shebang, deep paths, cloexec/pipe2
     test_signals();
+    test_net_p5();       // network step 5: sendto/recvfrom, ping sockets, timers
+    test_wallclock();    // network step 6: settable wall clock
     test_threads();   // fixed: FPUState null-init + right-sized buffer + XSAVE guard
+    test_gs_base();      // SMP step 2: kernel GS invariant (swapgs on every user entry/exit)
+    test_tlb_shootdown(); // SMP step 5: stale translations on sibling CPUs
+    test_storage_parallel(); // SMP step 6: ext4 without the big kernel lock
+    test_affinity();         // SMP step 7: sched_setaffinity / getcpu / cpu_info
+    test_exec_threads();     // exec kills the other threads first
+    test_exit_threads();     // exit()/crash in any thread ends the process
     test_process_stress();   // P1.1: wait-race / kill-storm / orphan reaping
     test_memory_p13();   // P1.3: COW fork, demand paging/overcommit, mprotect, soak
     test_mmap_file();    // P2.1a: file-backed mmap (demand page from vnode + MAP_SHARED writeback)

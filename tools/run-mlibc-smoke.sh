@@ -70,7 +70,7 @@ timeout "$QEMU_TIMEOUT" "$QEMU" \
   -accel "$QEMU_ACCEL" \
   -cpu max,+tsc \
   -m 1G \
-  -smp 2 \
+  -smp "${QEMU_SMP:-2}" \
   -serial "file:$LOG" \
   -no-shutdown \
   -no-reboot \
@@ -85,6 +85,12 @@ fi
 
 if ! grep -q 'mlibc-hello: serial-done' "$LOG"; then
   printf 'mlibc smoke did not find completion marker in %s\n' "$LOG" >&2
+  exit 1
+fi
+
+# sysconf(_SC_NPROCESSORS_ONLN) has to see every CPU QEMU was given.
+if ! grep -q "mlibc-hello: nprocs=${QEMU_SMP:-2}\$" "$LOG"; then
+  printf 'mlibc smoke: expected nprocs=%s in %s\n' "${QEMU_SMP:-2}" "$LOG" >&2
   exit 1
 fi
 

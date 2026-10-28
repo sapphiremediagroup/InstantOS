@@ -320,39 +320,6 @@ void io_wait() {
     asm volatile("pause");
 }
 
-char hid_usage_to_char(uint8_t usage, bool shift) {
-    static constexpr char normal[] = {
-        0, 0, 0, 0,
-        'a','b','c','d','e','f','g','h','i','j','k','l','m',
-        'n','o','p','q','r','s','t','u','v','w','x','y','z',
-        '1','2','3','4','5','6','7','8','9','0',
-        '\n', 0, '\b', '\t', ' ', '-', '=', '[', ']', '\\',
-        0, ';', '\'', '`', ',', '.', '/'
-    };
-    static constexpr char shifted[] = {
-        0, 0, 0, 0,
-        'A','B','C','D','E','F','G','H','I','J','K','L','M',
-        'N','O','P','Q','R','S','T','U','V','W','X','Y','Z',
-        '!','@','#','$','%','^','&','*','(',')',
-        '\n', 0, '\b', '\t', ' ', '_', '+', '{', '}', '|',
-        0, ':', '"', '~', '<', '>', '?'
-    };
-
-    if (usage >= sizeof(normal)) {
-        return 0;
-    }
-    return shift ? shifted[usage] : normal[usage];
-}
-
-uint16_t hid_modifier_byte_to_key_modifiers(uint8_t modifiers) {
-    uint16_t out = KeyModifierNone;
-    if (modifiers & 0x22) out |= KeyModifierShift;
-    if (modifiers & 0x11) out |= KeyModifierControl;
-    if (modifiers & 0x44) out |= KeyModifierAlt;
-    if (modifiers & 0x88) out |= KeyModifierSuper;
-    return out;
-}
-
 uint32_t hid_read_bits(const uint8_t* report, uint16_t reportLength, uint16_t bitOffset, uint8_t bitSize) {
     if (!report || bitSize == 0 || bitSize > 32) {
         return 0;
@@ -416,15 +383,6 @@ uint8_t keyboard_key_usage_at(const I2CHIDController::HIDKeyboardReportLayout& l
             static_cast<uint8_t>((layout.keyUsageMinimum + index) & 0xFF) : 0;
     }
     return static_cast<uint8_t>(hid_read_bits(report, reportLength, bitOffset, layout.keyArrayReportSize) & 0xFF);
-}
-
-bool report_had_key(const I2CHIDController::HIDKeyboardReportLayout& layout, const uint8_t* report, uint16_t reportLength, uint8_t usage) {
-    for (uint8_t i = 0; i < layout.keyArrayCount; ++i) {
-        if (keyboard_key_usage_at(layout, report, reportLength, i) == usage) {
-            return true;
-        }
-    }
-    return false;
 }
 
 bool parse_hid_keyboard_report_descriptor(const uint8_t* reportDescriptor, uint16_t length, I2CHIDController::HIDKeyboardReportLayout& outLayout) {
@@ -1526,7 +1484,7 @@ void I2CHIDController::poll() {
         return;
     }
 
-    if (__atomic_test_and_set(&pollingLock, __ATOMIC_ACQUIRE)) {
+    if (!pollingLock.tryLock()) {
         return;
     }
 
@@ -1564,23 +1522,22 @@ void I2CHIDController::poll() {
 
         if (runtime.keyboard && keyboard_report_matches_id(runtime.keyboardLayout, report, reportLength)) {
             const HIDKeyboardReportLayout& layout = runtime.keyboardLayout;
-            const uint8_t hidModifiers = keyboard_modifier_byte(layout, report, reportLength);
-            const uint16_t keyModifiers = hid_modifier_byte_to_key_modifiers(hidModifiers);
-            const bool shift = (keyModifiers & KeyModifierShift) != 0;
-            for (uint8_t keyIndex = 0; keyIndex < layout.keyArrayCount; ++keyIndex) {
-                const uint8_t usage = keyboard_key_usage_at(layout, report, reportLength, keyIndex);
-                if (usage == 0 || report_had_key(layout, runtime.lastKeyboardReport, MaxInputReportBytes, usage)) {
-                    continue;
-                }
-
-                const char c = hid_usage_to_char(usage, shift);
-                if (c != 0) {
-                    Keyboard::get().injectKey(c, keyModifiers, "[i2c:kbd]");
-                    inputDelivered = true;
-                }
+            // Presses and releases against the previous report.
+            uint8_t oldKeys[32] = {};
+            uint8_t newKeys[32] = {};
+            const uint8_t count = layout.keyArrayCount < 32 ? layout.keyArrayCount : 32;
+            for (uint8_t keyIndex = 0; keyIndex < count; ++keyIndex) {
+                oldKeys[keyIndex] = keyboard_key_usage_at(layout, runtime.lastKeyboardReport, MaxInputReportBytes, keyIndex);
+                newKeys[keyIndex] = keyboard_key_usage_at(layout, report, reportLength, keyIndex);
             }
-            memset(runtime.lastKeyboardReport, 0, sizeof(runtime.lastKeyboardReport));
-            memcpy(runtime.lastKeyboardReport, report, reportLength < sizeof(runtime.lastKeyboardReport) ? reportLength : sizeof(runtime.lastKeyboardReport));
+            if (Keyboard::get().hidKeyboardReport(
+                    keyboard_modifier_byte(layout, runtime.lastKeyboardReport, MaxInputReportBytes),
+                    keyboard_modifier_byte(layout, report, reportLength),
+                    oldKeys, newKeys, count, "[i2c:kbd]")) {
+                inputDelivered = true;
+                memset(runtime.lastKeyboardReport, 0, sizeof(runtime.lastKeyboardReport));
+                memcpy(runtime.lastKeyboardReport, report, reportLength < sizeof(runtime.lastKeyboardReport) ? reportLength : sizeof(runtime.lastKeyboardReport));
+            }
         }
 
         if (runtime.mouse && mouse_report_matches_id(runtime.mouseLayout, report, reportLength)) {
@@ -1594,22 +1551,21 @@ void I2CHIDController::poll() {
                 wheel = sign_extend(hid_read_bits(report, reportLength, static_cast<uint16_t>(base + layout.wheelBitOffset), layout.axisReportSize), layout.axisReportSize);
             }
 
-            if (buttons != 0 || dx != 0 || dy != 0 || wheel != 0) {
-                if (dx >= -128 && dx <= 127 && dy >= -128 && dy <= 127 && wheel >= -128 && wheel <= 127) {
-                    Keyboard::get().injectPointerDelta(
-                        buttons,
-                        static_cast<int8_t>(dx),
-                        static_cast<int8_t>(dy),
-                        static_cast<int8_t>(wheel),
-                        "[i2c:mouse]"
-                    );
-                    inputDelivered = true;
-                }
+            // Every report: one with no motion may still release a button.
+            if (dx >= -128 && dx <= 127 && dy >= -128 && dy <= 127 && wheel >= -128 && wheel <= 127 &&
+                Keyboard::get().injectPointerDelta(
+                    buttons,
+                    static_cast<int8_t>(dx),
+                    static_cast<int8_t>(dy),
+                    static_cast<int8_t>(wheel),
+                    "[i2c:mouse]"
+                )) {
+                inputDelivered = true;
             }
         }
     }
 
-    __atomic_clear(&pollingLock, __ATOMIC_RELEASE);
+    pollingLock.unlock();
     if (inputDelivered) {
         Process* current = Scheduler::get().getCurrentProcess();
         if (current && current->getPriority() == ProcessPriority::Idle) {

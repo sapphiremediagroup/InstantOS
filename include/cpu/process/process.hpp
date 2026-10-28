@@ -141,30 +141,64 @@ public:
 
   bool hasValidUserState() const { return validUserState; }
   void setValidUserState(bool valid) { validUserState = valid; }
+  // Big-kernel-lock depth at which this thread's current syscall lets storage
+  // operations run without the lock (0 = never). See StorageLock.
+  uint32_t getStorageUnlockDepth() const { return storageUnlockDepth; }
+  void setStorageUnlockDepth(uint32_t depth) { storageUnlockDepth = depth; }
+  // CPUs (bit = SMP index) this thread may run on; inherited by fork, spawn
+  // and new threads. See sys_sched_setaffinity.
+  uint64_t getCpuAffinity() const { return cpuAffinity; }
+  void setCpuAffinity(uint64_t mask) { cpuAffinity = mask; }
+  bool mayRunOn(uint32_t cpu) const { return cpu < 64 && ((cpuAffinity >> cpu) & 1) != 0; }
 
   uint64_t getSavedUserRSP() const { return savedUserRSP; }
   void setSavedUserRSP(uint64_t rsp) { savedUserRSP = rsp; }
   uint64_t getUserFsBase() const { return userFsBase; }
   void setUserFsBase(uint64_t base) { userFsBase = base; }
+  // User GS base. Live in IA32_KERNEL_GS_BASE while this process is current
+  // (see percpu.hpp); saved here by the scheduler when it switches away.
+  uint64_t getUserGsBase() const { return userGsBase; }
+  void setUserGsBase(uint64_t base) { userGsBase = base; }
 
   bool isSleeping() const { return sleeping; }
   uint64_t getSleepDeadlineMs() const { return sleepDeadlineMs; }
-  void sleepUntil(uint64_t deadlineMs) {
+  // wakesOnEvents: a timed wait (poll with a timeout) that I/O wake-ups
+  // (Scheduler::wakeAllBlockedProcesses) may end early, unlike a plain sleep.
+  void sleepUntil(uint64_t deadlineMs, bool wakesOnEvents = false) {
     sleepDeadlineMs = deadlineMs;
     sleeping = true;
+    sleepWakesOnEvents = wakesOnEvents;
   }
   void clearSleep() {
     sleepDeadlineMs = 0;
     sleeping = false;
+    sleepWakesOnEvents = false;
   }
+  bool wakesOnEvents() const { return sleepWakesOnEvents; }
   bool sleepDeadlineReached(uint64_t nowMs) const {
     return sleeping && nowMs >= sleepDeadlineMs;
   }
 
   SignalHandler *getSignalHandler() { return &signalHandler; }
   void sendSignal(int sig);
+
+  // ITIMER_REAL (setitimer/alarm): SIGALRM at alarmDeadlineMs (0 = off),
+  // then every alarmIntervalMs if nonzero. Checked by the boot CPU's tick.
+  uint64_t alarmDeadlineMs = 0;
+  uint64_t alarmIntervalMs = 0;
   void handlePendingSignals();
   bool hasDeliverableSignal() const;
+  bool killPending() const { return (signalHandler.pending & (1ULL << SIGKILL)) != 0; }
+  // Acts on a pending SIGKILL only, for paths that cannot deliver a handler
+  // (an IRQ taken in user mode). True if this terminated the process.
+  bool terminateIfKilled();
+  // Kills the process like SIGKILL but reports `code` as its exit status
+  // (another thread called exit() or crashed).
+  void requestExit(int code) {
+    exitRequested = true;
+    exitCode = code;
+    sendSignal(SIGKILL);
+  }
 
   // One-shot guard so Scheduler::onProcessTerminated() runs its parent
   // notification / child reparenting exactly once regardless of how many
@@ -202,6 +236,10 @@ public:
   const ThreadObject *getThreadObject() const { return threadObject; }
   void setThreadObject(ThreadObject *object) { threadObject = object; }
   bool replaceImageFrom(Process *image);
+  // Threads of one process share its address space, handles and mmap regions.
+  bool sharesStateWith(const Process *other) const {
+    return other && sharedState && sharedState == other->sharedState;
+  }
 
   // File descriptor management
   uint64_t allocateFD(FileDescriptor *fd);
@@ -308,9 +346,14 @@ private:
   bool validUserState;
   uint64_t savedUserRSP;
   uint64_t userFsBase;
+  uint64_t userGsBase;
   uint64_t sleepDeadlineMs;
   bool sleeping;
   bool terminationHandled = false;
+  bool exitRequested = false;   // see requestExit()
+  bool sleepWakesOnEvents = false;   // see sleepUntil()
+  uint32_t storageUnlockDepth = 0;
+  uint64_t cpuAffinity = ~0ULL;
   SignalHandler signalHandler;
   Debug::SyscallTrace syscallTrace;
   ThreadObject *threadObject;

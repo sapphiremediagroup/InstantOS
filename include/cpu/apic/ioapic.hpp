@@ -14,6 +14,8 @@ public:
     void initialize(uint64_t physAddr, uint32_t gsiBase);
     
     void setRedirect(uint8_t irq, uint8_t vector, uint32_t lapicId, bool masked, uint16_t flags);
+    // Retargets an entry, leaving vector, mode and mask as they are.
+    void setDestination(uint8_t irq, uint32_t lapicId);
     void maskIRQ(uint8_t irq);
     void unmaskIRQ(uint8_t irq);
     

@@ -55,6 +55,7 @@ void _start(void) {
     // no network needed).
     static const char* const argv[] = {
         "nsfb",
+        "-f", "instant",
         "-w", "1024",
         "-h", "768",
         "about:welcome",

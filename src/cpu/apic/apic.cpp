@@ -1,4 +1,5 @@
 #include <cpu/apic/apic.hpp>
+#include <cpu/apic/irq_balance.hpp>
 #include <memory/vmm.hpp>
 #include <cpu/acpi/acpi.hpp>
 #include <cpu/cereal/cereal.hpp>
@@ -177,6 +178,11 @@ void IOAPIC::initialize(uint64_t physAddr, uint32_t gsiBaseIn) {
           PageFlags::Present | PageFlags::ReadWrite | PageFlags::CacheDisab | PageFlags::WriteThru | PageFlags::NoExecute);
 
   base = reinterpret_cast<volatile uint32_t *>(virt);
+}
+
+void IOAPIC::setDestination(uint8_t irq, uint32_t lapicId) {
+  // The destination is the whole high dword, so one write moves it atomically.
+  write(IOAPIC_REG_REDTBL + (irq * 2) + 1, lapicId << 24);
 }
 
 void IOAPIC::setRedirect(uint8_t irq, uint8_t vector, uint32_t lapicId,
@@ -377,7 +383,7 @@ bool APICManager::mapGSI(uint32_t gsi, uint8_t vector, uint32_t dest, uint16_t f
     return false;
   }
 
-  uint32_t lapicId = dest;
+  uint32_t lapicId = IRQBalance::addGsiRoute(gsi, vector, dest);
   uint8_t redirectIndex = gsi - ioapic->getGSIBase();
   traceStr("[apic] mapGSI gsi=");
   traceDec(gsi);
@@ -392,6 +398,15 @@ bool APICManager::mapGSI(uint32_t gsi, uint8_t vector, uint32_t dest, uint16_t f
   traceStr("\n");
 
   ioapic->setRedirect(redirectIndex, vector, lapicId, false, flags);
+  return true;
+}
+
+bool APICManager::setGSIDestination(uint32_t gsi, uint32_t lapicId) {
+  IOAPIC *ioapic = getIOAPICForGSI(gsi);
+  if (!ioapic) {
+    return false;
+  }
+  ioapic->setDestination(static_cast<uint8_t>(gsi - ioapic->getGSIBase()), lapicId);
   return true;
 }
 

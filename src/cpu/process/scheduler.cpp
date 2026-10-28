@@ -7,6 +7,8 @@
 #include <cpu/cpuid.hpp>
 #include <cpu/percpu.hpp>
 #include <cpu/cereal/cereal.hpp>
+#include <cpu/klock.hpp>
+#include <cpu/smp.hpp>
 #include <common/ports.hpp>
 #include <time/tsc_timer.hpp>
 
@@ -66,18 +68,41 @@ uint64_t processCR3(Process* process) {
     return process->getContext()->cr3 & ADDR_MASK;
 }
 
-void loadThreadPointer(Process* process) {
-    wrmsr(kMsrFsBase, process ? process->getUserFsBase() : 0);
+// Switch the user FS/GS bases from oldProcess to newProcess. In the kernel the
+// current process's user GS base lives in IA32_KERNEL_GS_BASE (the GS base is
+// the PerCPUData pointer), so it is saved from there before loading the next.
+void switchUserSegmentBases(Process* oldProcess, Process* newProcess) {
+    if (oldProcess) {
+        oldProcess->setUserGsBase(rdmsr(kMsrKernelGsBase));
+    }
+    wrmsr(kMsrFsBase, newProcess ? newProcess->getUserFsBase() : 0);
+    wrmsr(kMsrKernelGsBase, newProcess ? newProcess->getUserGsBase() : 0);
 }
 
+// One line per CPU the first time it runs something other than its idle loop,
+// so a serial log shows which CPUs actually took work.
+void traceFirstRunOnCpu(Process* process) {
+    static bool seen[SMP::kMaxCPUs] = {};
+    const uint32_t cpu = currentCpuIndex();
+    if (!process || process->getPriority() == ProcessPriority::Idle ||
+        cpu >= SMP::kMaxCPUs || seen[cpu]) {
+        return;
+    }
+    seen[cpu] = true;
+    traceWrite("[smp] cpu ");
+    traceDec(cpu);
+    traceWrite(" running pid ");
+    traceDec(process->getPID());
+    traceWrite(" ");
+    traceWrite(process->getName());
+    traceWrite("\n");
+}
+
+// The IRQ exit stub swaps to the user GS when it sees the user CS set here.
 void prepareInterruptReturnToUser(InterruptFrame* frame) {
     frame->cs = kUserCodeSelector;
     frame->ss = kUserDataSelector;
     frame->rflags |= 0x200;
-
-    if (rdmsr(kMsrKernelGsBase) == 0) {
-        asm volatile("swapgs" ::: "memory");
-    }
 }
 
 const char* stateName(ProcessState state) {
@@ -160,34 +185,149 @@ Scheduler& Scheduler::get() {
 void Scheduler::initialize() {
     if (initialized) return;
     
-    currentProcess = nullptr;
+    current() = nullptr;
     allProcessesHead = nullptr;
     for (int i = 0; i < 4; i++) {
         readyQueues[i] = nullptr;
     }
     
     nextPID = 1;
-    
-    // Create idle process
-    idleProcess = new Process(0);
-    idleProcess->setName("<idle>");
-    idleProcess->getContext()->cr3 =
-        reinterpret_cast<uint64_t>(VMM::GetKernelAddressSpace()) & ADDR_MASK;
-    idleProcess->setPriority(ProcessPriority::Idle);
-    idleProcess->getContext()->rip = reinterpret_cast<uint64_t>(idleLoop);
-    idleProcess->getContext()->rsp = idleProcess->getKernelStack() - 8;
-    idleProcess->getContext()->rflags = 0x202; // IF enabled
-    idleProcess->setState(ProcessState::Ready);
-    
-    // We don't add idle process to allProcessesHead or regular ready queues
-    // It's handled specially in getNextProcess
-    
+
+    // The boot CPU's idle process. Idle processes are not in allProcessesHead
+    // or the ready queues; getNextProcess() falls back to the executing CPU's.
+    idle() = createIdleProcess();
+
     initialized = true;
+}
+
+namespace {
+// Idle is stateless: whenever a CPU switches to it, it restarts at idleLoop on
+// an empty stack. Nothing is ever resumed on an idle stack, so an IRQ frame
+// left there (by a frame-rewrite return to user) can never be resumed stale.
+void resetIdleContext(Process* idleProcess) {
+    ProcessContext* ctx = idleProcess->getContext();
+    ctx->cr3 = reinterpret_cast<uint64_t>(VMM::GetKernelAddressSpace()) & ADDR_MASK;
+    ctx->rip = reinterpret_cast<uint64_t>(idleLoop);
+    ctx->rsp = idleProcess->getKernelStack() - 8;
+    ctx->rflags = 0x202; // IF enabled
+}
+}
+
+Process* Scheduler::createIdleProcess() {
+    Process* idleProcess = new Process(0);
+    idleProcess->setName("<idle>");
+    idleProcess->setPriority(ProcessPriority::Idle);
+    resetIdleContext(idleProcess);
+    idleProcess->setState(ProcessState::Ready);
+    return idleProcess;
+}
+
+void Scheduler::runIdleOnThisCpu() {
+    Process* idleProcess = idle();
+    current() = idleProcess;
+    idleProcess->setState(ProcessState::Running);
+    resetIdleContext(idleProcess);
+    Syscall::get().setKernelStack(idleProcess->getKernelStack());
+    switchContext(nullptr, idleProcess->getContext());
+}
+
+void Scheduler::onKernelEntry() {
+    PerCPUData* cpu = getPerCPU();
+    Process* parked = cpu->deferredProcess;
+    if (!parked) return;
+    cpu->deferredProcess = nullptr;
+
+    if (parked->getState() == ProcessState::Ready) {
+        addToReadyQueue(parked);
+    } else if (parked->getState() == ProcessState::Terminated) {
+        // A waiting parent skipped it while it was parked; let it look again.
+        wakeParentOf(parked);
+    }
+}
+
+bool Scheduler::tickIsNoop(InterruptFrame* frame) {
+    PerCPUData* cpu = getPerCPU();
+    // A parked process is only queued again by this CPU's next locked entry.
+    if (cpu->deferredProcess) return false;
+    for (int prio = 0; prio <= static_cast<int>(ProcessPriority::High); ++prio) {
+        if (__atomic_load_n(&readyQueues[prio], __ATOMIC_RELAXED)) return false;
+    }
+    Process* running = cpu->currentProcess;
+    if (!running || running == cpu->idleProcess || frame->cs != kUserCodeSelector) {
+        return true;
+    }
+    // Its affinity no longer includes this CPU: the scheduler has to move it.
+    if (!running->mayRunOn(cpu->cpuIndex)) return false;
+    if (running->killPending()) return false;
+    // Still runnable and nothing else to run: it keeps the CPU. Killed or
+    // blocked from another CPU: the scheduler has to take it off.
+    return running->getState() == ProcessState::Running;
+}
+
+void Scheduler::deferUntilNextEntry(Process* proc) {
+    onKernelEntry();   // never more than one parked process per CPU
+    removeFromReadyQueue(proc);
+    getPerCPU()->deferredProcess = proc;
+}
+
+bool Scheduler::isBusyOnAnyCpu(Process* proc) {
+    for (uint32_t i = 0; i < SMP::kMaxCPUs; ++i) {
+        PerCPUData* cpu = SMP::cpu(i);
+        if (cpu && (cpu->currentProcess == proc || cpu->deferredProcess == proc)) {
+            return true;
+        }
+    }
+    return current() == proc || getPerCPU()->deferredProcess == proc;
+}
+
+void Scheduler::kickIdleCpu(Process* proc) {
+    if (!SMP::schedulingActive()) return;
+    PerCPUData* self = getPerCPU();
+    for (uint32_t i = 0; i < SMP::kMaxCPUs; ++i) {
+        PerCPUData* cpu = SMP::cpu(i);
+        if (!cpu || cpu == self || !proc->mayRunOn(i)) continue;
+        if (cpu->currentProcess && cpu->currentProcess == cpu->idleProcess) {
+            SMP::sendReschedule(cpu);
+            return;
+        }
+    }
+}
+
+void Scheduler::switchTo(Process* oldProcess, Process* nextProcess) {
+    if (nextProcess == idle()) {
+        resetIdleContext(nextProcess);
+    }
+    if (!oldProcess || oldProcess == idle()) {
+        // Nothing to come back to: idle restarts fresh, and the boot path
+        // never resumes.
+        switchContext(nullptr, nextProcess->getContext());
+        return;
+    }
+
+    const uint32_t lockDepth = KernelLock::depth();
+    switchContext(oldProcess->getContext(), nextProcess->getContext());
+    // Resumed, possibly on another CPU, by a context that holds the BKL.
+    KernelLock::setDepth(lockDepth);
+}
+
+namespace {
+// A parked process (see PerCPUData::deferredProcess) is queued by its CPU's
+// onKernelEntry(), never directly: some CPU may still be on its kernel stack.
+bool parkedOnSomeCpu(Process* proc) {
+    for (uint32_t i = 0; i < SMP::kMaxCPUs; ++i) {
+        PerCPUData* cpu = SMP::cpu(i);
+        if (cpu && cpu->deferredProcess == proc) {
+            return true;
+        }
+    }
+    return getPerCPU()->deferredProcess == proc;
+}
 }
 
 void Scheduler::addToReadyQueue(Process* proc) {
     if (!proc || proc->getState() != ProcessState::Ready) return;
-    
+    if (parkedOnSomeCpu(proc)) return;
+
     int prio = static_cast<int>(proc->getPriority());
     if (prio < 0 || prio > 3) return;
 
@@ -198,7 +338,7 @@ void Scheduler::addToReadyQueue(Process* proc) {
     }
 
     proc->next = nullptr;
-    
+
     if (!readyQueues[prio]) {
         readyQueues[prio] = proc;
     } else {
@@ -208,10 +348,14 @@ void Scheduler::addToReadyQueue(Process* proc) {
         }
         current->next = proc;
     }
+    // Re-queueing the running process (preemption) needs no wake-up: this CPU
+    // is about to pick from the queue itself, unless its affinity forbids that.
+    if (proc != current() || !proc->mayRunOn(currentCpuIndex())) kickIdleCpu(proc);
 }
 
 void Scheduler::addToReadyQueueFront(Process* proc) {
     if (!proc || proc->getState() != ProcessState::Ready) return;
+    if (parkedOnSomeCpu(proc)) return;
 
     int prio = static_cast<int>(proc->getPriority());
     if (prio < 0 || prio > 3) return;
@@ -223,6 +367,8 @@ void Scheduler::addToReadyQueueFront(Process* proc) {
 
     proc->next = readyQueues[prio];
     readyQueues[prio] = proc;
+    // See addToReadyQueue().
+    if (proc != current() || !proc->mayRunOn(currentCpuIndex())) kickIdleCpu(proc);
 }
 
 void Scheduler::removeFromReadyQueue(Process* proc) {
@@ -263,7 +409,13 @@ void Scheduler::addProcess(Process* proc) {
 
 void Scheduler::removeProcess(uint32_t pid) {
     if (!allProcessesHead) return;
-    
+
+    // Never free a process some CPU still runs or sits on the stack of; wait()
+    // only gets here for children findChild() reported as fully off-CPU.
+    if (Process* target = getProcessByPID(pid)) {
+        if (target != current() && isBusyOnAnyCpu(target)) return;
+    }
+
     Process* toDelete = nullptr;
     
     // Remove from all processes list
@@ -287,7 +439,7 @@ void Scheduler::removeProcess(uint32_t pid) {
         removeFromReadyQueue(toDelete);
         
         // SessionManager::get().onProcessExit(pid);
-        if (currentProcess == toDelete) currentProcess = nullptr;
+        if (current() == toDelete) current() = nullptr;
 
         delete toDelete;
     }
@@ -303,10 +455,11 @@ void Scheduler::reapTerminated() {
         // Reap terminated threads (their exit status lives in a refcounted
         // ThreadObject read by join) and terminated orphan processes (no parent
         // left to call wait()). A terminated process that still has a live
-        // parent stays a zombie until the parent reaps it via sys_wait(). The
-        // currently running process is never freed out from under itself.
+        // parent stays a zombie until the parent reaps it via sys_wait(). A
+        // process some CPU still runs or sits on the kernel stack of is never
+        // freed out from under it.
         const bool reapable =
-            process != currentProcess &&
+            !isBusyOnAnyCpu(process) &&
             process->getState() == ProcessState::Terminated &&
             (process->isThread() || process->getParentPID() == 0);
 
@@ -318,7 +471,17 @@ void Scheduler::reapTerminated() {
             }
 
             removeFromReadyQueue(process);
+            Process* leader = nullptr;
+            if (process->isThread()) {
+                for (Process* p = allProcessesHead; p; p = p->allNext) {
+                    if (!p->isThread() && p->sharesStateWith(process)) { leader = p; break; }
+                }
+            }
             delete process;
+            // A dead main thread waits for its threads before wait() sees it.
+            if (leader && leader->getState() == ProcessState::Terminated) {
+                wakeParentOf(leader);
+            }
         } else {
             previous = process;
         }
@@ -328,16 +491,19 @@ void Scheduler::reapTerminated() {
 }
 
 Process* Scheduler::getNextProcess() {
+    const uint32_t cpu = currentCpuIndex();
     // Check queues in order of priority: High (2), Normal (1), Low (0)
     for (int i = 2; i >= 0; i--) {
-        if (readyQueues[i]) {
-            Process* next = readyQueues[i];
-            
-            // Round robin within the same priority level
-            // Move head to tail
+        Process* previous = nullptr;
+        for (Process* next = readyQueues[i]; next; previous = next, next = next->next) {
+            if (!next->mayRunOn(cpu)) continue;   // left for another CPU
+            // Round robin within the same priority level: move it to the tail.
             if (next->next) {
-                readyQueues[i] = next->next;
-                
+                if (previous) {
+                    previous->next = next->next;
+                } else {
+                    readyQueues[i] = next->next;
+                }
                 Process* tail = readyQueues[i];
                 while (tail->next) {
                     tail = tail->next;
@@ -345,13 +511,13 @@ Process* Scheduler::getNextProcess() {
                 tail->next = next;
                 next->next = nullptr;
             }
-            
+
             return next;
         }
     }
     
     // If no user processes are ready, return the idle process
-    return idleProcess;
+    return idle();
 }
 
 void Scheduler::schedule() {
@@ -359,20 +525,26 @@ void Scheduler::schedule() {
 
     reapTerminated();
     
-    if (currentProcess) {
-        currentProcess->handlePendingSignals();
+    if (current()) {
+        // Only SIGKILL here. This runs inside a syscall, and a handler frame
+        // built into the saved context now is overwritten when the syscall
+        // resumes after the switch (restoreSyscallState rebuilds the context
+        // from its stack): the handler never ran but its mask stayed applied,
+        // so that signal was never delivered again (an interval timer went
+        // quiet after two SIGALRMs). Both syscall exits deliver signals.
+        current()->terminateIfKilled();
 
-        if (currentProcess != idleProcess) {
-            if (currentProcess->getState() == ProcessState::Terminated) {
+        if (current() != idle()) {
+            if (current()->getState() == ProcessState::Terminated) {
                 // The current process just died here (e.g. a fatal signal
                 // delivered by handlePendingSignals, or a sys_exit that landed
                 // us in schedule()). Notify its parent before we switch away;
                 // the actual free happens later via reapTerminated()/sys_wait().
-                onProcessTerminated(currentProcess);
-            } else if (currentProcess->getState() == ProcessState::Running) {
+                onProcessTerminated(current());
+            } else if (current()->getState() == ProcessState::Running) {
                 // Still runnable: put it back in the ready queue.
-                currentProcess->setState(ProcessState::Ready);
-                addToReadyQueue(currentProcess);
+                current()->setState(ProcessState::Ready);
+                addToReadyQueue(current());
             }
         }
     }
@@ -380,25 +552,26 @@ void Scheduler::schedule() {
     Process* nextProcess = getNextProcess();
     if (!nextProcess) return;
 
-    Process* oldProcess = currentProcess;
-    currentProcess = nextProcess;
-    currentProcess->setState(ProcessState::Running);
-    currentProcess->getContext()->cr3 = processCR3(currentProcess);
-    loadThreadPointer(currentProcess);
-    
+    Process* oldProcess = current();
+    current() = nextProcess;
+    current()->setState(ProcessState::Running);
+    current()->getContext()->cr3 = processCR3(current());
+    switchUserSegmentBases(oldProcess, current());
+    traceFirstRunOnCpu(current());
+
     // If it's a regular process, it's already removed from the ready queue head by getNextProcess
     // or specifically handled by round-robin logic there.
     // Wait, my getNextProcess round-robin logic moves it to the tail. 
     // That means it's still in the queue. We should PROBABLY remove it from the ready queue while it's running.
-    if (currentProcess != idleProcess) {
-        removeFromReadyQueue(currentProcess);
+    if (current() != idle()) {
+        removeFromReadyQueue(current());
     }
 
     Syscall::get().setKernelStack(nextProcess->getKernelStack());
     traceSwitchInvariant("syscall", oldProcess, nextProcess);
     
     asm volatile("cli");
-    
+
     if (oldProcess) {
         if (oldProcess->getFPUState()) {
             CPU::saveExtendedState(oldProcess->getFPUState());
@@ -409,13 +582,13 @@ void Scheduler::schedule() {
         oldProcess->getContext()->cr3 = processCR3(oldProcess);
         oldProcess->setValidUserState(false);
         oldProcess->setSavedUserRSP(getPerCPU()->userRSP);
-        switchContext(oldProcess->getContext(), nextProcess->getContext());
-        getPerCPU()->userRSP = currentProcess->getSavedUserRSP();
+        switchTo(oldProcess, nextProcess);
+        getPerCPU()->userRSP = current()->getSavedUserRSP();
     } else {
         if (nextProcess->getFPUState()) {
             CPU::restoreExtendedState(nextProcess->getFPUState());
         }
-        switchContext(nullptr, nextProcess->getContext());
+        switchTo(nullptr, nextProcess);
     }
     // Reached when this frame is resumed via a later switchContext() back into
     // it. oldProcess is this (now-running) process, so it cannot be Terminated;
@@ -433,17 +606,23 @@ void Scheduler::schedule(InterruptFrame* frame) {
 
     reapTerminated();
     
-    Process* oldProcess = currentProcess;
+    Process* oldProcess = current();
     const bool interruptedUser = frame->cs == kUserCodeSelector;
 
     if (oldProcess && oldProcess->getFPUState()) {
         CPU::saveExtendedState(oldProcess->getFPUState());
     }
 
+    // Killed while running user code (e.g. a sibling thread of an exec): it
+    // would otherwise only notice at its next syscall.
+    if (oldProcess && oldProcess != idle() && interruptedUser) {
+        oldProcess->terminateIfKilled();
+    }
+
     if (oldProcess && oldProcess->getState() == ProcessState::Terminated) {
         onProcessTerminated(oldProcess);
     }
-    
+
     // Save current state if it's a user process
     if (oldProcess && interruptedUser) {
         oldProcess->getContext()->rip = frame->rip;
@@ -465,17 +644,24 @@ void Scheduler::schedule(InterruptFrame* frame) {
         
         if (oldProcess->getState() == ProcessState::Running) {
             oldProcess->setState(ProcessState::Ready);
-            if (oldProcess != idleProcess) addToReadyQueue(oldProcess);
+            if (oldProcess != idle()) addToReadyQueue(oldProcess);
         }
     } else if (oldProcess) {
         if (oldProcess->getState() == ProcessState::Running) {
             oldProcess->setState(ProcessState::Ready);
-            if (oldProcess != idleProcess) addToReadyQueue(oldProcess);
+            if (oldProcess != idle()) addToReadyQueue(oldProcess);
         }
     }
     
     Process* nextProcess = getNextProcess();
     if (!nextProcess) return;
+
+    // Idle and still nothing to run (the common idle tick): keep idling rather
+    // than restarting the idle loop.
+    if (nextProcess == oldProcess && oldProcess == idle()) {
+        oldProcess->setState(ProcessState::Running);
+        return;
+    }
 
     const bool nextHasKernelResume = !nextProcess->hasValidUserState() && nextProcess->getSavedUserRSP() != 0;
 
@@ -490,7 +676,7 @@ void Scheduler::schedule(InterruptFrame* frame) {
         if (oldProcess) {
             removeFromReadyQueue(oldProcess);
             oldProcess->setState(ProcessState::Running);
-            currentProcess = oldProcess;
+            current() = oldProcess;
         }
         return;
     }
@@ -506,19 +692,20 @@ void Scheduler::schedule(InterruptFrame* frame) {
         if (oldProcess) {
             removeFromReadyQueue(oldProcess);
             oldProcess->setState(ProcessState::Running);
-            currentProcess = oldProcess;
+            current() = oldProcess;
         }
         return;
     }
     
-    if (nextProcess != idleProcess) {
+    if (nextProcess != idle()) {
         removeFromReadyQueue(nextProcess);
     }
     
-    currentProcess = nextProcess;
-    currentProcess->setState(ProcessState::Running);
-    currentProcess->getContext()->cr3 = processCR3(currentProcess);
-    loadThreadPointer(currentProcess);
+    current() = nextProcess;
+    current()->setState(ProcessState::Running);
+    current()->getContext()->cr3 = processCR3(current());
+    switchUserSegmentBases(oldProcess, current());
+    traceFirstRunOnCpu(current());
 
     if (nextProcess->getFPUState()) {
         CPU::restoreExtendedState(nextProcess->getFPUState());
@@ -548,6 +735,13 @@ void Scheduler::schedule(InterruptFrame* frame) {
         if (!interruptedUser) {
             prepareInterruptReturnToUser(frame);
         }
+
+        // This CPU returns to nextProcess from the IRQ frame on oldProcess's
+        // kernel stack, and only after irqHandler drops the BKL. Until then no
+        // other CPU may run (or free) oldProcess on that stack.
+        if (oldProcess && oldProcess != nextProcess && oldProcess != idle()) {
+            deferUntilNextEntry(oldProcess);
+        }
     } else {
         // Special case for newly created processes that haven't run yet
         Syscall::get().setKernelStack(nextProcess->getKernelStack());
@@ -559,16 +753,12 @@ void Scheduler::schedule(InterruptFrame* frame) {
             oldProcess->getContext()->cr3 = processCR3(oldProcess);
             oldProcess->setValidUserState(false);
             oldProcess->setSavedUserRSP(interruptedUser ? frame->rsp : getPerCPU()->userRSP);
-            if (interruptedUser) {
-                asm volatile("swapgs" ::: "memory");
-            }
-            switchContext(oldProcess->getContext(), nextProcess->getContext());
-            if (interruptedUser) {
-                asm volatile("swapgs" ::: "memory");
-            }
-            getPerCPU()->userRSP = currentProcess->getSavedUserRSP();
+            // No GS juggling: the IRQ entry stub already put this CPU's
+            // PerCPUData in GS, which is where every kernel context expects it.
+            switchTo(oldProcess, nextProcess);
+            getPerCPU()->userRSP = current()->getSavedUserRSP();
         } else {
-            switchContext(nullptr, nextProcess->getContext());
+            switchTo(nullptr, nextProcess);
         }
     }
 }
@@ -582,7 +772,7 @@ void Scheduler::scheduleFromSyscall() {
 }
 
 void Scheduler::wakeProcess(Process* process) {
-    if (!process || process == idleProcess) {
+    if (!process || process == idle()) {
         return;
     }
 
@@ -620,6 +810,10 @@ void Scheduler::onProcessTerminated(Process* process) {
     }
     process->markTerminationHandled();
 
+    // However the main thread died, its threads go with it. wait() does not
+    // report it until they are all reaped (findChild).
+    killSiblingThreads(process);
+
     const uint32_t deadPid = process->getPID();
 
     // Reparent any children (live or already-zombie) to the orphan parent (0).
@@ -650,6 +844,10 @@ void Scheduler::onProcessTerminated(Process* process) {
 void Scheduler::wakeExpiredSleepers(uint64_t nowMs) {
     Process* process = allProcessesHead;
     while (process) {
+        if (process->alarmDeadlineMs != 0 && nowMs >= process->alarmDeadlineMs) {
+            process->alarmDeadlineMs = process->alarmIntervalMs ? nowMs + process->alarmIntervalMs : 0;
+            process->sendSignal(SIGALRM);
+        }
         if (process->getState() == ProcessState::Blocked && process->sleepDeadlineReached(nowMs)) {
             process->clearSleep();
             process->setState(ProcessState::Ready);
@@ -664,7 +862,8 @@ void Scheduler::wakeAllBlockedProcesses() {
     Process* process = allProcessesHead;
     while (process) {
         if (process->getState() == ProcessState::Blocked) {
-            if (process->isSleeping() && !process->sleepDeadlineReached(nowMs)) {
+            if (process->isSleeping() && !process->wakesOnEvents() &&
+                !process->sleepDeadlineReached(nowMs)) {
                 process = process->allNext;
                 continue;
             }
@@ -677,12 +876,56 @@ void Scheduler::wakeAllBlockedProcesses() {
     }
 }
 
+bool Scheduler::killSiblingThreads(Process* proc) {
+    bool remaining = false;
+    for (Process* p = allProcessesHead; p; p = p->allNext) {
+        if (p == proc || !p->sharesStateWith(proc)) continue;
+        remaining = true;
+        if (p->getState() == ProcessState::Terminated) continue;
+        // Blocked: woken, it dies at its next schedule() or syscall exit.
+        // Running in user mode elsewhere: the IPI makes that CPU's
+        // schedule(frame) act on the SIGKILL.
+        p->sendSignal(SIGKILL);
+        kickCpuRunning(p);
+    }
+    return remaining;
+}
+
+void Scheduler::exitThreadGroup(Process* caller, int code) {
+    if (caller->isThread()) {
+        for (Process* p = allProcessesHead; p; p = p->allNext) {
+            if (!p->isThread() && p->sharesStateWith(caller) &&
+                p->getState() != ProcessState::Terminated) {
+                p->requestExit(code);
+                kickCpuRunning(p);
+            }
+        }
+    }
+    killSiblingThreads(caller);
+}
+
+bool Scheduler::hasOtherThreads(Process* proc) {
+    for (Process* p = allProcessesHead; p; p = p->allNext) {
+        if (p != proc && p->sharesStateWith(proc)) return true;
+    }
+    return false;
+}
+
+void Scheduler::kickCpuRunning(Process* proc) {
+    for (uint32_t i = 0; i < SMP::kMaxCPUs; ++i) {
+        PerCPUData* cpu = SMP::cpu(i);
+        if (cpu && cpu != getPerCPU() && cpu->currentProcess == proc) {
+            SMP::sendReschedule(cpu);
+        }
+    }
+}
+
 uint32_t Scheduler::allocatePID() {
     return nextPID++;
 }
 
 Process* Scheduler::getProcessByPID(uint32_t pid) {
-    if (idleProcess && idleProcess->getPID() == pid) return idleProcess;
+    if (idle() && idle()->getPID() == pid) return idle();
     
     Process* current = allProcessesHead;
     while (current) {
@@ -715,7 +958,13 @@ Process* Scheduler::findChild(uint32_t parentPID, int64_t pid, bool terminatedOn
                 if (hasMatchingChild) {
                     *hasMatchingChild = true;
                 }
-                if (!terminatedOnly || current->getState() == ProcessState::Terminated) {
+                // A terminated child still parked on some CPU is not reapable
+                // yet; that CPU wakes the parent again once it lets go of it.
+                // Nor is one whose threads are still dying: reapTerminated()
+                // wakes the parent as they go.
+                if (!terminatedOnly ||
+                    (current->getState() == ProcessState::Terminated && !isBusyOnAnyCpu(current) &&
+                     !hasOtherThreads(current))) {
                     return current;
                 }
             }

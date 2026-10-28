@@ -5,6 +5,7 @@
 constexpr uint8_t USB_REQUEST_GET_DESCRIPTOR = 0x06;
 constexpr uint8_t USB_REQUEST_SET_ADDRESS = 0x05;
 constexpr uint8_t USB_REQUEST_SET_CONFIGURATION = 0x09;
+constexpr uint8_t USB_REQUEST_SET_REPORT = 0x09;   // HID class
 constexpr uint8_t USB_REQUEST_SET_IDLE = 0x0A;
 constexpr uint8_t USB_REQUEST_SET_PROTOCOL = 0x0B;
 

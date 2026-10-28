@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <common/spinlock.hpp>
 // #include <array>
 #include <cpu/cereal/cereal.hpp>
 #include <cpu/idt/interrupt.hpp>
@@ -8,7 +9,9 @@
 #include <cpu/syscall/syscall.hpp>
 #include <common/ports.hpp>
 #include <graphics/console.hpp>
+#include <interrupts/keymap.hpp>
 #include <ipc/ipc.hpp>
+#include <time/tsc_timer.hpp>
 
 class Keyboard : public Interrupt {
 public:
@@ -17,13 +20,9 @@ public:
             return;
         }
 
-        shiftPressed = false;
-        ctrlPressed = false;
-        altPressed = false;
-        superPressed = false;
-        capsLock = false;
         keyboardPresent = false;
         extendedPrefix = false;
+        pauseBytes = 0;
         bufferHead = 0;
         bufferTail = 0;
 
@@ -62,6 +61,12 @@ public:
         const uint8_t scanAck = sendDeviceCommand(0xF4);
         keyboardPresent = keyboardPresent || scanAck == kDeviceAck;
 
+        // The lights to match the lock state we start with (Num Lock on).
+        if (keyboardPresent && sendDeviceCommand(0xED) == kDeviceAck &&
+            sendDeviceCommand(ps2LedByte(lockLeds())) == kDeviceAck) {
+            ps2LedsSent = lockLeds();
+        }
+
         waitForInputReady();
         outb(kCommandPort, 0xA8);
         const uint8_t mouseDefaultAck = sendAuxDeviceCommand(0xF6);
@@ -99,14 +104,14 @@ public:
 
     void Run(InterruptFrame* frame) override {
         (void)frame;
-        if (__atomic_test_and_set(&polling_lock, __ATOMIC_ACQUIRE)) {
+        if (!polling_lock.tryLock()) {
             sendEOI();
             return;
         }
 
         const bool handled = drainController(true);
 
-        __atomic_clear(&polling_lock, __ATOMIC_RELEASE);
+        polling_lock.unlock();
 
         sendEOI();
 
@@ -134,7 +139,7 @@ public:
     }
 
     void servicePendingInput() {
-        if (__atomic_test_and_set(&polling_lock, __ATOMIC_ACQUIRE)) {
+        if (!polling_lock.tryLock()) {
             return;
         }
 
@@ -151,7 +156,14 @@ public:
             }
         }
 
-        __atomic_clear(&polling_lock, __ATOMIC_RELEASE);
+        const uint64_t now = time_get_uptime_ms();
+        repeatTick(now);
+        if (ps2LedState != LedState::Idle && now >= ps2LedDeadlineMs) {
+            // No ACK: give up on this update; after three, on the lights.
+            ps2LedState = LedState::Idle;
+            ++ps2LedFailures;
+        }
+        polling_lock.unlock();
     }
 
     bool drainController(bool traceIrq = false) {
@@ -176,37 +188,114 @@ public:
         return (inb(kStatusPort) & kStatusOutputFull) != 0;
     }
 
+    // A character from the serial console: typed as the key that makes it
+    // (pressed and released), with Shift or, for control characters 1-26,
+    // Control around it.
     bool injectChar(char c, const char* prefix = "[kbd:serial]") {
-        return injectKey(c, KeyModifierNone, prefix);
-    }
-
-    bool injectKey(char c, uint16_t modifiers, const char* prefix = "[kbd:serial]") {
-        if (c == 0) {
+        uint16_t modifier = KeyNone;
+        if (c >= 1 && c <= 26 && c != '\b' && c != '\t' && c != '\n' && c != '\r') {
+            c = static_cast<char>('a' + c - 1);
+            modifier = KeyLeftControl;
+        }
+        bool shift = false;
+        const uint16_t key = keymap::forUsChar(c, &shift);
+        if (key == KeyNone) {
             return false;
         }
-
-        if (c == '\r') {
-            c = '\n';
+        if (shift) {
+            modifier = KeyLeftShift;
         }
-
-        const Event event = makeKeyEvent(c, modifiers);
-        const bool windowPosted = IPCManager::get().postKeyEventToFocusedWindow(event);
-        IPCManager::get().postServiceEvent("graphics.compositor", &event, sizeof(event));
-        const bool inputPosted = postInputManagerEvent(event);
-        const bool buffered = appendToBuffer(c, prefix);
-        Scheduler::get().wakeAllBlockedProcesses();
-        (void)windowPosted;
-        (void)inputPosted;
-        (void)buffered;
+        if (modifier != KeyNone) keyChanged(modifier, true, prefix);
+        keyChanged(key, true, prefix);
+        keyChanged(key, false, prefix);
+        if (modifier != KeyNone) keyChanged(modifier, false, prefix);
         return true;
     }
 
-    void injectPointerDelta(uint8_t buttons, int8_t dx, int8_t dy, int8_t wheel = 0, const char* prefix = "[mouse]") {
+    // A key went down or up on some keyboard; keycode is a KeyCode (the HID
+    // usage). The modifiers come from the keys held, Caps and Num Lock are
+    // kept here, the text comes from the US layout. Held keys repeat from
+    // repeatTick; a keyboard's own repeats (PS/2 typematic) are dropped, so
+    // every keyboard repeats alike.
+    bool keyChanged(uint16_t keycode, bool down, const char* prefix = "[kbd]") {
+        if (keycode == KeyNone || keycode > 0xFF) {
+            return false;
+        }
+        const bool wasDown = isDown(keycode);
+        if (down == wasDown) {
+            return false;
+        }
+        setDown(keycode, down);
+        if (down && (keycode == KeyCapsLock || keycode == KeyNumLock || keycode == KeyScrollLock)) {
+            if (keycode == KeyCapsLock) capsLock = !capsLock;
+            if (keycode == KeyNumLock) numLock = !numLock;
+            if (keycode == KeyScrollLock) scrollLock = !scrollLock;
+            syncPs2Leds();
+        }
+        emitKey(down ? KeyEventAction::Press : KeyEventAction::Release, keycode, prefix);
+        if (down && keymap::repeats(keycode)) {
+            repeatKey = keycode;
+            nextRepeatMs = time_get_uptime_ms() + kRepeatDelayMs;
+        } else if (!down && keycode == repeatKey) {
+            repeatKey = KeyNone;
+        }
+        return true;
+    }
+
+    // The lock lights as a HID output report has them: bit 0 Num Lock, bit 1
+    // Caps Lock, bit 2 Scroll Lock. The USB controllers set their keyboards'
+    // from their poll; PS/2's are set here.
+    uint8_t lockLeds() const {
+        return static_cast<uint8_t>((numLock ? 0x01 : 0) | (capsLock ? 0x02 : 0) | (scrollLock ? 0x04 : 0));
+    }
+
+    // One HID boot-style keyboard report (USB or I2C) against the previous
+    // one: the modifier byte's bits are the keys 0xE0-0xE7, the arrays the
+    // other keys held. Returns false for a report to ignore: the keyboard
+    // signalling rollover (more keys than it can report) with usage 0x01.
+    bool hidKeyboardReport(uint8_t oldModifiers, uint8_t newModifiers,
+                           const uint8_t* oldKeys, const uint8_t* newKeys, uint8_t count,
+                           const char* prefix) {
+        for (uint8_t i = 0; i < count; ++i) {
+            if (newKeys[i] == 0x01) {
+                return false;
+            }
+        }
+        auto has = [count](const uint8_t* keys, uint8_t usage) {
+            for (uint8_t i = 0; i < count; ++i) {
+                if (keys[i] == usage) return true;
+            }
+            return false;
+        };
+        // Modifiers down first and up last, so a report that brings Shift and
+        // a letter together types the capital.
+        for (uint8_t bit = 0; bit < 8; ++bit) {
+            if ((newModifiers & ~oldModifiers) & (1u << bit)) keyChanged(KeyLeftControl + bit, true, prefix);
+        }
+        for (uint8_t i = 0; i < count; ++i) {
+            if (oldKeys[i] >= KeyA && !has(newKeys, oldKeys[i])) keyChanged(oldKeys[i], false, prefix);
+        }
+        for (uint8_t i = 0; i < count; ++i) {
+            if (newKeys[i] >= KeyA && !has(oldKeys, newKeys[i])) keyChanged(newKeys[i], true, prefix);
+        }
+        for (uint8_t bit = 0; bit < 8; ++bit) {
+            if ((oldModifiers & ~newModifiers) & (1u << bit)) keyChanged(KeyLeftControl + bit, false, prefix);
+        }
+        return true;
+    }
+
+    // One mouse report. Returns false (and posts nothing) when it changes
+    // nothing: no motion, no wheel, the same buttons. A report that only
+    // releases a button is not empty.
+    bool injectPointerDelta(uint8_t buttons, int8_t dx, int8_t dy, int8_t wheel = 0, const char* prefix = "[mouse]") {
+        if (dx == 0 && dy == 0 && wheel == 0 && static_cast<uint16_t>(buttons & 0x07) == mouseButtons) {
+            return false;
+        }
+        // USB and I2C reports are framed, so unlike a PS/2 byte stream that
+        // slipped (handleMouseByte) a large delta is real motion: a fast
+        // flick, or movement the device folded together while unpolled.
         const int32_t rawDx = static_cast<int32_t>(dx);
         const int32_t rawDy = static_cast<int32_t>(dy);
-        if (absMouseDelta(rawDx) > kMouseMaxRawDelta || absMouseDelta(rawDy) > kMouseMaxRawDelta) {
-            return;
-        }
 
         const int32_t scaledDx = scaleMouseDelta(rawDx);
         const int32_t scaledDy = scaleMouseDelta(rawDy);
@@ -250,12 +339,30 @@ public:
         }
 
         Scheduler::get().wakeAllBlockedProcesses();
+        return true;
     }
 
     void publishBufferedInputToInputManager() {
         while (hasKey()) {
             const char c = buffer[bufferTail];
-            const Event event = makeKeyEvent(c, KeyModifierNone);
+            // An escape sequence (an arrow, F-key, ...) has no single key to
+            // stand for it here: drop it, ESC through its final byte.
+            const int next = (bufferTail + 1) % BUFFER_SIZE;
+            if (c == 0x1B && next != bufferHead && (buffer[next] == '[' || buffer[next] == 'O')) {
+                bufferTail = (next + 1) % BUFFER_SIZE;
+                while (hasKey()) {
+                    const char b = buffer[bufferTail];
+                    bufferTail = (bufferTail + 1) % BUFFER_SIZE;
+                    if (b >= 0x40 && b <= 0x7E) {
+                        break;
+                    }
+                }
+                continue;
+            }
+            bool shift = false;
+            const uint16_t key = keymap::forUsChar(c, &shift);
+            const char text = keymap::usText(key, shift, false);
+            const Event event = makeKeyEvent(KeyEventAction::Press, key, text, shift ? KeyModifierShift : KeyModifierNone);
             if (!postInputManagerEvent(event)) {
                 break;
             }
@@ -401,26 +508,127 @@ private:
         outb(kDataPort, config);
     }
 
-    Event makeKeyEvent(char c, uint16_t modifiers) {
+    Event makeKeyEvent(KeyEventAction action, uint16_t keycode, char text, uint16_t modifiers) {
         Event event = {};
         event.type = EventType::Key;
-        event.key.action = KeyEventAction::Press;
+        event.key.action = action;
         event.key.modifiers = modifiers;
-        event.key.keycode = static_cast<uint16_t>(static_cast<unsigned char>(c));
-        if (c != '\n' && c != '\r' && c != '\b') {
-            event.key.text[0] = c;
-        }
+        event.key.keycode = keycode;
+        event.key.text[0] = text;
         return event;
     }
 
-    bool appendToBuffer(char c, const char* prefix) {
-        int nextHead = (bufferHead + 1) % BUFFER_SIZE;
-        if (nextHead == bufferTail) {
+    bool isDown(uint16_t key) const { return (keysDown[key >> 3] & (1u << (key & 7))) != 0; }
+
+    void setDown(uint16_t key, bool down) {
+        if (down) keysDown[key >> 3] |= static_cast<uint8_t>(1u << (key & 7));
+        else keysDown[key >> 3] &= static_cast<uint8_t>(~(1u << (key & 7)));
+    }
+
+    uint16_t currentModifiers() const {
+        uint16_t modifiers = KeyModifierNone;
+        if (isDown(KeyLeftShift) || isDown(KeyRightShift)) modifiers |= KeyModifierShift;
+        if (isDown(KeyLeftControl) || isDown(KeyRightControl)) modifiers |= KeyModifierControl;
+        if (isDown(KeyLeftAlt) || isDown(KeyRightAlt)) modifiers |= KeyModifierAlt;
+        if (isDown(KeyLeftSuper) || isDown(KeyRightSuper)) modifiers |= KeyModifierSuper;
+        if (capsLock) modifiers |= KeyModifierCapsLock;
+        if (numLock) modifiers |= KeyModifierNumLock;
+        return modifiers;
+    }
+
+    // Posts the event for a physical key. The keypad becomes its navigation
+    // keys with Num Lock off; releases carry no text and type nothing.
+    void emitKey(KeyEventAction action, uint16_t physical, const char* prefix) {
+        const uint16_t modifiers = currentModifiers();
+        uint16_t keycode = physical;
+        char text = 0;
+        if (physical >= KeypadSlash && physical <= KeypadPeriod) {
+            const bool navigation = !numLock && keymap::keypadNavigation(physical) != physical;
+            if (navigation) {
+                keycode = keymap::keypadNavigation(physical);
+            } else {
+                text = keymap::keypadText(physical);
+            }
+        } else {
+            text = keymap::usText(physical, (modifiers & KeyModifierShift) != 0, capsLock);
+        }
+        if (action == KeyEventAction::Release) {
+            text = 0;
+        }
+        const Event event = makeKeyEvent(action, keycode, text, modifiers);
+        IPCManager::get().postKeyEventToFocusedWindow(event);
+        IPCManager::get().postServiceEvent("graphics.compositor", &event, sizeof(event));
+        postInputManagerEvent(event);
+        if (action != KeyEventAction::Release) {
+            char bytes[8];
+            appendToBuffer(bytes, keymap::consoleBytes(keycode, text, modifiers, bytes));
+        }
+        Scheduler::get().wakeAllBlockedProcesses();
+    }
+
+    // PS/2 orders the lights Scroll, Num, Caps from bit 0.
+    static uint8_t ps2LedByte(uint8_t hidLeds) {
+        return static_cast<uint8_t>(((hidLeds & 0x04) ? 0x01 : 0) | ((hidLeds & 0x01) ? 0x02 : 0) |
+                                    ((hidLeds & 0x02) ? 0x04 : 0));
+    }
+
+    // Sets the PS/2 lights without waiting: the command (0xED) goes out
+    // here, the light byte when its ACK arrives with the scancodes
+    // (ps2LedAck), and a change made meanwhile follows the second ACK.
+    void syncPs2Leds() {
+        if (!keyboardPresent || ps2LedState != LedState::Idle || ps2LedFailures >= 3 ||
+            lockLeds() == ps2LedsSent) {
+            return;
+        }
+        ps2LedsInFlight = lockLeds();
+        waitForInputReady();
+        outb(kDataPort, 0xED);
+        ps2LedState = LedState::WaitCommandAck;
+        ps2LedDeadlineMs = time_get_uptime_ms() + kLedAckTimeoutMs;
+    }
+
+    void ps2LedAck() {
+        if (ps2LedState == LedState::WaitCommandAck) {
+            waitForInputReady();
+            outb(kDataPort, ps2LedByte(ps2LedsInFlight));
+            ps2LedState = LedState::WaitDataAck;
+            ps2LedDeadlineMs = time_get_uptime_ms() + kLedAckTimeoutMs;
+        } else if (ps2LedState == LedState::WaitDataAck) {
+            ps2LedsSent = ps2LedsInFlight;
+            ps2LedState = LedState::Idle;
+            ps2LedFailures = 0;
+            syncPs2Leds();
+        }
+    }
+
+    // Auto-repeat of the last key pressed while it stays down: after
+    // kRepeatDelayMs, then every kRepeatIntervalMs. From the boot CPU's tick.
+    void repeatTick(uint64_t nowMs) {
+        if (repeatKey == KeyNone || nowMs < nextRepeatMs) {
+            return;
+        }
+        if (!isDown(repeatKey)) {
+            repeatKey = KeyNone;
+            return;
+        }
+        emitKey(KeyEventAction::Repeat, repeatKey, "[kbd:repeat]");
+        // Behind (the tick was late): carry on from now rather than burst.
+        nextRepeatMs = nextRepeatMs + kRepeatIntervalMs > nowMs ? nextRepeatMs + kRepeatIntervalMs
+                                                                : nowMs + kRepeatIntervalMs;
+    }
+
+    // Queues what a read of the console (stdin without a terminal) gets for
+    // a key, all of it or, when the buffer is full, none: a reader never sees
+    // half an escape sequence.
+    bool appendToBuffer(const char* bytes, uint32_t n) {
+        const int used = (bufferHead - bufferTail + BUFFER_SIZE) % BUFFER_SIZE;
+        if (n == 0 || used + static_cast<int>(n) >= BUFFER_SIZE) {
             return false;
         }
-
-        buffer[bufferHead] = c;
-        bufferHead = nextHead;
+        for (uint32_t i = 0; i < n; ++i) {
+            buffer[bufferHead] = bytes[i];
+            bufferHead = (bufferHead + 1) % BUFFER_SIZE;
+        }
         return true;
     }
 
@@ -430,7 +638,16 @@ private:
             return;
         }
 
-        if (scancode == kDeviceAck || scancode == kKeyboardBatOk) {
+        // 0xAA is not filtered like the ACK: besides "self-test passed" (read
+        // during initialize) it is left Shift's break code, and dropping it
+        // left Shift stuck down.
+        if (scancode == kDeviceAck) {
+            ps2LedAck();
+            return;
+        }
+        if (scancode == kDeviceResend && ps2LedState != LedState::Idle) {
+            ps2LedState = LedState::Idle;
+            ++ps2LedFailures;
             return;
         }
 
@@ -438,52 +655,25 @@ private:
             extendedPrefix = true;
             return;
         }
+        // Pause sends E1 1D 45 E1 9D C5 at once and nothing on release.
+        if (scancode == 0xE1) {
+            pauseBytes = 2;
+            return;
+        }
+        if (pauseBytes != 0) {
+            if (--pauseBytes == 0 && scancode == 0x45) {
+                keyChanged(KeyPause, true, prefix);
+                keyChanged(KeyPause, false, prefix);
+            }
+            return;
+        }
 
         const bool extended = extendedPrefix;
         extendedPrefix = false;
-
-        if (scancode & 0x80) {
-            scancode &= 0x7F;
-            if (extended) {
-                if (scancode == 0x5B || scancode == 0x5C) {
-                    superPressed = false;
-                }
-            } else if (scancode == 0x2A || scancode == 0x36) shiftPressed = false;
-            else if (scancode == 0x1D) ctrlPressed = false;
-            else if (scancode == 0x38) altPressed = false;
-            return;
-        }
-
-        if (extended) {
-            if (scancode == 0x5B || scancode == 0x5C) {
-                superPressed = true;
-            }
-            return;
-        }
-
-        if (scancode == 0x2A || scancode == 0x36) shiftPressed = true;
-        else if (scancode == 0x1D) ctrlPressed = true;
-        else if (scancode == 0x38) altPressed = true;
-        else if (scancode == 0x3A) capsLock = !capsLock;
-        else if (scancode < 58) {
-            char c = (shiftPressed ^ capsLock) ? scancodeToAsciiShift[scancode] : scancodeToAscii[scancode];
-            if (c != 0) {
-                uint16_t modifiers = KeyModifierNone;
-                if (shiftPressed) modifiers |= KeyModifierShift;
-                if (ctrlPressed) modifiers |= KeyModifierControl;
-                if (altPressed) modifiers |= KeyModifierAlt;
-                if (capsLock) modifiers |= KeyModifierCapsLock;
-                if (superPressed) modifiers |= KeyModifierSuper;
-                Event event = makeKeyEvent(c, modifiers);
-                const bool windowPosted = IPCManager::get().postKeyEventToFocusedWindow(event);
-                IPCManager::get().postServiceEvent("graphics.compositor", &event, sizeof(event));
-                const bool inputPosted = postInputManagerEvent(event);
-
-                if (appendToBuffer(c, prefix)) {
-                    Scheduler::get().wakeAllBlockedProcesses();
-                }
-            }
-        }
+        const bool release = (scancode & 0x80) != 0;
+        scancode &= 0x7F;
+        const uint16_t key = extended ? keymap::fromPs2Set1Extended(scancode) : keymap::fromPs2Set1(scancode);
+        keyChanged(key, !release, prefix);
     }
 
     void handleMouseByte(uint8_t byte) {
@@ -571,39 +761,38 @@ private:
         return BUFFER_SIZE - bufferTail + bufferHead;
     }
 
-    char scancodeToAscii[58] = {
-        0, 0, '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', '\b',
-        '\t', 'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '[', ']', '\n',
-        0, 'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', ';', '\'', '`',
-        0, '\\', 'z', 'x', 'c', 'v', 'b', 'n', 'm', ',', '.', '/', 0,
-        '*', 0, ' '
-    };
-    char scancodeToAsciiShift[58] = {
-        0, 0, '!', '@', '#', '$', '%', '^', '&', '*', '(', ')', '_', '+', '\b',
-        '\t', 'Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P', '{', '}', '\n',
-        0, 'A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L', ':', '"', '~',
-        0, '|', 'Z', 'X', 'C', 'V', 'B', 'N', 'M', '<', '>', '?', 0,
-        '*', 0, ' '
-    };
     
     static const int BUFFER_SIZE = 256;
     char buffer[BUFFER_SIZE];
     volatile int bufferHead = 0;
     volatile int bufferTail = 0;
     
+    static constexpr uint64_t kRepeatDelayMs = 500;
+    static constexpr uint64_t kRepeatIntervalMs = 33;
+    static constexpr uint64_t kLedAckTimeoutMs = 100;
+
+    enum class LedState : uint8_t { Idle, WaitCommandAck, WaitDataAck };
+
     bool initialized = false;
     bool keyboardPresent = false;
-    bool shiftPressed;
-    bool ctrlPressed;
-    bool altPressed;
-    bool superPressed;
-    bool capsLock;
+    uint8_t keysDown[32] = {};   // one bit per KeyCode held, any keyboard
+    bool capsLock = false;
+    bool numLock = true;         // as most PCs boot
+    bool scrollLock = false;
+    LedState ps2LedState = LedState::Idle;
+    uint8_t ps2LedsSent = 0xFF;  // as lockLeds(); 0xFF: unknown
+    uint8_t ps2LedsInFlight = 0;
+    uint8_t ps2LedFailures = 0;
+    uint64_t ps2LedDeadlineMs = 0;
+    uint16_t repeatKey = KeyNone;
+    uint64_t nextRepeatMs = 0;
     bool extendedPrefix;
+    uint8_t pauseBytes = 0;
     uint8_t mousePacket[3] = {0, 0, 0};
     int mousePacketIndex = 0;
     int32_t mouseX = 0;
     int32_t mouseY = 0;
     uint16_t mouseButtons = 0;
     bool mouseEnabled = false;
-    volatile bool polling_lock = false;
+    Spinlock polling_lock{"kbd-poll"};
 };

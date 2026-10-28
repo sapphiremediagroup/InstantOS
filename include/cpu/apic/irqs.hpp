@@ -23,4 +23,10 @@ static constexpr uint8_t VECTOR_MSI_BASE = 0x70;
 static constexpr uint8_t VECTOR_MSI_LIMIT = 0x7F;
 static constexpr uint8_t VECTOR_GPIO_BASE = 0x80;
 static constexpr uint8_t VECTOR_GPIO_LIMIT = 0x8F;
+// SMP: each application processor's periodic LAPIC timer, and the IPI a CPU
+// sends to wake an idle one when it queues work (src/cpu/smp.cpp).
+static constexpr uint8_t VECTOR_AP_TIMER = 0xF0;
+static constexpr uint8_t VECTOR_RESCHEDULE = 0xF1;
+// TLB shootdown IPI (src/cpu/tlb.cpp). Handled without the big kernel lock.
+static constexpr uint8_t VECTOR_TLB_SHOOTDOWN = 0xF2;
 static constexpr uint8_t VECTOR_SPURIOUS = 0xFF;

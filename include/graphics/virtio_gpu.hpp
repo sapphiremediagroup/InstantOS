@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <common/spinlock.hpp>
 #include <drivers/virtio/virtio.hpp>
 
 // VirtIO GPU Device IDs
@@ -522,6 +523,14 @@ private:
         uint32_t responseType;
         uint64_t completedFence;
         uint32_t ownerPID;
+        // Set when sendCommand() gave up waiting: the completion pass frees
+        // the descriptors and DMA pages once the device answers.
+        bool abandoned;
+        uint16_t tailDesc;
+        uint64_t cmdPhys;
+        uint64_t cmdPages;
+        uint64_t respPhys;
+        uint64_t respPages;
     };
 
     struct ResourceRecord {
@@ -573,6 +582,7 @@ private:
     FenceWaiter* allocateFenceWaiter();
     void releaseFenceWaiter(FenceWaiter* waiter);
     void processControlQueueCompletions();
+    void drainControlQueueLocked();
     bool destroyFramebufferResource();
     void releaseFramebufferMemory();
     ResourceRecord* findResourceRecord(uint32_t resourceId);
@@ -664,7 +674,7 @@ private:
     bool irqRegistered;
     IRQMode irqMode;
     bool interruptLatched;
-    int commandLock;
+    Spinlock commandLock{"virtio-gpu-cmd"};
     FenceWaiter fenceWaiters[MaxFenceWaiters];
     ResourceRecord resourceRecords[MaxTrackedResources];
     ContextRecord contextRecords[MaxTrackedContexts];

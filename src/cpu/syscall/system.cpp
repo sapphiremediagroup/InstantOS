@@ -15,6 +15,7 @@
 #include <common/ports.hpp>
 #include <common/krandom.hpp>
 #include <time/time.hpp>
+#include <time/tsc_timer.hpp>
 #include <fs/storage/storage.hpp>
 #include <cpuid.h>
 
@@ -91,12 +92,10 @@ bool currentProcessOwnsFramebuffer() {
         return false;
     }
 
-    // The graphics-compositor normally owns the framebuffer. The NetSurf
-    // framebuffer browser (/bin/nsfb) is a fullscreen direct-framebuffer app
-    // that also draws straight to the device, so grant it ownership too.
+    // Only the graphics-compositor draws to the device; everything else,
+    // NetSurf included, is a window on a compositor surface.
     const char* name = current->getName();
-    return strcmp(name, "/bin/graphics-compositor") == 0 ||
-           strcmp(name, "/bin/nsfb") == 0;
+    return strcmp(name, "/bin/graphics-compositor") == 0;
 }
 
 bool mapFramebufferIntoCurrentProcess(iFramebuffer* fb, uint64_t* userBase) {
@@ -215,8 +214,48 @@ uint64_t Syscall::sys_gettime() {
     return Timer::get().getMilliseconds();
 }
 
+// Monotonic nanoseconds since boot (CLOCK_MONOTONIC in mlibc).
+uint64_t Syscall::sys_gettime_ns() {
+    return time_get_uptime_ns();
+}
+
 uint64_t Syscall::sys_getunixtime() {
     return time_get_unix();
+}
+
+uint64_t Syscall::sys_get_unix_time_ns() {
+    return time_get_unix_ns();
+}
+
+// dmesg: the newest `length` bytes the kernel logged, oldest first.
+uint64_t Syscall::sys_kernel_log(uint64_t buffer, uint64_t length) {
+    if (buffer == 0 || length == 0) {
+        return syscall_error(SysErrInvalid);
+    }
+    if (length > 128 * 1024) {
+        length = 128 * 1024;
+    }
+    char* copy = static_cast<char*>(kmalloc(length));
+    if (!copy) {
+        return syscall_error(SysErrNoMemory);
+    }
+    const size_t count = Cereal::get().copyLog(copy, length);
+    const bool copied = copyToUser(buffer, copy, count);
+    kfree(copy);
+    return copied ? count : syscall_error(SysErrInvalid);
+}
+
+// settimeofday/clock_settime(CLOCK_REALTIME); root only, like Linux.
+uint64_t Syscall::sys_set_unix_time(uint64_t unixNs) {
+    Process* current = Scheduler::get().getCurrentProcess();
+    if (!current || !current->isPrivileged()) {
+        return syscall_error(SysErrPermission);
+    }
+    if (static_cast<int64_t>(unixNs) < 0 || !time_set_unix_ns(unixNs)) {
+        return syscall_error(SysErrInvalid);
+    }
+    Cereal::get().write("[time] wall clock set\n");
+    return 0;
 }
 
 uint64_t Syscall::sys_get_entropy(uint64_t buffer, uint64_t length) {
@@ -250,13 +289,14 @@ struct FBInfoStruct {
 uint64_t Syscall::sys_fb_info(uint64_t info_ptr) {
     iFramebuffer* fb = Console::get().getFramebuffer();
     if (!fb) return (uint64_t)-1;
-    if (!currentProcessOwnsFramebuffer()) return (uint64_t)-1;
 
     if (!isValidUserPointer(info_ptr, sizeof(FBInfoStruct))) {
         return (uint64_t)-1;
     }
+    // Only the compositor gets the framebuffer mapped; anyone may read the
+    // screen geometry (apps size their windows by it), with addr = 0.
     uint64_t userBase = 0;
-    if (!mapFramebufferIntoCurrentProcess(fb, &userBase)) {
+    if (currentProcessOwnsFramebuffer() && !mapFramebufferIntoCurrentProcess(fb, &userBase)) {
         return (uint64_t)-1;
     }
 

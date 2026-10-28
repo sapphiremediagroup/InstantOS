@@ -6,6 +6,12 @@
 #include <cpu/cpuid.hpp>
 #include <memory/vmm.hpp>
 #include <cpu/cereal/cereal.hpp>
+#include <cpu/klock.hpp>
+#include <cpu/tlb.hpp>
+#include <cpu/smp.hpp>
+#include <cpu/percpu.hpp>
+#include <cpu/apic/irqs.hpp>
+#include <time/tsc_timer.hpp>
 
 Interrupt *interruptHandlers[256] = {nullptr};
 
@@ -82,7 +88,7 @@ void printStackTrace(uint64_t rbp, uint64_t rip) {
     }
 }
 
-extern "C" void exceptionHandler(InterruptFrame* frame) {
+static void handleException(InterruptFrame* frame) {
     // Copy-on-write fast path: a write to a *present* page (err bits P|W set)
     // that lands on a COW-marked leaf is resolved by handing the faulting
     // address space a private writable copy, then resuming the instruction.
@@ -124,6 +130,29 @@ extern "C" void exceptionHandler(InterruptFrame* frame) {
             asm volatile("mov %0, %%cr3" :: "r"(savedCR3) : "memory");
             if (handled) {
                 return;   // page populated; re-execute the faulting instruction
+            }
+        }
+    }
+
+    // Stale TLB entry: another CPU widened this mapping (COW break, mprotect,
+    // demand fault by a sibling thread) without a shootdown, which only
+    // narrowing changes get. Flush the entry and retry. Faulting on the same
+    // address over and over means the cause is not the TLB (the flush did not
+    // help), so after a few retries it is handled as a real fault.
+    if (frame->interrupt == 0x0E) {
+        constexpr uint32_t kMaxRetries = 64;
+        static uint64_t lastAddr[SMP::kMaxCPUs];
+        static uint32_t retries[SMP::kMaxCPUs];
+        uint64_t cr2;
+        asm volatile("mov %%cr2, %0" : "=r"(cr2));
+        const uint32_t cpu = currentCpuIndex() % SMP::kMaxCPUs;
+        if (VMM::PermitsFaultedAccess(VMM::GetAddressSpace(), cr2, frame->errCode)) {
+            const uint64_t page = cr2 & ~0xFFFULL;
+            retries[cpu] = (lastAddr[cpu] == page) ? retries[cpu] + 1 : 1;
+            lastAddr[cpu] = page;
+            if (retries[cpu] <= kMaxRetries) {
+                TLB::flushLocal(cr2, 1);
+                return;
             }
         }
     }
@@ -187,7 +216,12 @@ extern "C" void exceptionHandler(InterruptFrame* frame) {
         }
 
         if (current) {
-            current->setExitCode(128 + ((frame->interrupt == 0x0E) ? SIGSEGV : SIGTERM));
+            const int code = 128 + ((frame->interrupt == 0x0E) ? SIGSEGV : SIGTERM);
+            // A crash in any thread takes the whole process down.
+            if (current->isThread()) {
+                Scheduler::get().exitThreadGroup(current, code);
+            }
+            current->setExitCode(code);
             current->closeFilesOnExit();
             current->setState(ProcessState::Terminated);
             current->setValidUserState(false);
@@ -239,6 +273,15 @@ extern "C" void exceptionHandler(InterruptFrame* frame) {
     while(1);
 }
 
+// Exceptions take the big kernel lock like any kernel entry. A fault inside the
+// kernel (e.g. demand paging a user buffer during a syscall) nests on the lock
+// this CPU already holds.
+extern "C" void exceptionHandler(InterruptFrame* frame) {
+    KernelLock::enter(KernelLock::kSiteException + (frame->interrupt & 0xFF));
+    handleException(frame);
+    KernelLock::leave();
+}
+
 Interrupt::~Interrupt() = default;
 
 void ISR::registerIRQ(uint8_t vector, Interrupt* handler) {
@@ -254,18 +297,57 @@ void ISR::registerIRQ(uint8_t vector, Interrupt* handler) {
 // pool. Without this, an IRQ landing inside kernel code that has live XMM/YMM
 // (e.g. a kernel thread doing floating-point pixel math) is silently corrupted.
 // IRQ gates run with IF=0 so nesting is normally absent; the depth index keeps
-// this correct even if a handler re-enables interrupts.
+// this correct even if a handler re-enables interrupts. The scratch pool is
+// shared by all CPUs: handleIrq runs only under the big kernel lock.
 namespace {
 constexpr int kMaxKernelIrqFpuDepth = 4;
 alignas(64) FPUState kernelIrqFpuScratch[kMaxKernelIrqFpuDepth];
 int kernelIrqFpuDepth = 0;
 }  // namespace
 
+static void handleIrq(InterruptFrame* frame);
+
 extern "C" void irqHandler(InterruptFrame* frame) {
     if (frame == nullptr) {
         LAPIC::get().sendEOI();
         return;
     }
+    // Served without the lock: the sender holds it while waiting for us.
+    if (frame->interrupt == VECTOR_TLB_SHOOTDOWN) {
+        TLB::handleIpi();
+        return;
+    }
+    const uint32_t site = KernelLock::kSiteIrq + (frame->interrupt & 0xFF);
+    // Scheduler ticks are frequent and usually change nothing; taking the lock
+    // for each would stall every CPU behind whichever one holds it.
+    if ((frame->interrupt == VECTOR_AP_TIMER || frame->interrupt == VECTOR_RESCHEDULE) &&
+        Scheduler::get().tickIsNoop(frame)) {
+        LAPIC::get().sendEOI();
+        return;
+    }
+    if (frame->interrupt == VECTOR_TIMER) {
+        // The boot CPU's tick keeps time without the lock. The rest (input,
+        // sleepers, preemption) is skipped while another CPU holds the lock,
+        // for at most kMaxSkippedTicks ticks in a row.
+        constexpr uint32_t kMaxSkippedTicks = 4;
+        static uint32_t skippedTicks = 0;   // only the boot CPU takes this IRQ
+        timer_account_tick();
+        if (!KernelLock::tryEnter(site)) {
+            if (++skippedTicks < kMaxSkippedTicks) {
+                LAPIC::get().sendEOI();
+                return;
+            }
+            KernelLock::enter(site);
+        }
+        skippedTicks = 0;
+    } else {
+        KernelLock::enter(site);
+    }
+    handleIrq(frame);
+    KernelLock::leave();
+}
+
+static void handleIrq(InterruptFrame* frame) {
 
     const bool interruptedUser = (frame->cs == 0x23);
     Process* current = interruptedUser ? Scheduler::get().getCurrentProcess() : nullptr;
@@ -282,6 +364,11 @@ extern "C" void irqHandler(InterruptFrame* frame) {
 
     if (fpuSave) {
         CPU::saveExtendedState(fpuSave);
+    }
+
+    if (frame->interrupt != VECTOR_TIMER && frame->interrupt != VECTOR_AP_TIMER &&
+        frame->interrupt != VECTOR_RESCHEDULE) {
+        getPerCPU()->deviceIrqs++;
     }
 
     Interrupt* handler = interruptHandlers[frame->interrupt];

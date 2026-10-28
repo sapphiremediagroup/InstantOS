@@ -136,7 +136,7 @@ timeout "$QEMU_TIMEOUT" "$QEMU" \
   -device ich9-ahci,id=ahci \
   -drive "id=ahci_disk,file=$DISK_IMG,if=none,format=raw" \
   -device ide-hd,drive=ahci_disk,bus=ahci.0 \
-  -accel "$QEMU_ACCEL" -cpu max,+tsc -m 1G -smp 2 \
+  -accel "$QEMU_ACCEL" -cpu max,+tsc -m 1G -smp "${QEMU_SMP:-2}" \
   -serial "file:$LOG" -no-shutdown -no-reboot \
   ${QEMU_EXTRA_ARGS:-}
 status=$?

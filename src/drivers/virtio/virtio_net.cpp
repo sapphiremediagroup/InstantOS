@@ -3,6 +3,8 @@
 #include <common/string.hpp>
 #include <memory/pmm.hpp>
 #include <drivers/net/net_device.hpp>
+#include <cpu/idt/interrupt.hpp>
+#include <cpu/cereal/cereal.hpp>
 
 namespace {
 constexpr uint16_t PCI_VENDOR_ID_REG = 0x00;
@@ -19,10 +21,14 @@ constexpr uint8_t PCI_CAP_ID_VENDOR_SPECIFIC = 0x09;
 
 constexpr uint16_t kReceiveQueueIndex = 0;
 constexpr uint16_t kTransmitQueueIndex = 1;
-constexpr uint16_t kQueueSize = 32;
+constexpr uint16_t kQueueSize = 256;
 constexpr uint16_t kVirtioNetStatusLinkUp = 1;
-constexpr uint32_t kTxCompletionSpinLimit = 1000000;
+// Waiting for a free TX descriptor when the ring is full.
+constexpr uint32_t kTxCompletionSpinLimit = 100000;
+// Notify the device after this many RX buffers have been handed back.
+constexpr uint16_t kRxNotifyBatch = 32;
 constexpr uint32_t kInvalidUsedDescriptor = 0xFFFFFFFFU;
+constexpr uint16_t kVirtioNoVector = 0xFFFF;
 
 static void virtio_barrier() {
     asm volatile("" ::: "memory");
@@ -34,6 +40,34 @@ static void cpu_pause() {
 
 uint16_t min_u16(uint16_t a, uint16_t b) {
     return a < b ? a : b;
+}
+
+// Receive interrupt. Only the RX queue is given a vector: transmit buffers are
+// reclaimed lazily, so TX completions need no interrupt.
+class VirtIONetInterruptHandler : public Interrupt {
+public:
+    void initialize() override {
+    }
+
+    bool shouldDispatch() override {
+        return VirtIONetDriver::get().claimInterrupt();
+    }
+
+    void Run(InterruptFrame* frame) override {
+        // An MSI-X vector is ours alone, so EOI now (before a possible switch
+        // to a woken process); the shared INTx dispatcher sends its own EOI
+        // after every handler has run.
+        const bool msix = VirtIONetDriver::get().usesMsix();
+        if (msix) {
+            sendEOI();
+        }
+        netDeviceInterrupt(frame, msix);
+    }
+};
+
+VirtIONetInterruptHandler& interruptHandler() {
+    static VirtIONetInterruptHandler handler;
+    return handler;
 }
 }
 
@@ -52,14 +86,20 @@ VirtIONetDriver::VirtIONetDriver()
       notifyBase(nullptr),
       notifyOffMultiplier(0),
       deviceCfg(nullptr),
+      isrStatus(nullptr),
+      irqMode(IRQMode::None),
+      irqVector(0),
       negotiatedFeatures(0),
       rxBuffers{},
       rxBuffersPhys{},
       rxDesc{},
+      rxIndexOfDesc{},
+      rxRequeuedSinceNotify(0),
       txBuffers{},
       macAddr{} {
     for (size_t i = 0; i < VIRTIO_NET_RX_BUFFERS; ++i) {
         rxDesc[i] = -1;
+        rxIndexOfDesc[i] = -1;
     }
 }
 
@@ -87,7 +127,11 @@ bool VirtIONetDriver::detectDevice() {
                     continue;
                 }
                 const uint16_t devId = pci.readConfig16(0, static_cast<uint8_t>(b), d, f, PCI_DEVICE_ID_REG);
-                if (vendor == VIRTIO_VENDOR_ID && devId == VIRTIO_NET_DEVICE_ID) {
+                // A transitional device (0x1000, QEMU's default on a PCI bus)
+                // also has the modern interface, the only one spoken here; a
+                // legacy-only one fails initDevice.
+                if (vendor == VIRTIO_VENDOR_ID &&
+                    (devId == VIRTIO_NET_DEVICE_ID || devId == VIRTIO_NET_DEVICE_ID_LEGACY)) {
                     bus = static_cast<uint8_t>(b);
                     device = d;
                     function = f;
@@ -138,6 +182,8 @@ bool VirtIONetDriver::initDevice() {
                     notifyOffMultiplier = readConfig32(capPtr + 16);
                 } else if (cfgType == VIRTIO_PCI_CAP_DEVICE_CFG) {
                     deviceCfg = reinterpret_cast<volatile VirtIONetConfig*>(mapped);
+                } else if (cfgType == VIRTIO_PCI_CAP_ISR_CFG) {
+                    isrStatus = reinterpret_cast<volatile uint8_t*>(mapped);
                 }
             }
         }
@@ -167,6 +213,8 @@ bool VirtIONetDriver::initDevice() {
         commonCfg->device_status = commonCfg->device_status | VIRTIO_STATUS_FAILED;
         return false;
     }
+    // Before the queues: their MSI-X vector numbers only stick once MSI-X is on.
+    setupInterrupts();
     if (!setupQueues()) {
         commonCfg->device_status = commonCfg->device_status | VIRTIO_STATUS_FAILED;
         return false;
@@ -241,6 +289,15 @@ bool VirtIONetDriver::setupQueues() {
         return false;
     }
     commonCfg->queue_size = rxSize;
+    if (irqMode == IRQMode::Msix) {
+        commonCfg->queue_msix_vector = 0;
+        virtio_barrier();
+        if (commonCfg->queue_msix_vector != 0) {
+            // The device refused the vector: fall back to polling.
+            irqMode = IRQMode::None;
+            Cereal::get().write("[net] virtio-net: RX queue rejected its MSI-X vector, polling\n");
+        }
+    }
     commonCfg->queue_desc = rxQueue.getDescAddr();
     commonCfg->queue_driver = rxQueue.getAvailAddr();
     commonCfg->queue_device = rxQueue.getUsedAddr();
@@ -257,13 +314,40 @@ bool VirtIONetDriver::setupQueues() {
     if (!txQueue.init(txSize)) {
         return false;
     }
+    txQueue.suppressInterrupts();
     commonCfg->queue_size = txSize;
+    commonCfg->queue_msix_vector = kVirtioNoVector;
     commonCfg->queue_desc = txQueue.getDescAddr();
     commonCfg->queue_driver = txQueue.getAvailAddr();
     commonCfg->queue_device = txQueue.getUsedAddr();
     virtio_barrier();
     commonCfg->queue_enable = 1;
     return true;
+}
+
+void VirtIONetDriver::setupInterrupts() {
+    irqMode = IRQMode::None;
+    if (PCI::get().registerMSIXInterrupt(0, bus, device, function, 0, &interruptHandler(), &irqVector)) {
+        irqMode = IRQMode::Msix;
+        commonCfg->msix_config = kVirtioNoVector;   // no config-change interrupts
+    } else if (isrStatus &&
+               PCI::get().registerLegacyInterrupt(0, bus, device, function, &interruptHandler(),
+                                                  nullptr, &irqVector)) {
+        irqMode = IRQMode::Legacy;
+    }
+    Cereal::get().write(irqMode == IRQMode::Msix ? "[net] virtio-net: MSI-X receive interrupt\n"
+                        : irqMode == IRQMode::Legacy ? "[net] virtio-net: INTx receive interrupt\n"
+                        : "[net] virtio-net: no interrupt, polling\n");
+}
+
+bool VirtIONetDriver::claimInterrupt() {
+    if (irqMode == IRQMode::Msix) {
+        return true;
+    }
+    // INTx may be shared: reading the ISR status says (and acknowledges)
+    // whether this device raised it. A config change also holds the line, so
+    // any set bit is ours.
+    return isrStatus && *isrStatus != 0;
 }
 
 bool VirtIONetDriver::fillRxQueue() {
@@ -296,6 +380,9 @@ bool VirtIONetDriver::queueRxBuffer(size_t index) {
         return false;
     }
     rxDesc[index] = desc;
+    if (static_cast<size_t>(desc) < VIRTIO_NET_RX_BUFFERS) {
+        rxIndexOfDesc[desc] = static_cast<int16_t>(index);
+    }
     rxQueue.setDesc(desc, rxBuffersPhys[index], VIRTIO_NET_BUFFER_SIZE, VIRTQ_DESC_F_WRITE, 0);
     rxQueue.addAvail(static_cast<uint16_t>(desc));
     return true;
@@ -313,9 +400,15 @@ bool VirtIONetDriver::sendPacket(const void* data, size_t len) {
         return false;
     }
 
+    // Completions are reclaimed lazily: waiting for the device to consume each
+    // frame made every send cost a full round trip through the host.
     reclaimTxCompletions();
-
-    const int desc = txQueue.allocDesc();
+    int desc = txQueue.allocDesc();
+    for (uint32_t spin = 0; desc < 0 && spin < kTxCompletionSpinLimit; ++spin) {
+        cpu_pause();
+        reclaimTxCompletions();
+        desc = txQueue.allocDesc();
+    }
     if (desc < 0) {
         return false;
     }
@@ -323,40 +416,21 @@ bool VirtIONetDriver::sendPacket(const void* data, size_t len) {
         txQueue.freeDesc(desc);
         return false;
     }
-    const uint64_t phys = PMM::AllocFrames(1);
-    if (phys == 0) {
-        txQueue.freeDesc(desc);
-        return false;
+    if (txBuffers[desc] == 0) {
+        txBuffers[desc] = PMM::AllocFrames(1);
+        if (txBuffers[desc] == 0) {
+            txQueue.freeDesc(desc);
+            return false;
+        }
     }
-    txBuffers[desc] = phys;
 
-    auto* packet = reinterpret_cast<uint8_t*>(phys);
+    auto* packet = reinterpret_cast<uint8_t*>(txBuffers[desc]);
     memset(packet, 0, sizeof(VirtIONetHdr));
     memcpy(packet + sizeof(VirtIONetHdr), data, len);
 
-    txQueue.setDesc(desc, phys, static_cast<uint32_t>(sizeof(VirtIONetHdr) + len), 0, 0);
+    txQueue.setDesc(desc, txBuffers[desc], static_cast<uint32_t>(sizeof(VirtIONetHdr) + len), 0, 0);
     txQueue.addAvail(static_cast<uint16_t>(desc));
     notifyQueue(kTransmitQueueIndex);
-
-    uint32_t usedLength = 0;
-    for (uint32_t spin = 0; spin < kTxCompletionSpinLimit; ++spin) {
-        if (!txQueue.hasUsed()) {
-            cpu_pause();
-            continue;
-        }
-        const uint32_t usedDesc = txQueue.getUsed(&usedLength);
-        if (usedDesc != kInvalidUsedDescriptor) {
-            if (usedDesc < VIRTIO_NET_TX_BUFFERS && txBuffers[usedDesc] != 0) {
-                PMM::FreeFrames(txBuffers[usedDesc], 1);
-                txBuffers[usedDesc] = 0;
-            }
-            txQueue.freeDesc(static_cast<int>(usedDesc));
-        }
-        if (usedDesc == static_cast<uint32_t>(desc)) {
-            return true;
-        }
-    }
-
     return true;
 }
 
@@ -366,10 +440,6 @@ void VirtIONetDriver::reclaimTxCompletions() {
         const uint32_t usedDesc = txQueue.getUsed(&usedLength);
         if (usedDesc == kInvalidUsedDescriptor) {
             continue;
-        }
-        if (usedDesc < VIRTIO_NET_TX_BUFFERS && txBuffers[usedDesc] != 0) {
-            PMM::FreeFrames(txBuffers[usedDesc], 1);
-            txBuffers[usedDesc] = 0;
         }
         txQueue.freeDesc(static_cast<int>(usedDesc));
     }
@@ -390,11 +460,9 @@ int VirtIONetDriver::receivePacket(void* buffer, size_t maxLen) {
     }
 
     size_t index = VIRTIO_NET_RX_BUFFERS;
-    for (size_t i = 0; i < VIRTIO_NET_RX_BUFFERS; ++i) {
-        if (rxDesc[i] == static_cast<int>(usedDesc)) {
-            index = i;
-            break;
-        }
+    if (usedDesc < VIRTIO_NET_RX_BUFFERS && rxIndexOfDesc[usedDesc] >= 0) {
+        index = static_cast<size_t>(rxIndexOfDesc[usedDesc]);
+        rxIndexOfDesc[usedDesc] = -1;
     }
     if (index == VIRTIO_NET_RX_BUFFERS || !rxBuffers[index]) {
         rxQueue.freeDesc(static_cast<int>(usedDesc));
@@ -409,7 +477,11 @@ int VirtIONetDriver::receivePacket(void* buffer, size_t maxLen) {
 
     rxQueue.freeDesc(static_cast<int>(usedDesc));
     rxDesc[index] = -1;
-    if (queueRxBuffer(index)) {
+    // Hand the buffer back, but notify only once per batch or when the ring
+    // has been drained: each notify is a trap to the host.
+    if (queueRxBuffer(index) &&
+        (++rxRequeuedSinceNotify >= kRxNotifyBatch || !rxQueue.hasUsed())) {
+        rxRequeuedSinceNotify = 0;
         notifyQueue(kReceiveQueueIndex);
     }
     return static_cast<int>(copied);

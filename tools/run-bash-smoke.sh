@@ -97,7 +97,7 @@ timeout "$QEMU_TIMEOUT" "$QEMU" \
   -accel "$QEMU_ACCEL" \
   -cpu max,+tsc \
   -m 1G \
-  -smp 2 \
+  -smp "${QEMU_SMP:-2}" \
   -serial "file:$LOG" \
   -no-shutdown \
   -no-reboot \

@@ -23,6 +23,7 @@ struct RamFSNode {
 struct RamFSFileData {
     void* data;
     uint64_t size;
+    uint64_t capacity;   // bytes allocated at data; size <= capacity
     uint32_t links;
     uint32_t mode;
     uint64_t atime;

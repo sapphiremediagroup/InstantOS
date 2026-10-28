@@ -4,39 +4,21 @@
 #include <stddef.h>
 #include <drivers/net/net_device.hpp>
 
-// Intel 8254x / e1000(e) Gigabit Ethernet NIC driver.
+// Intel gigabit Ethernet: the 8254x (e1000), 8257x/82583 (e1000e), the PCH
+// LAN-on-motherboard parts (82577 through the I219, e1000e) and the igb family
+// (82575/82576, 82580, I350/I354, I210/I211).
 //
-// Targets the 82540EM (PCI device 0x100E), which is QEMU's classic emulated
-// gigabit NIC (-device e1000) and is also found on a great deal of real
-// hardware.  The driver uses memory-mapped registers (MMIO BAR0) and the
-// legacy descriptor ring model, polling for receive/transmit completion.
-//
-// The same legacy descriptor model and core register layout also drive the
-// e1000e family, including the Intel I219-LM (PCH LAN-on-motherboard) NICs
-// found on most Intel-based business laptops/desktops from ~2015 onward, so
-// this driver also matches those device IDs.
+// They share the register core (CTRL, STATUS, ICR/IMS, RCTL/TCTL, RAL/RAH,
+// MDIC). The igb parts keep their queue registers elsewhere, must have each
+// queue enabled, and use advanced descriptors; the others legacy ones. The PCH parts reach their PHY over an interconnect
+// that the firmware may have left in SMBus or ultra-low-power mode, which the
+// driver undoes (a subset of Linux's e1000_init_phy_workarounds_pchlan), and
+// a register read straight after their reset hangs the bus. MMIO BAR0, MSI,
+// else INTx.
 
-constexpr uint16_t E1000_VENDOR_ID = 0x8086;
-constexpr uint16_t E1000_DEVICE_ID_82540EM = 0x100E;  // QEMU default -device e1000
-constexpr uint16_t E1000_DEVICE_ID_82545EM = 0x100F;
-constexpr uint16_t E1000_DEVICE_ID_82574L = 0x10D3;   // e1000e
-
-// Intel I219-LM device IDs.  Each Intel CPU/PCH generation shipped a new ID
-// for what is functionally the same I219-LM LOM controller, so several must be
-// matched.  (LM = vPro/managed variant; the consumer "V" parts use adjacent
-// IDs and behave the same for this driver.)
-constexpr uint16_t E1000_DEVICE_ID_I219LM = 0x156F;       // Skylake (gen 1)
-constexpr uint16_t E1000_DEVICE_ID_I219LM_2 = 0x15B7;     // Kaby Lake (gen 2)
-constexpr uint16_t E1000_DEVICE_ID_I219LM_3 = 0x15BB;     // gen 3
-constexpr uint16_t E1000_DEVICE_ID_I219LM_4 = 0x15D7;     // gen 4 (Coffee Lake)
-constexpr uint16_t E1000_DEVICE_ID_I219LM_5 = 0x15E3;     // gen 5
-constexpr uint16_t E1000_DEVICE_ID_I219LM_6 = 0x15BE;     // Comet Lake
-constexpr uint16_t E1000_DEVICE_ID_I219LM_7 = 0x0D4E;     // Ice/Tiger Lake
-constexpr uint16_t E1000_DEVICE_ID_I219LM_8 = 0x1A1E;     // Alder Lake
-
-constexpr size_t E1000_RX_DESCRIPTORS = 32;
-constexpr size_t E1000_TX_DESCRIPTORS = 32;
-constexpr size_t E1000_RX_BUFFER_SIZE = 2048;  // 2 KiB per descriptor
+constexpr size_t E1000_RX_DESCRIPTORS = 256;
+constexpr size_t E1000_TX_DESCRIPTORS = 256;
+constexpr size_t E1000_RX_BUFFER_SIZE = 2048;
 constexpr size_t E1000_TX_BUFFER_SIZE = 2048;
 
 // Legacy receive descriptor.
@@ -60,8 +42,38 @@ struct E1000TxDesc {
     uint16_t special;
 } __attribute__((packed));
 
+// Advanced (igb) receive descriptor: the driver writes the two addresses, the
+// NIC writes back over them (statusError and length in the upper half).
+union E1000AdvRxDesc {
+    struct {
+        uint64_t packetAddr;
+        uint64_t headerAddr;
+    };
+    struct {
+        uint64_t info;
+        uint32_t statusError;
+        uint16_t length;
+        uint16_t vlan;
+    };
+} __attribute__((packed));
+
+// Advanced (igb) transmit data descriptor; written back with DD in bit 0 of
+// olinfoStatus.
+struct E1000AdvTxDesc {
+    uint64_t addr;
+    uint32_t cmdTypeLen;
+    uint32_t olinfoStatus;
+} __attribute__((packed));
+
 class E1000Driver : public NetDevice {
 public:
+    enum class Family : uint8_t {
+        Classic,   // 8254x
+        Pcie,      // 82571-82574, 82583
+        Pch,       // ICH/PCH LOM: 82567, 82577-82579, I217, I218, I219
+        Igb,       // 82575, 82576, 82580, I350, I354, I210, I211
+    };
+
     static E1000Driver& get();
 
     bool initialize() override;
@@ -72,45 +84,66 @@ public:
     bool sendPacket(const void* data, size_t len) override;
     int receivePacket(void* buffer, size_t maxLen) override;
     bool isLinkUp() const override;
-    const char* name() const override { return isI219 ? "i219-lm" : "e1000"; }
+    bool interruptDriven() const override { return irqMode != IRQMode::None; }
+    const char* name() const override { return chipName; }
+
+    // Interrupt handler hooks.
+    bool claimInterrupt();
+    bool usesMsi() const { return irqMode == IRQMode::Msi; }
     int probePriority() const override { return 50; }
 
 private:
-    E1000Driver();
+    enum class IRQMode : uint8_t { None, Msi, Legacy };
+
+    E1000Driver() = default;
+    void setupInterrupts();
 
     bool detectDevice();
-    static bool matchesDeviceId(uint16_t devId);
-    static bool isI219DeviceId(uint16_t devId);
     bool initDevice();
+    void resetMac();
+    void pchPhyWorkarounds();
+    void togglePhyPowerPin();
+    bool phyAccessible();
+    bool acquireSwFlag();
+    void releaseSwFlag();
+    void startPhy();
     bool setupRx();
     bool setupTx();
     void readMacAddress();
+    bool enableQueue(uint32_t reg);
+    int receiveAdvanced(void* buffer, size_t maxLen);
 
-    uint32_t mmioRead(uint16_t reg) const;
-    void mmioWrite(uint16_t reg, uint32_t value) const;
+    bool mdicRead(uint8_t reg, uint16_t& value);
+    bool mdicWrite(uint8_t reg, uint16_t value);
 
-    bool initialized;
-    bool deviceFound;
+    uint32_t mmioRead(uint32_t reg) const;
+    void mmioWrite(uint32_t reg, uint32_t value) const;
 
-    uint8_t bus;
-    uint8_t device;
-    uint8_t function;
-    uint16_t pciDeviceId;
-    bool isI219;
+    bool initialized = false;
+    bool deviceFound = false;
 
-    volatile uint8_t* mmio;  // MMIO register base (identity-mapped physical)
+    uint8_t bus = 0;
+    uint8_t device = 0;
+    uint8_t function = 0;
+    uint16_t pciDeviceId = 0;
+    Family family = Family::Classic;
+    const char* chipName = "e1000";
+    bool pchLpt = false;      // I217 and later: ULP and LANPHYPC handling
+    uint8_t phyAddress = 1;
+    uint32_t rxBase = 0;      // queue 0 register blocks
+    uint32_t txBase = 0;
 
-    E1000RxDesc* rxDescs;
-    uint64_t rxDescsPhys;
-    uint8_t* rxBuffers[E1000_RX_DESCRIPTORS];
-    uint64_t rxBuffersPhys[E1000_RX_DESCRIPTORS];
-    uint16_t rxCurrent;
+    volatile uint8_t* mmio = nullptr;  // MMIO register base (identity-mapped physical)
+    IRQMode irqMode = IRQMode::None;
 
-    E1000TxDesc* txDescs;
-    uint64_t txDescsPhys;
-    uint8_t* txBuffers[E1000_TX_DESCRIPTORS];
-    uint64_t txBuffersPhys[E1000_TX_DESCRIPTORS];
-    uint16_t txCurrent;
+    E1000RxDesc* rxDescs = nullptr;
+    uint8_t* rxBuffers[E1000_RX_DESCRIPTORS] {};
+    uint16_t rxCurrent = 0;
 
-    uint8_t macAddr[6];
+    E1000TxDesc* txDescs = nullptr;
+    uint8_t* txBuffers[E1000_TX_DESCRIPTORS] {};
+    uint64_t txBuffersPhys[E1000_TX_DESCRIPTORS] {};
+    uint16_t txCurrent = 0;
+
+    uint8_t macAddr[6] {};
 };

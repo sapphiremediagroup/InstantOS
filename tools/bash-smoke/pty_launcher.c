@@ -52,6 +52,7 @@ enum {
 
 enum {
     O_RDWR = 2,
+    TIOCSPGRP = 0x5410,
     TIOCSWINSZ = 0x5414,
     TIOCGPTN = 0x80045430,
     POLLIN = 0x0001,
@@ -143,6 +144,9 @@ void _start(void) {
         serial("[PTYTEST] spawn-failed rc="); put_hex(pid); serial("\n"); sc1(SYS_EXIT, 1);
     }
     serial("[PTYTEST] spawned pid="); put_hex(pid); serial("\n");
+    // bash -i waits until its group (its pid here) is the terminal's foreground.
+    unsigned pgrp = (unsigned)pid;
+    sc3(SYS_IOCTL, (u64)master, TIOCSPGRP, (u64)&pgrp);
 
     // Let bash start up and print its prompt.
     drain(master, 40);

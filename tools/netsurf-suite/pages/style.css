@@ -1,0 +1,6 @@
+/* Colours the host looks for in the screendump (tools/netsurf-suite/drive.py). */
+body { background: #ffffff; color: #000000; margin: 8px; }
+#band { background: #2a9d8f; width: 300px; height: 60px; }
+a#next { display: block; width: 300px; height: 60px; background: #8338ec; color: #ffffff; }
+body.two { background: #ffbe0b; }
+body.three { background: #3a86ff; }

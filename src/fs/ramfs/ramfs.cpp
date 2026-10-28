@@ -1,4 +1,5 @@
 #include <fs/ramfs/ramfs.hpp>
+#include <common/string.hpp>
 #include <memory/heap.hpp>
 #include <time/time.hpp>
 
@@ -174,6 +175,7 @@ RamFSNode* RamFS::createNode(const char* name, FileType type, uint32_t mode) {
         }
         file->data = nullptr;
         file->size = 0;
+        file->capacity = 0;
         file->links = 1;
         file->mode = mode;
         file->atime = now;
@@ -262,33 +264,34 @@ int64_t RamFS::nodeWrite(VNode* node, const void* buffer, uint64_t size, uint64_
     if (!file) return -1;
     
     uint64_t newSize = offset + size;
-    if (newSize > file->size) {
-        void* newData = kmalloc(newSize);
+    if (newSize > file->capacity) {
+        // Grow geometrically (by up to 1 MiB at a time): reallocating to the
+        // exact size made a file written in small pieces cost O(n^2) copying,
+        // all of it with interrupts off.
+        const uint64_t step = file->capacity < (1ULL << 20) ? file->capacity : (1ULL << 20);
+        uint64_t capacity = file->capacity + step;
+        if (capacity < newSize) capacity = newSize;
+        capacity = (capacity + 4095) & ~4095ULL;
+        void* newData = kmalloc(capacity);
         if (!newData) return -1;
-        
+
         if (file->data) {
-            uint8_t* src = (uint8_t*)file->data;
-            uint8_t* dst = (uint8_t*)newData;
-            for (uint64_t i = 0; i < file->size; i++) {
-                dst[i] = src[i];
-            }
+            memcpy(newData, file->data, file->size);
             kfree(file->data);
         }
-        uint8_t* dst = (uint8_t*)newData;
-        for (uint64_t i = file->size; i < newSize; i++) {
-            dst[i] = 0;
-        }
-        
         file->data = newData;
+        file->capacity = capacity;
+    }
+    if (newSize > file->size) {
+        // A write past the end leaves a hole of zeros.
+        if (offset > file->size) {
+            memset((uint8_t*)file->data + file->size, 0, offset - file->size);
+        }
         file->size = newSize;
         ramNode->size = newSize;
     }
-    
-    uint8_t* dst = (uint8_t*)file->data + offset;
-    const uint8_t* src = (const uint8_t*)buffer;
-    for (uint64_t i = 0; i < size; i++) {
-        dst[i] = src[i];
-    }
+
+    memcpy((uint8_t*)file->data + offset, buffer, size);
 
     const uint64_t now = ramfsNow();
     file->mtime = now;
@@ -316,14 +319,9 @@ int RamFS::nodeTruncate(VNode* node, uint64_t size) {
         uint8_t* dst = (uint8_t*)newData;
         uint64_t preserve = file->size < size ? file->size : size;
         if (file->data) {
-            uint8_t* src = (uint8_t*)file->data;
-            for (uint64_t i = 0; i < preserve; i++) {
-                dst[i] = src[i];
-            }
+            memcpy(dst, file->data, preserve);
         }
-        for (uint64_t i = preserve; i < size; i++) {
-            dst[i] = 0;
-        }
+        memset(dst + preserve, 0, size - preserve);
     }
 
     if (file->data) {
@@ -331,6 +329,7 @@ int RamFS::nodeTruncate(VNode* node, uint64_t size) {
     }
     file->data = newData;
     file->size = size;
+    file->capacity = size;
     ramNode->size = size;
     const uint64_t now = ramfsNow();
     file->mtime = now;

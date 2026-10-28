@@ -69,7 +69,7 @@ timeout "$QEMU_TIMEOUT" "${ICD_ENV[@]}" "$QEMU" \
   -serial chardev:serial0 \
   -monitor none \
   -m 1G \
-  -smp 2 \
+  -smp "${QEMU_SMP:-2}" \
   -no-shutdown \
   -no-reboot \
   -d guest_errors \

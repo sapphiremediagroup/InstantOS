@@ -11,8 +11,25 @@
 #include <common/string.hpp>
 
 extern int16_t pollSocketHandle(void* object, uint32_t rights, int16_t events);
+extern bool socketIsNonBlocking(void* object);
+extern void socketSetNonBlocking(void* object, bool nonBlocking);
 
 namespace {
+// Holds a reference on an fd for the rest of a syscall. Disk I/O can run
+// without the big kernel lock (StorageLock), and a sibling thread could close
+// the fd while this one waits for the disk.
+class PinnedFd {
+public:
+    explicit PinnedFd(FileDescriptor* fd) : fd(fd) { VFS::get().retain(fd); }
+    ~PinnedFd() { VFS::get().close(fd); }
+
+    PinnedFd(const PinnedFd&) = delete;
+    PinnedFd& operator=(const PinnedFd&) = delete;
+
+private:
+    FileDescriptor* fd;
+};
+
 constexpr uint64_t kOpenAccessModeMask = 0x3;
 constexpr uint64_t kOpenWriteOnly = 0x1;
 constexpr uint64_t kOpenReadWrite = 0x2;
@@ -1041,6 +1058,7 @@ uint64_t Syscall::sys_write(uint64_t fileHandle, uint64_t buf, uint64_t count) {
     
     FileDescriptor* fileFd = current->getFD(fileHandle, HandleRightWrite);
     if (!fileFd) return syscall_error(SysErrBadFile);
+    PinnedFd pin(fileFd);
     
     char chunk[512];
     uint64_t total = 0;
@@ -1209,6 +1227,7 @@ uint64_t Syscall::sys_read(uint64_t fileHandle, uint64_t buf, uint64_t count) {
     
     FileDescriptor* fileFd = current->getFD(fileHandle, HandleRightRead);
     if (!fileFd) return syscall_error(SysErrBadFile);
+    PinnedFd pin(fileFd);
     
     char chunk[512];
     uint64_t total = 0;
@@ -1771,6 +1790,7 @@ uint64_t Syscall::sys_fstat(uint64_t handle, uint64_t statbuf) {
     if (!fileFd || !fileFd->getNode() || !fileFd->getNode()->ops || !fileFd->getNode()->ops->stat) {
         return syscall_error(SysErrBadFile);
     }
+    PinnedFd pin(fileFd);
 
     FileStats fileStats {};
     if (fileFd->getNode()->ops->stat(fileFd->getNode(), &fileStats) != 0) {
@@ -1788,6 +1808,7 @@ uint64_t Syscall::sys_fsync(uint64_t handle) {
     if (!fileFd || !fileFd->getNode()) {
         return syscall_error(SysErrBadFile);
     }
+    PinnedFd pin(fileFd);
 
     VNode* node = fileFd->getNode();
     // Filesystems without an fsync hook (RamFS, devfs, ...) hold nothing on a
@@ -1963,21 +1984,28 @@ uint64_t Syscall::sys_fcntl(uint64_t handle, uint64_t command, uint64_t value) {
             }
             return 0;
         case kFcntlGetFL: {
-            // The kernel does not track general per-fd status flags, but pipes
-            // and FIFOs honor O_NONBLOCK, so report it for those endpoints.
+            // The kernel does not track general per-fd status flags, but pipes,
+            // FIFOs and sockets honor O_NONBLOCK, so report it for those.
             uint64_t flags = kOpenReadWrite;
             if (PipeEndpoint* ep = pipeEndpointFromHandle(current, handle)) {
                 if (ep->nonBlock) {
                     flags |= kOpenNonBlock;
                 }
             }
+            HandleEntry* entry = current->getHandle(handle);
+            if (entry && entry->type == HandleType::Socket && socketIsNonBlocking(entry->object)) {
+                flags |= kOpenNonBlock;
+            }
             return flags;
         }
         case kFcntlSetFL:
-            // The only status flag the kernel tracks is O_NONBLOCK on pipes and
-            // FIFOs; persist it there and accept/ignore the rest.
+            // The only status flag the kernel tracks is O_NONBLOCK on pipes,
+            // FIFOs and sockets; persist it there and accept/ignore the rest.
             if (PipeEndpoint* ep = pipeEndpointFromHandle(current, handle)) {
                 ep->nonBlock = (value & kOpenNonBlock) != 0;
+            }
+            if (HandleEntry* entry = current->getHandle(handle); entry && entry->type == HandleType::Socket) {
+                socketSetNonBlocking(entry->object, (value & kOpenNonBlock) != 0);
             }
             return 0;
         case kFcntlDupFD:
@@ -2140,6 +2168,7 @@ uint64_t Syscall::sys_poll(uint64_t fds, uint64_t nfds, uint64_t timeoutMs) {
     // the NetSurf event loop wake to re-run their own scheduler instead of
     // busy-spinning).
     constexpr uint64_t kPollWaitForever = static_cast<uint64_t>(-1);
+    const uint64_t deadline = timeoutMs == kPollWaitForever ? 0 : time_get_uptime_ms() + timeoutMs;
 
     for (;;) {
         uint64_t ready = 0;
@@ -2156,24 +2185,18 @@ uint64_t Syscall::sys_poll(uint64_t fds, uint64_t nfds, uint64_t timeoutMs) {
             return 0;
         }
         if (timeoutMs != kPollWaitForever) {
-            current->sleepUntil(time_get_uptime_ms() + timeoutMs);
+            if (time_get_uptime_ms() >= deadline) {
+                return 0;
+            }
+            // I/O wake-ups end the wait early (see Process::sleepUntil); one
+            // for another descriptor just loops back to the re-scan above.
+            current->sleepUntil(deadline, true);
         }
         current->setState(ProcessState::Blocked);
         Scheduler::get().scheduleFromSyscall();
         current->clearSleep();
         if (current->hasDeliverableSignal()) {
             return syscall_error(SysErrInterrupted);
-        }
-
-        if (timeoutMs != kPollWaitForever) {
-            // Finite timeout: we either hit the deadline or were woken by I/O.
-            // Re-scan once and return whatever is ready (0 is fine -> caller
-            // re-polls / re-runs its scheduler).
-            uint64_t ready2 = 0;
-            if (!scanOnce(&ready2)) {
-                return syscall_error(SysErrInvalid);
-            }
-            return ready2;
         }
     }
 }

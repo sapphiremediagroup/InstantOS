@@ -42,6 +42,10 @@ struct CPUFeatures {
 class CPU {
 public:
     static bool initialize();
+    // Applies the features initialize() enabled on the boot CPU (CR0/CR4/EFER/
+    // XCR0, FPU/SSE state) to the executing application processor. CPUs are
+    // assumed to be homogeneous.
+    static bool initializeSecondary();
     static const CPUFeatures& getFeatures();
     static bool hasLegacySIMD();
     static bool hasAVXHardware();

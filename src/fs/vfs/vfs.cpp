@@ -1,6 +1,7 @@
 #include <fs/vfs/vfs.hpp>
 #include <graphics/console.hpp>
 #include <memory/heap.hpp>
+#include <fs/storage/storage_lock.hpp>
 
 namespace {
 constexpr int kOpenCreate = 0100;
@@ -121,11 +122,27 @@ FileDescriptor::~FileDescriptor() {
     }
 }
 
+namespace {
+// Mounts fs; a block-backed one is mounted under the storage lock and gets its
+// VNode ops wrapped so that every later operation takes the lock too.
+int mountFileSystem(FileSystem* fs, const char* path) {
+    if (!fs->isBlockBacked()) {
+        return fs->mount(path);
+    }
+    StorageLock::Section section;
+    const int result = fs->mount(path);
+    if (result == 0 && fs->getRoot()) {
+        StorageLock::wrapOps(fs->getRoot()->ops);
+    }
+    return result;
+}
+} // namespace
+
 int VFS::mount(FileSystem* fs, const char* path) {
     if (!initialized || !fs) return -1;
     
     if (path[0] == '/' && path[1] == '\0') {
-        int result = fs->mount(path);
+        int result = mountFileSystem(fs, path);
         if (result == 0) {
             rootFS = fs;
         }
@@ -141,7 +158,7 @@ int VFS::mount(FileSystem* fs, const char* path) {
         i++;
     }
     mp->path[i] = '\0';
-    int result = fs->mount(path);
+    int result = mountFileSystem(fs, path);
     if (result != 0) {
         kfree(mp);
         return result;

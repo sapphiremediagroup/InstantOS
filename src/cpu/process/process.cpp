@@ -9,6 +9,8 @@
 #include <fs/vfs/vfs.hpp>
 #include <ipc/ipc.hpp>
 #include <common/string.hpp>
+#include <common/ports.hpp>
+#include <cpu/tlb.hpp>
 
 extern "C" void forkChildTrampoline();
 
@@ -35,8 +37,24 @@ struct UserSignalFrame {
     uint64_t altStackFlags;
 };
 
+// Linux ignores SIGCHLD, SIGCONT, SIGURG and SIGWINCH by default. Its default
+// for SIGSTOP, SIGTSTP, SIGTTIN and SIGTTOU is to stop the process, which this
+// kernel cannot do; ignoring them beats killing it (bash sends itself SIGTTIN
+// until it owns its terminal, and dies before its first prompt otherwise).
 bool defaultIgnoredSignal(int sig) {
-    return sig == SIGCHLD;
+    switch (sig) {
+    case SIGCHLD:
+    case 18:   // SIGCONT
+    case 19:   // SIGSTOP
+    case 20:   // SIGTSTP
+    case 21:   // SIGTTIN
+    case 22:   // SIGTTOU
+    case 23:   // SIGURG
+    case 28:   // SIGWINCH
+        return true;
+    default:
+        return false;
+    }
 }
 }
 
@@ -215,7 +233,7 @@ Process::Process(uint32_t pid)
     : sharedState(nullptr), sessionID(0), uid(0), gid(0), pid(pid), parentPID(0), exitCode(0),
       state(ProcessState::Ready), priority(ProcessPriority::Normal), kernelStack(0), userStack(0),
       userStackBase(0), userStackSize(0), userStackHeapBacked(false), fpuState(nullptr), userFpuState(nullptr), validUserState(false), savedUserRSP(0),
-      userFsBase(0), sleepDeadlineMs(0), sleeping(false),
+      userFsBase(0), userGsBase(0), sleepDeadlineMs(0), sleeping(false),
       threadObject(nullptr) {
     next = nullptr;
     allNext = nullptr;
@@ -307,7 +325,7 @@ Process::Process(uint32_t pid, Process* sharedFrom, uint64_t stackSize)
     : sharedState(nullptr), sessionID(0), uid(0), gid(0), pid(pid), parentPID(0), exitCode(0),
       state(ProcessState::Ready), priority(ProcessPriority::Normal), kernelStack(0), userStack(0),
       userStackBase(0), userStackSize(0), userStackHeapBacked(false), fpuState(nullptr), validUserState(false), savedUserRSP(0),
-      userFsBase(0), sleepDeadlineMs(0), sleeping(false),
+      userFsBase(0), userGsBase(0), sleepDeadlineMs(0), sleeping(false),
       threadObject(nullptr) {
     next = nullptr;
     allNext = nullptr;
@@ -418,11 +436,13 @@ Process::~Process() {
 
     if (userStackBase && userStackSize && getPageTable()) {
         if (userStackHeapBacked) {
+            // Unmap (and shoot down) before freeing: sibling threads may still
+            // be running in this address space on other CPUs.
             uint64_t ustackPhys = VMM::VirtualToPhysicalIn(getPageTable(), userStackBase);
+            VMM::UnmapRangeFrom(getPageTable(), userStackBase, userStackSize / PAGE_SIZE);
             if (ustackPhys) {
                 kfree(reinterpret_cast<void*>(ustackPhys));
             }
-            VMM::UnmapRangeFrom(getPageTable(), userStackBase, userStackSize / PAGE_SIZE);
         }
         // For non-heap-backed (forked) stacks, FreeAddressSpace() reclaims the
         // copied frame; do not kfree() it here.
@@ -458,16 +478,28 @@ bool Process::cloneAddressSpaceFrom(Process* parent) {
     // (not kfree()).
     if (userStackHeapBacked && userStackBase && userStackSize) {
         uint64_t ustackPhys = VMM::VirtualToPhysicalIn(sharedState->pageTable, userStackBase);
+        VMM::UnmapRangeFrom(sharedState->pageTable, userStackBase, userStackSize / PAGE_SIZE);
         if (ustackPhys) {
             kfree(reinterpret_cast<void*>(ustackPhys));
         }
-        VMM::UnmapRangeFrom(sharedState->pageTable, userStackBase, userStackSize / PAGE_SIZE);
         userStackHeapBacked = false;
     }
 
     PageTable* parentPml4 = parent->sharedState->pageTable;
     PageTable* childPml4 = sharedState->pageTable;
     PageTable* kernelPml4 = VMM::GetKernelAddressSpace();
+
+    // Parent pages turned read-only below must not stay writable in any CPU's
+    // TLB (the parent's other threads), or their writes would leak into the
+    // child's copy. One shootdown once the walk is done, on every exit path.
+    bool parentDowngraded = false;
+    struct ParentFlush {
+        PageTable* pml4;
+        bool* needed;
+        ~ParentFlush() {
+            if (*needed) TLB::shootdown(pml4, 0, 0);
+        }
+    } parentFlush{parentPml4, &parentDowngraded};
 
     // Walk only the user half (PML4 entries 0..255). The child already has the
     // kernel half copied from its construction.
@@ -567,6 +599,7 @@ bool Process::cloneAddressSpaceFrom(Process* parent) {
                         // read-only intermediate entry) but a read-only COW leaf.
                         if (flags & ReadWrite) {
                             parentPt->entries[l] = (pte & ~ReadWrite) | kCowPage;
+                            parentDowngraded = true;
                         }
                         VMM::MapPageInto(childPml4, vaddr, srcPhys, flags | ReadWrite);
                         if (!VMM::ProtectPageIn(childPml4, vaddr,
@@ -990,7 +1023,12 @@ bool Process::replaceImageFrom(Process* image) {
     validUserState = false;
     savedUserRSP = 0;
     userFsBase = 0;
+    userGsBase = 0;
+    if (Scheduler::get().getCurrentProcess() == this) {
+        wrmsr(0xC0000102, 0); // live user GS base of the current process
+    }
     exitCode = 0;
+    exitRequested = false;
     signalHandler.pending = 0;
     signalHandler.blocked = 0;
     for (int i = 0; i < NSIG; ++i) {
@@ -1060,6 +1098,8 @@ void Process::handlePendingSignals() {
     // re-run the termination logic and clobber it (or double-report the death).
     if (state == ProcessState::Terminated) return;
     if (!signalHandler.pending) return;
+    // SIGKILL wins over any lower-numbered signal that has a handler.
+    if (terminateIfKilled()) return;
 
     for (int sig = 0; sig < NSIG; sig++) {
         if (!(signalHandler.pending & (1ULL << sig))) continue;
@@ -1081,6 +1121,10 @@ void Process::handlePendingSignals() {
         if (!handler) {
             if (defaultIgnoredSignal(sig)) {
                 continue;
+            }
+            // A fatal signal kills the whole process, not just this thread.
+            if (isThread()) {
+                Scheduler::get().exitThreadGroup(this, 128 + sig);
             }
             closeFilesOnExit();
             state = ProcessState::Terminated;
@@ -1133,6 +1177,15 @@ void Process::handlePendingSignals() {
 
         break;
     }
+}
+
+bool Process::terminateIfKilled() {
+    if (state == ProcessState::Terminated || !killPending()) return false;
+    signalHandler.pending &= ~(1ULL << SIGKILL);
+    closeFilesOnExit();
+    state = ProcessState::Terminated;
+    if (!exitRequested) exitCode = 128 + SIGKILL;
+    return true;
 }
 
 void Process::closeFilesOnExit() {

@@ -4,6 +4,9 @@ extern "C" __attribute__((naked)) void enterUsermode(uint64_t entry, uint64_t st
     asm volatile (
         ".intel_syntax noprefix\n"
         "cli\n"
+        // Kernel GS -> user GS first: the selector loads below clear the live
+        // GS base, which must not be the PerCPUData pointer at that point.
+        "swapgs\n"
         "mov r11, rdx\n"
         "mov ax, 0x1B\n"
         "mov ds, ax\n"

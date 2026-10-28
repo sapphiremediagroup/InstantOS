@@ -2,6 +2,7 @@
 #include <memory/heap.hpp>
 #include <memory/pmm.hpp>
 #include <graphics/console.hpp>
+#include <cpu/tlb.hpp>
 
 PageTable* VMM::s_pml4        = nullptr;
 bool       VMM::s_initialized = false;
@@ -202,6 +203,149 @@ PageTable* VMM::AllocTable() {
     return alloc_zeroed_table();
 }
 
+namespace {
+// Pages unmapped but not yet shot down, and the page tables they emptied. A
+// table is detached from its parent first and freed only after the shootdown,
+// so no CPU can still reach it through a cached paging-structure entry once
+// its frame is reused.
+struct UnmapBatch {
+    static constexpr uint32_t kMaxTables = 32;
+
+    PageTable* pml4;
+    uint64_t start = 0;
+    uint64_t end = 0;
+    PageTable* tables[kMaxTables];
+    uint32_t tableCount = 0;
+
+    explicit UnmapBatch(PageTable* space) : pml4(space) {}
+
+    void addPage(uint64_t va) {
+        if (start == end) {
+            start = va;
+            end = va + PAGE_SIZE;
+            return;
+        }
+        if (va < start) start = va;
+        if (va + PAGE_SIZE > end) end = va + PAGE_SIZE;
+    }
+
+    void deferFree(PageTable* table) {
+        if (tableCount == kMaxTables) {
+            finish();
+        }
+        tables[tableCount++] = table;
+    }
+
+    void finish() {
+        if (end > start) {
+            TLB::shootdown(pml4, start, (end - start) / PAGE_SIZE);
+        }
+        for (uint32_t i = 0; i < tableCount; ++i) {
+            free_table(tables[i]);
+        }
+        start = end = 0;
+        tableCount = 0;
+    }
+};
+
+void unmapLeaf(UnmapBatch& batch, uint64_t virtualAddr) {
+    PageTable* pml4 = batch.pml4;
+    virtualAddr &= ~0xFFFULL;
+
+    uint64_t pml4i = (virtualAddr >> 39) & 0x1FF;
+    if (!(pml4->entries[pml4i] & Present)) return;
+    auto* pdpt = clone_table_if_needed(pml4->entries[pml4i]);
+    if (!pdpt) return;
+
+    uint64_t pdpti = (virtualAddr >> 30) & 0x1FF;
+    if (!(pdpt->entries[pdpti] & Present)) return;
+    if (!(pdpt->entries[pdpti] & LargePage)) {
+        if (!clone_table_if_needed(pdpt->entries[pdpti])) return;
+    }
+    if (pdpt->entries[pdpti] & LargePage) {
+        if (!splitLargePdptEntry(pdpt, pdpti)) return;
+    }
+    auto* pd = reinterpret_cast<PageTable*>(pdpt->entries[pdpti] & ADDR_MASK);
+
+    uint64_t pdi = (virtualAddr >> 21) & 0x1FF;
+    if (!(pd->entries[pdi] & Present)) return;
+    if (!(pd->entries[pdi] & LargePage)) {
+        if (!clone_table_if_needed(pd->entries[pdi])) return;
+    }
+    if (pd->entries[pdi] & LargePage) {
+        if (!splitLargePdEntry(pd, pdi)) return;
+    }
+    auto* pt = reinterpret_cast<PageTable*>(pd->entries[pdi] & ADDR_MASK);
+
+    uint64_t pti = (virtualAddr >> 12) & 0x1FF;
+    pt->entries[pti] = 0;
+    batch.addPage(virtualAddr);
+
+    if (is_table_empty(pt)) {
+        pd->entries[pdi] = 0;
+        batch.deferFree(pt);
+    }
+    if (is_table_empty(pd)) {
+        pdpt->entries[pdpti] = 0;
+        batch.deferFree(pd);
+    }
+    if (is_table_empty(pdpt)) {
+        pml4->entries[pml4i] = 0;
+        batch.deferFree(pdpt);
+    }
+}
+
+// Rewrites a present leaf's flags, keeping its frame. No TLB flush.
+bool protectLeaf(PageTable* pml4, uint64_t virtualAddr, uint64_t flags) {
+    virtualAddr &= ~0xFFFULL;
+
+    uint64_t pml4i = (virtualAddr >> 39) & 0x1FF;
+    if (!(pml4->entries[pml4i] & Present)) return false;
+    auto* pdpt = clone_table_if_needed(pml4->entries[pml4i]);
+    if (!pdpt) return false;
+
+    uint64_t pdpti = (virtualAddr >> 30) & 0x1FF;
+    if (!(pdpt->entries[pdpti] & Present)) return false;
+    if (!(pdpt->entries[pdpti] & LargePage)) {
+        if (!clone_table_if_needed(pdpt->entries[pdpti])) return false;
+    }
+    if (pdpt->entries[pdpti] & LargePage) {
+        if (!splitLargePdptEntry(pdpt, pdpti)) return false;
+    }
+    auto* pd = reinterpret_cast<PageTable*>(pdpt->entries[pdpti] & ADDR_MASK);
+
+    uint64_t pdi = (virtualAddr >> 21) & 0x1FF;
+    if (!(pd->entries[pdi] & Present)) return false;
+    if (!(pd->entries[pdi] & LargePage)) {
+        if (!clone_table_if_needed(pd->entries[pdi])) return false;
+    }
+    if (pd->entries[pdi] & LargePage) {
+        if (!splitLargePdEntry(pd, pdi)) return false;
+    }
+    auto* pt = reinterpret_cast<PageTable*>(pd->entries[pdi] & ADDR_MASK);
+
+    uint64_t pti = (virtualAddr >> 12) & 0x1FF;
+    if (!(pt->entries[pti] & Present)) return false;
+
+    const uint64_t phys = pt->entries[pti] & ADDR_MASK;
+    pt->entries[pti] = phys | (flags & ~ADDR_MASK) | Present;
+    return true;
+}
+
+// Stores a leaf. Replacing a present translation needs a shootdown; filling an
+// empty slot only needs this CPU's (possibly cached paging-structure) entries
+// dropped, and only if `pml4` is live here.
+void storeLeaf(PageTable* pml4, uint64_t* slot, uint64_t value, uint64_t virtualAddr) {
+    const uint64_t old = *slot;
+    *slot = value;
+    if ((old & Present) && old != value) {
+        TLB::shootdown(pml4, virtualAddr, 1);
+    } else if (pml4 == current_pml4()) {
+        asm volatile("invlpg (%0)" : : "r"(virtualAddr) : "memory");
+    }
+}
+} // namespace
+
 void VMM::InvalidatePage(uint64_t addr) {
     asm volatile("invlpg (%0)" : : "r"(addr) : "memory");
 }
@@ -307,61 +451,12 @@ void VMM::MapPage(uint64_t virtualAddr, uint64_t physAddr, uint64_t flags) {
     auto* pt = splitLargePdEntry(pd, pdi);
     if (!pt) return;
 
-    pt->entries[pti] = physAddr | (flags & ~ADDR_MASK) | Present;
-
-    InvalidatePage(virtualAddr);
+    storeLeaf(pml4, &pt->entries[pti], physAddr | (flags & ~ADDR_MASK) | Present, virtualAddr);
 }
 
 void VMM::UnmapPage(uint64_t virtualAddr) {
     if (!s_initialized) return;
-
-    PageTable* pml4 = current_pml4();
-    if (!pml4) return;
-
-    virtualAddr &= ~0xFFFULL;
-
-    uint64_t pml4i = PML4Index(virtualAddr);
-    if (!(pml4->entries[pml4i] & Present)) return;
-    auto* pdpt = clone_table_if_needed(pml4->entries[pml4i]);
-    if (!pdpt) return;
-
-    uint64_t pdpti = PDPTIndex(virtualAddr);
-    if (!(pdpt->entries[pdpti] & Present)) return;
-    if (!(pdpt->entries[pdpti] & LargePage)) {
-        if (!clone_table_if_needed(pdpt->entries[pdpti])) return;
-    }
-    if (pdpt->entries[pdpti] & LargePage) {
-        if (!splitLargePdptEntry(pdpt, pdpti)) return;
-    }
-    auto* pd = reinterpret_cast<PageTable*>(pdpt->entries[pdpti] & ADDR_MASK);
-
-    uint64_t pdi = PDIndex(virtualAddr);
-    if (!(pd->entries[pdi] & Present)) return;
-    if (!(pd->entries[pdi] & LargePage)) {
-        if (!clone_table_if_needed(pd->entries[pdi])) return;
-    }
-    if (pd->entries[pdi] & LargePage) {
-        if (!splitLargePdEntry(pd, pdi)) return;
-    }
-    auto* pt = reinterpret_cast<PageTable*>(pd->entries[pdi] & ADDR_MASK);
-
-    uint64_t pti = PTIndex(virtualAddr);
-    pt->entries[pti] = 0;
-
-    if (is_table_empty(pt)) {
-        pd->entries[pdi] = 0;
-        free_table(pt);
-    }
-    if (is_table_empty(pd)) {
-        pdpt->entries[pdpti] = 0;
-        free_table(pd);
-    }
-    if (is_table_empty(pdpt)) {
-        pml4->entries[pml4i] = 0;
-        free_table(pdpt);
-    }
-
-    InvalidatePage(virtualAddr);
+    UnmapPageFrom(current_pml4(), virtualAddr);
 }
 
 uint64_t VMM::VirtualToPhysical(uint64_t virtualAddr) {
@@ -450,8 +545,8 @@ void VMM::MapRange(uint64_t virtualBase, uint64_t physBase,
 }
 
 void VMM::UnmapRange(uint64_t virtualBase, uint64_t pageCount) {
-    for (uint64_t i = 0; i < pageCount; i++)
-        UnmapPage(virtualBase + i * PAGE_SIZE);
+    if (!s_initialized) return;
+    UnmapRangeFrom(current_pml4(), virtualBase, pageCount);
 }
 
 void VMM::MapPageInto(PageTable* pml4, uint64_t virtualAddr, uint64_t physAddr, uint64_t flags) {
@@ -508,14 +603,7 @@ void VMM::MapPageInto(PageTable* pml4, uint64_t virtualAddr, uint64_t physAddr, 
     auto* pt = splitLargePdEntry(pd, pdi);
     if (!pt) return;
 
-    pt->entries[pti] = physAddr | (flags & ~ADDR_MASK) | Present;
-
-    // If we just edited the live address space, flush the stale translation so
-    // a subsequent access (including a kernel-side memset of a fresh mapping)
-    // doesn't fault against a previously cached entry.
-    if (pml4 == current_pml4()) {
-        InvalidatePage(virtualAddr);
-    }
+    storeLeaf(pml4, &pt->entries[pti], physAddr | (flags & ~ADDR_MASK) | Present, virtualAddr);
 }
 
 void VMM::MapRangeInto(PageTable* pml4, uint64_t virtualBase, uint64_t physBase,
@@ -526,50 +614,25 @@ void VMM::MapRangeInto(PageTable* pml4, uint64_t virtualBase, uint64_t physBase,
 
 bool VMM::ProtectPageIn(PageTable* pml4, uint64_t virtualAddr, uint64_t flags) {
     if (!pml4) return false;
-
-    virtualAddr &= ~0xFFFULL;
-
-    uint64_t pml4i = PML4Index(virtualAddr);
-    if (!(pml4->entries[pml4i] & Present)) return false;
-    auto* pdpt = clone_table_if_needed(pml4->entries[pml4i]);
-    if (!pdpt) return false;
-
-    uint64_t pdpti = PDPTIndex(virtualAddr);
-    if (!(pdpt->entries[pdpti] & Present)) return false;
-    if (!(pdpt->entries[pdpti] & LargePage)) {
-        if (!clone_table_if_needed(pdpt->entries[pdpti])) return false;
-    }
-    if (pdpt->entries[pdpti] & LargePage) {
-        if (!splitLargePdptEntry(pdpt, pdpti)) return false;
-    }
-    auto* pd = reinterpret_cast<PageTable*>(pdpt->entries[pdpti] & ADDR_MASK);
-
-    uint64_t pdi = PDIndex(virtualAddr);
-    if (!(pd->entries[pdi] & Present)) return false;
-    if (!(pd->entries[pdi] & LargePage)) {
-        if (!clone_table_if_needed(pd->entries[pdi])) return false;
-    }
-    if (pd->entries[pdi] & LargePage) {
-        if (!splitLargePdEntry(pd, pdi)) return false;
-    }
-    auto* pt = reinterpret_cast<PageTable*>(pd->entries[pdi] & ADDR_MASK);
-
-    uint64_t pti = PTIndex(virtualAddr);
-    if (!(pt->entries[pti] & Present)) return false;
-
-    const uint64_t phys = pt->entries[pti] & ADDR_MASK;
-    pt->entries[pti] = phys | (flags & ~ADDR_MASK) | Present;
-    InvalidatePage(virtualAddr);
+    if (!protectLeaf(pml4, virtualAddr, flags)) return false;
+    TLB::shootdown(pml4, virtualAddr & ~0xFFFULL, 1);
     return true;
 }
 
 bool VMM::ProtectRangeIn(PageTable* pml4, uint64_t virtualBase, uint64_t pageCount, uint64_t flags) {
-    for (uint64_t i = 0; i < pageCount; i++) {
-        if (!ProtectPageIn(pml4, virtualBase + i * PAGE_SIZE, flags)) {
-            return false;
+    if (!pml4) return false;
+    uint64_t done = 0;
+    bool ok = true;
+    for (; done < pageCount; done++) {
+        if (!protectLeaf(pml4, virtualBase + done * PAGE_SIZE, flags)) {
+            ok = false;
+            break;
         }
     }
-    return true;
+    if (done) {
+        TLB::shootdown(pml4, virtualBase & ~0xFFFULL, done);
+    }
+    return ok;
 }
 
 bool VMM::HandleCowFault(PageTable* pml4, uint64_t faultAddr) {
@@ -636,66 +699,64 @@ bool VMM::HandleCowFault(PageTable* pml4, uint64_t faultAddr) {
     }
 
     pt->entries[pti] = (newPhys & ADDR_MASK) | newFlags;
+    // Other threads of this space may still read the old frame through a stale
+    // entry; drop it everywhere before giving up our reference.
+    TLB::shootdown(pml4, va, 1);
     PMM::FreeFrame(oldPhys);       // release this space's reference to the shared frame
-    InvalidatePage(va);
+    return true;
+}
+
+bool VMM::PermitsFaultedAccess(PageTable* pml4, uint64_t faultAddr, uint64_t errCode) {
+    constexpr uint64_t kErrWrite = 1ULL << 1;
+    constexpr uint64_t kErrUser = 1ULL << 2;
+    constexpr uint64_t kErrReserved = 1ULL << 3;
+    constexpr uint64_t kErrFetch = 1ULL << 4;
+    constexpr uint64_t kErrProtKey = 1ULL << 5;
+    if (!pml4 || (errCode & (kErrReserved | kErrProtKey))) {
+        return false;   // not about the translation's present/RW/US/NX bits
+    }
+
+    // Walk through the direct map (see HandleCowFault for why), accumulating
+    // the effective permissions: RW and US must be set at every level, NX at
+    // any level forbids fetches.
+    uint64_t entry = reinterpret_cast<uint64_t>(pml4) | Present | ReadWrite | UserSuper;
+    bool writable = true;
+    bool user = true;
+    bool noExec = false;
+    for (int level = 4; level >= 1; --level) {
+        auto* table = reinterpret_cast<PageTable*>(PhysToVirt(entry & ADDR_MASK));
+        entry = table->entries[(faultAddr >> (12 + 9 * (level - 1))) & 0x1FF];
+        if (!(entry & Present)) {
+            return false;
+        }
+        writable = writable && (entry & ReadWrite);
+        user = user && (entry & UserSuper);
+        noExec = noExec || (entry & NoExecute);
+        if (level > 1 && level < 4 && (entry & LargePage)) {
+            break;
+        }
+    }
+
+    if ((errCode & kErrWrite) && !writable) return false;
+    if ((errCode & kErrUser) && !user) return false;
+    if (errCode & kErrFetch) {
+        if (noExec) return false;
+        if (!(errCode & kErrUser) && user) return false;   // SMEP
+    }
     return true;
 }
 
 void VMM::UnmapPageFrom(PageTable* pml4, uint64_t virtualAddr) {
-    if (!pml4) return;
-
-    virtualAddr &= ~0xFFFULL;
-
-    uint64_t pml4i = PML4Index(virtualAddr);
-    if (!(pml4->entries[pml4i] & Present)) return;
-    auto* pdpt = clone_table_if_needed(pml4->entries[pml4i]);
-    if (!pdpt) return;
-
-    uint64_t pdpti = PDPTIndex(virtualAddr);
-    if (!(pdpt->entries[pdpti] & Present)) return;
-    if (!(pdpt->entries[pdpti] & LargePage)) {
-        if (!clone_table_if_needed(pdpt->entries[pdpti])) return;
-    }
-    if (pdpt->entries[pdpti] & LargePage) {
-        if (!splitLargePdptEntry(pdpt, pdpti)) return;
-    }
-    auto* pd = reinterpret_cast<PageTable*>(pdpt->entries[pdpti] & ADDR_MASK);
-
-    uint64_t pdi = PDIndex(virtualAddr);
-    if (!(pd->entries[pdi] & Present)) return;
-    if (!(pd->entries[pdi] & LargePage)) {
-        if (!clone_table_if_needed(pd->entries[pdi])) return;
-    }
-    if (pd->entries[pdi] & LargePage) {
-        if (!splitLargePdEntry(pd, pdi)) return;
-    }
-    auto* pt = reinterpret_cast<PageTable*>(pd->entries[pdi] & ADDR_MASK);
-
-    uint64_t pti = PTIndex(virtualAddr);
-    pt->entries[pti] = 0;
-
-    if (is_table_empty(pt)) {
-        pd->entries[pdi] = 0;
-        free_table(pt);
-    }
-    if (is_table_empty(pd)) {
-        pdpt->entries[pdpti] = 0;
-        free_table(pd);
-    }
-    if (is_table_empty(pdpt)) {
-        pml4->entries[pml4i] = 0;
-        free_table(pdpt);
-    }
-
-    if (pml4 == current_pml4()) {
-        InvalidatePage(virtualAddr);
-    }
+    UnmapRangeFrom(pml4, virtualAddr, 1);
 }
 
 void VMM::UnmapRangeFrom(PageTable* pml4, uint64_t virtualBase, uint64_t pageCount) {
+    if (!pml4) return;
+    UnmapBatch batch(pml4);
     for (uint64_t i = 0; i < pageCount; i++) {
-        UnmapPageFrom(pml4, virtualBase + i * PAGE_SIZE);
+        unmapLeaf(batch, virtualBase + i * PAGE_SIZE);
     }
+    batch.finish();
 }
 
 namespace {

@@ -7,6 +7,7 @@
 #include <drivers/usb/ohci.hpp>
 #include <interrupts/timer.hpp>
 #include <interrupts/keyboard.hpp>
+#include <drivers/net/net_device.hpp>
 #include <time/rtc.hpp>
 
 namespace {
@@ -134,6 +135,33 @@ uint64_t choose_tsc_frequency(uint64_t cpuidFrequency, uint64_t calibratedFreque
 volatile uint64_t uptime_ticks = 0;
 volatile uint64_t uptime_ms = 0;
 
+namespace {
+// The uptime comes from the TSC once boot_tsc is set: always with the
+// deadline timer, and with the PIT tick too when tsc_enable_clocksource()
+// finds a constant-rate TSC. Otherwise it counts PIT ticks.
+bool tsc_clock_running() {
+    return boot_tsc != 0 && cycles_per_ms != 0;
+}
+
+// An invariant TSC (CPUID 80000007h EDX bit 8) ticks at one rate whatever
+// the power state; so does the TSC a hypervisor (CPUID 1 ECX bit 31) offers.
+bool tsc_runs_at_constant_rate() {
+    uint32_t eax = 1, ebx = 0, ecx = 0, edx = 0;
+    cpuid(&eax, &ebx, &ecx, &edx);
+    if ((ecx & (1U << 31)) != 0) {
+        return true;
+    }
+    eax = 0x80000000U; ebx = ecx = edx = 0;
+    cpuid(&eax, &ebx, &ecx, &edx);
+    if (eax < 0x80000007U) {
+        return false;
+    }
+    eax = 0x80000007U; ebx = ecx = edx = 0;
+    cpuid(&eax, &ebx, &ecx, &edx);
+    return (edx & (1U << 8)) != 0;
+}
+}
+
 uint64_t tsc_frequency = 0;
 uint64_t cycles_per_ms = 0;
 uint64_t cycles_per_us = 0;
@@ -211,9 +239,9 @@ void pit_enable_timer_mode(uint32_t frequency_hz) {
     outb(kPitChannel0, static_cast<uint8_t>((divisor >> 8) & 0xFF));
 }
 
-void timer_interrupt_handler() {
+void timer_account_tick() {
     uptime_ticks = uptime_ticks + 1;
-    if (timerBackend == TimerBackend::TscDeadline && boot_tsc != 0 && cycles_per_ms != 0) {
+    if (tsc_clock_running()) {
         uptime_ms = (rdtsc() - boot_tsc) / cycles_per_ms;
     } else if (timer_tick_hz != 0) {
         uptime_ms = (uptime_ticks * 1000ULL) / timer_tick_hz;
@@ -221,24 +249,57 @@ void timer_interrupt_handler() {
         uptime_ms = uptime_ticks;
     }
 
+    if (timerBackend == TimerBackend::TscDeadline) {
+        timer_schedule_next_tick();
+    }
+}
+
+void timer_interrupt_handler() {
     USBInput::get().poll();
     Keyboard::get().servicePendingInput();
 
     Scheduler::get().wakeExpiredSleepers(uptime_ms);
 
-    if (timerBackend == TimerBackend::TscDeadline) {
-        timer_schedule_next_tick();
-    }
-
     LAPIC::get().sendEOI();
+}
+
+// With the PIT driving the tick, counting its interrupts loses every one that
+// lands while interrupts are off; under emulation that is a lot of them (a
+// TCG guest's clock ran ~30% slow). So keep time with the TSC when it can.
+bool tsc_enable_clocksource() {
+    if (tsc_clock_running() || !tsc_runs_at_constant_rate()) {
+        return tsc_clock_running();
+    }
+    if (tsc_frequency == 0) {
+        tsc_frequency = detect_tsc_frequency();
+    }
+    if (tsc_frequency < 1000000ULL) {
+        return false;
+    }
+    cycles_per_ms = tsc_frequency / 1000ULL;
+    cycles_per_us = tsc_frequency / 1000000ULL;
+    // Carry on from the ticks counted so far.
+    const uint64_t elapsedMs = timer_tick_hz ? (uptime_ticks * 1000ULL) / timer_tick_hz : uptime_ms;
+    boot_tsc = rdtsc() - elapsedMs * cycles_per_ms;
+    return true;
 }
 
 uint64_t time_get_uptime_ticks() {
     return uptime_ticks;
 }
 
+// Nanoseconds since boot from the TSC when it keeps the time, split so it
+// never disagrees with time_get_uptime_ms(); else ms resolution.
+uint64_t time_get_uptime_ns() {
+    if (tsc_clock_running()) {
+        const uint64_t cycles = rdtsc() - boot_tsc;
+        return (cycles / cycles_per_ms) * 1000000ULL + (cycles % cycles_per_ms) * 1000000ULL / cycles_per_ms;
+    }
+    return time_get_uptime_ms() * 1000000ULL;
+}
+
 uint64_t time_get_uptime_ms() {
-    if (timerBackend == TimerBackend::TscDeadline && boot_tsc != 0 && cycles_per_ms != 0) {
+    if (tsc_clock_running()) {
         return (rdtsc() - boot_tsc) / cycles_per_ms;
     }
 
@@ -261,6 +322,8 @@ void Timer::Run(InterruptFrame* frame) {
     const bool runningIdle = current && current->getPriority() == ProcessPriority::Idle;
 
     if (frame && (interruptedUser || runningIdle)) {
+        // Before scheduling, so a process woken by a packet can run now.
+        netTimerTick();
         Scheduler::get().schedule(frame);
     }
 }

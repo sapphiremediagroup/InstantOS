@@ -334,6 +334,7 @@ public:
     int mount(const char* path) override;
     int unmount() override;
     VNode* getRoot() override;
+    bool isBlockBacked() const override { return true; }
 
     // Cheap probe: returns true if `device` starts with a valid ext2/3/4
     // superblock (magic + sane geometry). Used by boot-time FS detection.

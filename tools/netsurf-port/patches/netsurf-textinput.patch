@@ -1,0 +1,41 @@
+--- a/frontends/framebuffer/fbtk/text.c
++++ b/frontends/framebuffer/fbtk/text.c
+@@ -362,6 +362,22 @@
+ 		caret_moved = true;
+ 		break;
+ 
++	case NSFB_KEY_DELETE:
++		/* InstantOS: Delete takes out the character after the caret. */
++		if (widget->u.text.idx >= widget->u.text.len)
++			break;
++		memmove(widget->u.text.text + widget->u.text.idx,
++				widget->u.text.text + widget->u.text.idx + 1,
++				widget->u.text.len - widget->u.text.idx - 1);
++		widget->u.text.len--;
++		widget->u.text.text[widget->u.text.len] = 0;
++
++		fb_font_width(&font_style, widget->u.text.text,
++				widget->u.text.len, &widget->u.text.width);
++
++		caret_moved = true;
++		break;
++
+ 	case NSFB_KEY_RETURN:
+ 		widget->u.text.enter(widget->u.text.pw, widget->u.text.text);
+ 		break;
+@@ -442,6 +458,15 @@
+ 			break;
+ 		}
+ 
++		/* InstantOS: keys that type nothing (Insert, Escape, Tab, the
++		 * F-keys, ...) map to -1, and the shifted table's 243/254 are
++		 * not UTF-8: put only printable ASCII in the text. */
++		{
++			const int ucs4 = fbtk_keycode_to_ucs4(value, modifier);
++			if (ucs4 < 0x20 || ucs4 > 0x7e)
++				break;
++		}
++
+ 		/* allow for new character and null */
+ 		temp = realloc(widget->u.text.text, widget->u.text.len + 2);
+ 		if (temp == NULL) {

@@ -6,6 +6,12 @@
 
 uint64_t boot_unix_time = 0;
 
+namespace {
+// Unix time in nanoseconds minus the uptime: the wall clock is this plus
+// time_get_uptime_ns(). Read from the RTC at boot, moved by time_set_unix_ns.
+uint64_t wall_offset_ns = 0;
+}
+
 bool time_init() {
     if (!cpu_has_tsc_deadline()) {
         Console::get().drawText("[TIME] CPU does not support TSC deadline mode; using PIT\n");
@@ -27,16 +33,34 @@ bool time_init() {
             }
         }
     }
+    if (!cpu_has_tsc_deadline() || cycles_per_ms == 0 || cycles_per_us == 0) {
+        Console::get().drawText(tsc_enable_clocksource() ? "[TIME] PIT tick, TSC clock\n"
+                                                         : "[TIME] PIT tick and clock\n");
+    }
 
     rtc_time rtc = {};
     rtc_read_time(&rtc);
-    boot_unix_time = rtc_to_unix(&rtc);
+    time_set_unix_ns(rtc_to_unix(&rtc) * 1000000000ULL);
 
     return true;
 }
 
+uint64_t time_get_unix_ns() {
+    return wall_offset_ns + time_get_uptime_ns();
+}
+
 uint64_t time_get_unix() {
-    return boot_unix_time + (time_get_uptime_ms() / 1000ULL);
+    return time_get_unix_ns() / 1000000000ULL;
+}
+
+bool time_set_unix_ns(uint64_t unix_ns) {
+    const uint64_t uptime = time_get_uptime_ns();
+    if (unix_ns < uptime) {
+        return false;
+    }
+    wall_offset_ns = unix_ns - uptime;
+    boot_unix_time = wall_offset_ns / 1000000000ULL;
+    return true;
 }
 
 uint64_t time_get_boot_unix() {

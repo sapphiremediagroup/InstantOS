@@ -2,7 +2,11 @@
 #include <cpu/process/scheduler.hpp>
 #include <cpu/process/exec.hpp>
 #include <cpu/percpu.hpp>
+#include <cpu/apic/lapic.hpp>
+#include <cpu/smp.hpp>
+#include <cpu/klock.hpp>
 #include <interrupts/timer.hpp>
+#include <time/tsc_timer.hpp>
 #include <memory/pmm.hpp>
 #include <memory/vmm.hpp>
 #include <common/string.hpp>
@@ -152,6 +156,11 @@ uint64_t Syscall::sys_exit(uint64_t code) {
         return (uint64_t)-1;
     }
 
+    // exit() from any thread ends the whole process (thread exit is
+    // sys_thread_exit). From the main thread, onProcessTerminated does it.
+    if (current->isThread()) {
+        Scheduler::get().exitThreadGroup(current, (int)code);
+    }
     current->setExitCode((int)code);
     current->closeFilesOnExit();
     current->setState(ProcessState::Terminated);
@@ -218,6 +227,9 @@ uint64_t Syscall::sys_fork() {
     // by saveSyscallState() on syscall entry.
     const ProcessContext parentUserCtx = *parent->getContext();
     const uint64_t parentFsBase = parent->getUserFsBase();
+    // The parent is the current process, so its live user GS base is in
+    // IA32_KERNEL_GS_BASE rather than its (stale) saved copy.
+    const uint64_t parentGsBase = rdmsr(0xC0000102);
 
     // Run the copy on the kernel address space so all phys pointers are usable.
     uint64_t userCR3;
@@ -255,6 +267,8 @@ uint64_t Syscall::sys_fork() {
     child->setCwd(parent->getCwd());
     child->setName(parent->getName());
     child->setUserFsBase(parentFsBase);
+    child->setUserGsBase(parentGsBase);
+    child->setCpuAffinity(parent->getCpuAffinity());
     child->cloneHandlesFrom(parent, false);
 
     SignalHandler* dst = child->getSignalHandler();
@@ -326,6 +340,18 @@ uint64_t Syscall::sys_exec(uint64_t path, uint64_t argv, uint64_t envp) {
         asm volatile("mov %0, %%cr3" :: "r"(userCR3) : "memory");
         return syscall_error(SysErrInvalid);
     }
+
+    // Past the point of failure: like Linux, the other threads die before the
+    // image is replaced. They may be running on other CPUs in the old address
+    // space, and their teardown unmaps their stacks from it, so wait until they
+    // are reaped. Sleeping, not yielding, lets go of the BKL they need to exit.
+    while (Scheduler::get().killSiblingThreads(current)) {
+        current->sleepUntil(Timer::get().getMilliseconds() + 1);
+        current->setState(ProcessState::Blocked);
+        Scheduler::get().scheduleFromSyscall();
+    }
+    current->clearSleep();
+    VMM::SetAddressSpace(kernelPML4);
 
     const uint64_t imageStack = newProc->getContext()->rsp;
     const uint64_t entry = *reinterpret_cast<uint64_t*>(imageStack);
@@ -457,6 +483,157 @@ uint64_t Syscall::sys_yield() {
     return 0;
 }
 
+namespace {
+uint64_t onlineCpuMask() {
+    const uint32_t count = SMP::onlineCount();
+    return count >= 64 ? ~0ULL : (1ULL << count) - 1;
+}
+
+// pid 0 is the calling thread; any other pid names one thread.
+Process* affinityTarget(uint64_t pid) {
+    if (pid == 0) return Scheduler::get().getCurrentProcess();
+    if (pid > UINT32_MAX) return nullptr;
+    return Scheduler::get().getProcessByPID(static_cast<uint32_t>(pid));
+}
+}
+
+// Linux sched_setaffinity: `size` bytes of CPU bitmask (bit = SMP index).
+// Bits past the online CPUs are ignored; a mask with no online CPU is EINVAL.
+uint64_t Syscall::sys_sched_setaffinity(uint64_t pid, uint64_t size, uint64_t maskPtr) {
+    if (size == 0) return syscall_error(SysErrInvalid);
+    uint64_t mask = 0;
+    if (!copyFromUser(&mask, maskPtr, size < sizeof(mask) ? size : sizeof(mask))) {
+        return syscall_error(SysErrInvalid);
+    }
+    mask &= onlineCpuMask();
+    if (mask == 0) return syscall_error(SysErrInvalid);
+
+    Process* target = affinityTarget(pid);
+    if (!target || target->getState() == ProcessState::Terminated) {
+        return syscall_error(SysErrNoProcess);
+    }
+    target->setCpuAffinity(mask);
+
+    if (target == Scheduler::get().getCurrentProcess()) {
+        // Requeue: the scheduler hands it to a CPU it may run on.
+        if (!target->mayRunOn(currentCpuIndex())) Scheduler::get().yield();
+        return 0;
+    }
+    for (uint32_t i = 0; i < SMP::kMaxCPUs; ++i) {
+        PerCPUData* cpu = SMP::cpu(i);
+        if (cpu && cpu->currentProcess == target && !target->mayRunOn(i)) {
+            SMP::sendReschedule(cpu);
+        }
+    }
+    return 0;
+}
+
+// Linux sched_getaffinity: needs room for every online CPU, in whole 8-byte
+// words; writes one word and returns its size.
+uint64_t Syscall::sys_sched_getaffinity(uint64_t pid, uint64_t size, uint64_t maskPtr) {
+    if (size * 8 < SMP::onlineCount() || (size & 7) != 0) {
+        return syscall_error(SysErrInvalid);
+    }
+    Process* target = affinityTarget(pid);
+    if (!target) return syscall_error(SysErrNoProcess);
+
+    const uint64_t mask = target->getCpuAffinity() & onlineCpuMask();
+    if (!copyToUser(maskPtr, &mask, sizeof(mask))) return syscall_error(SysErrInvalid);
+    return sizeof(mask);
+}
+
+uint64_t Syscall::sys_getcpu() {
+    return currentCpuIndex();
+}
+
+// Returns the number of online CPUs; with entryPtr, also fills a CpuInfoEntry
+// for CPU `index`.
+uint64_t Syscall::sys_cpu_info(uint64_t index, uint64_t entryPtr) {
+    const uint32_t count = SMP::onlineCount();
+    if (entryPtr == 0) return count;
+    PerCPUData* cpu = index < count ? SMP::cpu(static_cast<uint32_t>(index)) : nullptr;
+    if (!cpu) return syscall_error(SysErrInvalid);
+
+    CpuInfoEntry entry {};
+    entry.index = cpu->cpuIndex;
+    entry.lapicId = cpu->lapicId;
+    entry.deviceIrqs = __atomic_load_n(&cpu->deviceIrqs, __ATOMIC_RELAXED);
+    Process* running = cpu->currentProcess;
+    entry.currentPid = running && running != cpu->idleProcess ? running->getPID() : 0;
+    if (!copyToUser(entryPtr, &entry, sizeof(entry))) return syscall_error(SysErrInvalid);
+    return count;
+}
+
+namespace {
+// struct itimerval: it_interval, then it_value, each a struct timeval.
+struct KernelTimeval {
+    int64_t seconds;
+    int64_t microseconds;
+};
+struct KernelItimerval {
+    KernelTimeval interval;
+    KernelTimeval value;
+};
+constexpr uint64_t kItimerReal = 0;
+
+uint64_t timevalToMs(const KernelTimeval& tv) {
+    // Round up: a nonzero timer must not become "off".
+    return static_cast<uint64_t>(tv.seconds) * 1000 + (static_cast<uint64_t>(tv.microseconds) + 999) / 1000;
+}
+
+KernelTimeval msToTimeval(uint64_t ms) {
+    return KernelTimeval { static_cast<int64_t>(ms / 1000), static_cast<int64_t>((ms % 1000) * 1000) };
+}
+
+void currentItimer(Process* process, KernelItimerval* out) {
+    const uint64_t now = time_get_uptime_ms();
+    const uint64_t left = process->alarmDeadlineMs > now ? process->alarmDeadlineMs - now
+                        : (process->alarmDeadlineMs != 0 ? 1 : 0);
+    out->interval = msToTimeval(process->alarmIntervalMs);
+    out->value = msToTimeval(left);
+}
+}  // namespace
+
+// setitimer(2) for ITIMER_REAL; the virtual and profiling timers are not
+// supported. Resolution is the 1 ms tick.
+uint64_t Syscall::sys_setitimer(uint64_t which, uint64_t newValue, uint64_t oldValue) {
+    Process* current = Scheduler::get().getCurrentProcess();
+    if (!current || which != kItimerReal) {
+        return syscall_error(SysErrInvalid);
+    }
+    KernelItimerval next {};
+    if (newValue != 0 && !copyFromUser(&next, newValue, sizeof(next))) {
+        return syscall_error(SysErrInvalid);
+    }
+    if (next.value.seconds < 0 || next.value.microseconds < 0 || next.value.microseconds >= 1000000 ||
+        next.interval.seconds < 0 || next.interval.microseconds < 0 || next.interval.microseconds >= 1000000) {
+        return syscall_error(SysErrInvalid);
+    }
+    if (oldValue != 0) {
+        KernelItimerval old {};
+        currentItimer(current, &old);
+        if (!copyToUser(oldValue, &old, sizeof(old))) {
+            return syscall_error(SysErrInvalid);
+        }
+    }
+    if (newValue != 0) {
+        const uint64_t ms = timevalToMs(next.value);
+        current->alarmDeadlineMs = ms ? time_get_uptime_ms() + ms : 0;
+        current->alarmIntervalMs = ms ? timevalToMs(next.interval) : 0;
+    }
+    return 0;
+}
+
+uint64_t Syscall::sys_getitimer(uint64_t which, uint64_t value) {
+    Process* current = Scheduler::get().getCurrentProcess();
+    if (!current || which != kItimerReal) {
+        return syscall_error(SysErrInvalid);
+    }
+    KernelItimerval now {};
+    currentItimer(current, &now);
+    return copyToUser(value, &now, sizeof(now)) ? 0 : syscall_error(SysErrInvalid);
+}
+
 uint64_t Syscall::sys_sleep(uint64_t ms) {
     if (ms == 0) return 0;
 
@@ -548,6 +725,7 @@ uint64_t Syscall::sys_spawn(uint64_t path, uint64_t argv, uint64_t envp) {
         newProc->setGID(current->getGID());
         newProc->setSessionID(current->getSessionID());
         newProc->setCwd(current->getCwd());
+        newProc->setCpuAffinity(current->getCpuAffinity());
         // Inherit the parent's open file descriptors (stdin/stdout/stderr and
         // any others) so spawned programs share the controlling terminal.
         newProc->cloneHandlesFrom(current, true);
@@ -646,6 +824,7 @@ uint64_t Syscall::sys_thread_create(uint64_t entry, uint64_t arg, uint64_t stack
     thread->setGID(current->getGID());
     thread->setSessionID(current->getSessionID());
     thread->setPriority(current->getPriority());
+    thread->setCpuAffinity(current->getCpuAffinity());
     thread->setCwd(current->getCwd());
     thread->setName(current->getName());
 
@@ -729,6 +908,7 @@ uint64_t Syscall::sys_thread_clone(uint64_t entry, uint64_t userStack) {
     thread->setGID(current->getGID());
     thread->setSessionID(current->getSessionID());
     thread->setPriority(current->getPriority());
+    thread->setCpuAffinity(current->getCpuAffinity());
     thread->setCwd(current->getCwd());
     thread->setName(current->getName());
 
@@ -832,7 +1012,11 @@ uint64_t Syscall::sys_set_thread_pointer(uint64_t pointer) {
     return 0;
 }
 
+// First C code on syscall entry (interrupts are off via SFMASK): take the big
+// kernel lock for the whole syscall. restoreSyscallState() drops it.
 extern "C" void saveSyscallState(uint64_t* stack) {
+    KernelLock::enter(stack[14] < KernelLock::kSiteIrq ? static_cast<uint32_t>(stack[14])
+                                                      : KernelLock::kSiteOther);
     Process* current = Scheduler::get().getCurrentProcess();
     if (!current) return;
     
@@ -859,7 +1043,17 @@ extern "C" void saveSyscallState(uint64_t* stack) {
     current->setValidUserState(true);
 }
 
+static void restoreSyscallStateLocked(uint64_t* stack, uint64_t result);
+
+// Last C code before sysret: drops the big kernel lock taken in
+// saveSyscallState() (the syscall may have been resumed on another CPU; the
+// lock moved with it through the context switch).
 extern "C" void restoreSyscallState(uint64_t* stack, uint64_t result) {
+    restoreSyscallStateLocked(stack, result);
+    KernelLock::leave();
+}
+
+static void restoreSyscallStateLocked(uint64_t* stack, uint64_t result) {
     Process* current = Scheduler::get().getCurrentProcess();
     if (!current || !stack) return;
 

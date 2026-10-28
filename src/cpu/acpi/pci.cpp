@@ -1,9 +1,11 @@
 #include <cpu/acpi/pci.hpp>
 #include <cpu/acpi/acpi.hpp>
 #include <cpu/apic/apic.hpp>
+#include <cpu/apic/irq_balance.hpp>
 #include <cpu/apic/irqs.hpp>
 #include <cpu/idt/isr.hpp>
 #include <common/ports.hpp>
+#include <memory/vmm.hpp>
 
 namespace {
 constexpr uint16_t kInterruptLineOffset = 0x3C;
@@ -14,6 +16,11 @@ constexpr uint16_t kCapabilityListOffset = 0x34;
 constexpr uint16_t kCommandInterruptDisable = 1 << 10;
 constexpr uint16_t kStatusCapabilityList = 1 << 4;
 constexpr uint8_t kCapabilityMsi = 0x05;
+constexpr uint8_t kCapabilityMsix = 0x11;
+constexpr uint16_t kMsixEnable = 1 << 15;
+constexpr uint16_t kMsixFunctionMask = 1 << 14;
+constexpr uint32_t kMsixEntryMasked = 1;
+constexpr uint16_t kBar0Offset = 0x10;
 constexpr uint8_t kMaxLegacyIrq = 15;
 constexpr uint8_t kMaxHandlersPerIrq = 8;
 uint8_t g_nextMsiVector = VECTOR_MSI_BASE;
@@ -236,7 +243,8 @@ bool PCI::registerMSIInterrupt(uint16_t segment, uint8_t bus, uint8_t device, ui
     (void)maskCapable;
 
     const uint8_t vector = g_nextMsiVector++;
-    const uint32_t destination = LAPIC::get().getId() & 0xFF;
+    const uint32_t destination = IRQBalance::addMsiRoute(segment, bus, device, function, cap, vector,
+                                                         LAPIC::get().getId()) & 0xFF;
     const uint32_t messageAddress = 0xFEE00000U | (destination << 12);
     const uint16_t messageData = vector;
 
@@ -260,6 +268,102 @@ bool PCI::registerMSIInterrupt(uint16_t segment, uint8_t bus, uint8_t device, ui
         *outVector = vector;
     }
     return true;
+}
+
+uint64_t PCI::barAddress(uint16_t segment, uint8_t bus, uint8_t device, uint8_t function, uint8_t bar) {
+    if (bar > 5) {
+        return 0;
+    }
+    const uint16_t offset = static_cast<uint16_t>(kBar0Offset + bar * 4);
+    const uint32_t low = readConfig32(segment, bus, device, function, offset);
+    if ((low & 0x1) != 0) {
+        return 0;   // I/O space
+    }
+    uint64_t base = low & ~0xFULL;
+    if (((low >> 1) & 0x3) == 0x2 && bar < 5) {
+        base |= static_cast<uint64_t>(readConfig32(segment, bus, device, function, offset + 4)) << 32;
+    }
+    return base;
+}
+
+uint64_t PCI::mapMemoryBar(uint16_t segment, uint8_t bus, uint8_t device, uint8_t function,
+                          uint8_t bar, uint64_t bytes) {
+    const uint64_t base = barAddress(segment, bus, device, function, bar);
+    if (base == 0) {
+        return 0;
+    }
+    for (uint64_t offset = 0; offset < bytes; offset += PAGE_SIZE) {
+        if (!VMM::IsMapped(base + offset)) {
+            VMM::MapRange(base + offset, base + offset, 1,
+                          Present | ReadWrite | CacheDisab | WriteThru | NoExecute);
+        }
+    }
+    return base;
+}
+
+bool PCI::registerMSIXInterrupt(uint16_t segment, uint8_t bus, uint8_t device, uint8_t function,
+                                uint16_t entry, Interrupt* handler, uint8_t* outVector) {
+    if (!handler) {
+        return false;
+    }
+    const uint16_t cap = findCapability(segment, bus, device, function, kCapabilityMsix);
+    if (cap == 0 || g_nextMsiVector > VECTOR_MSI_LIMIT) {
+        return false;
+    }
+    const uint16_t control = readConfig16(segment, bus, device, function, cap + 2);
+    const uint32_t tableSize = (control & 0x7FFU) + 1;
+    if (entry >= tableSize) {
+        return false;
+    }
+    const uint32_t table = readConfig32(segment, bus, device, function, cap + 4);
+    const uint64_t barBase = barAddress(segment, bus, device, function, static_cast<uint8_t>(table & 0x7));
+    if (barBase == 0) {
+        return false;
+    }
+    // The table is reached through the identity mapping, like the device's
+    // other BAR registers.
+    const uint64_t entryAddress = barBase + (table & ~0x7U) + static_cast<uint64_t>(entry) * 16;
+    auto* slot = reinterpret_cast<volatile uint32_t*>(entryAddress);
+
+    const uint8_t vector = g_nextMsiVector++;
+    const uint32_t destination = IRQBalance::addMsixRoute(entryAddress, vector, LAPIC::get().getId()) & 0xFF;
+
+    // Program the entry with the whole function masked, then unmask.
+    writeConfig16(segment, bus, device, function, cap + 2,
+                  static_cast<uint16_t>(control | kMsixEnable | kMsixFunctionMask));
+    slot[3] = kMsixEntryMasked;
+    slot[0] = 0xFEE00000U | (destination << 12);
+    slot[1] = 0;
+    slot[2] = vector;
+    slot[3] = 0;
+    ISR::registerIRQ(vector, handler);
+    writeConfig16(segment, bus, device, function, cap + 2,
+                  static_cast<uint16_t>((control | kMsixEnable) & ~kMsixFunctionMask));
+
+    uint16_t command = readConfig16(segment, bus, device, function, kCommandOffset);
+    command |= kCommandInterruptDisable;
+    writeConfig16(segment, bus, device, function, kCommandOffset, command);
+
+    if (outVector) {
+        *outVector = vector;
+    }
+    return true;
+}
+
+void PCI::setMSIXDestination(uint64_t entryAddress, uint32_t lapicId) {
+    // Masked while the address changes; a message raised meanwhile stays
+    // pending and is sent on unmask.
+    auto* slot = reinterpret_cast<volatile uint32_t*>(entryAddress);
+    slot[3] = kMsixEntryMasked;
+    slot[0] = 0xFEE00000U | ((lapicId & 0xFF) << 12);
+    slot[3] = 0;
+}
+
+void PCI::setMSIDestination(uint16_t segment, uint8_t bus, uint8_t device, uint8_t function,
+                            uint16_t cap, uint32_t lapicId) {
+    // Same vector, new destination: rewriting the low address dword is one
+    // config write, so the device never sees a half-updated message.
+    writeConfig32(segment, bus, device, function, cap + 4, 0xFEE00000U | ((lapicId & 0xFF) << 12));
 }
 
 bool PCI::registerLegacyInterrupt(uint16_t segment, uint8_t bus, uint8_t device, uint8_t function,

@@ -45,6 +45,10 @@ public:
     // True if the physical/virtual link is up.
     virtual bool isLinkUp() const = 0;
 
+    // True if the driver raises an interrupt for received frames and calls
+    // netDeviceInterrupt from it. Otherwise the stack polls on every tick.
+    virtual bool interruptDriven() const { return false; }
+
     // Human-readable driver name (e.g. "virtio-net", "rtl8139", "e1000").
     virtual const char* name() const = 0;
 
@@ -78,3 +82,18 @@ public:
     // Registered driver at `index`, or nullptr if out of range.
     static NetDevice* deviceAt(size_t index);
 };
+
+// The kernel drives the network stack (src/cpu/syscall/net.cpp) itself:
+// netEnableTimerPump brings up the active NIC at boot, after which the boot
+// CPU's timer tick calls netTimerTick to process received frames and run the
+// ARP and TCP timers. The tick must only call it when it did not interrupt
+// kernel code, since the stack is not reentrant.
+void netEnableTimerPump();
+void netTimerTick();
+
+struct InterruptFrame;
+// Called by a NIC's receive interrupt handler (with the big kernel lock held,
+// like any IRQ): processes the received frames. With `mayReschedule`, a
+// process woken by them is switched to straight away; only for a handler that
+// has already sent its EOI.
+void netDeviceInterrupt(InterruptFrame* frame, bool mayReschedule);

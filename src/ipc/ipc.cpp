@@ -9,16 +9,6 @@
 namespace {
 constexpr uint64_t kSharedMapFlags = Present | ReadWrite | UserSuper | NoExecute | kSharedFrame;
 
-uint64_t saveInterruptFlagsAndDisable() {
-    uint64_t flags = 0;
-    asm volatile("pushfq; pop %0; cli" : "=r"(flags) :: "memory");
-    return flags;
-}
-
-void restoreInterruptFlags(uint64_t flags) {
-    asm volatile("push %0; popfq" :: "r"(flags) : "memory", "cc");
-}
-
 void traceStr(const char* text) {
     Cereal::get().write(text);
 }
@@ -195,7 +185,7 @@ SurfaceObject::SurfaceObject(uint64_t idValue, uint32_t widthValue, uint32_t hei
 
 SurfaceObject::~SurfaceObject() {
     if (backing) {
-        backing->release();
+        IPCManager::get().retireSurfaceBacking(backing);
     }
 }
 
@@ -445,12 +435,9 @@ void MessageQueueObject::release() {
 }
 
 bool MessageQueueObject::enqueue(const IPCMessageHeader& header, const void* payload) {
-    const uint64_t irqFlags = saveInterruptFlagsAndDisable();
-    while (__atomic_test_and_set(&lock_flag, __ATOMIC_ACQUIRE)) { asm volatile("pause"); }
+    IrqSpinlockGuard guard(lock);
 
     if (count >= MaxMessages || header.size > MaxPayloadSize) {
-        __atomic_clear(&lock_flag, __ATOMIC_RELEASE);
-        restoreInterruptFlags(irqFlags);
         return false;
     }
 
@@ -460,28 +447,19 @@ bool MessageQueueObject::enqueue(const IPCMessageHeader& header, const void* pay
         memcpy(messages[slot].payload, payload, static_cast<size_t>(header.size));
     }
     count++;
-
-    __atomic_clear(&lock_flag, __ATOMIC_RELEASE);
-    restoreInterruptFlags(irqFlags);
     return true;
 }
 
 bool MessageQueueObject::dequeue(Message* outMessage) {
-    const uint64_t irqFlags = saveInterruptFlagsAndDisable();
-    while (__atomic_test_and_set(&lock_flag, __ATOMIC_ACQUIRE)) { asm volatile("pause"); }
+    IrqSpinlockGuard guard(lock);
 
     if (!outMessage || count == 0) {
-        __atomic_clear(&lock_flag, __ATOMIC_RELEASE);
-        restoreInterruptFlags(irqFlags);
         return false;
     }
 
     *outMessage = messages[head];
     head = (head + 1) % MaxMessages;
     count--;
-
-    __atomic_clear(&lock_flag, __ATOMIC_RELEASE);
-    restoreInterruptFlags(irqFlags);
     return true;
 }
 
@@ -528,6 +506,8 @@ IPCManager& IPCManager::get() {
 IPCManager::IPCManager() : requestCounter(1), surfaceIDCounter(1), windowIDCounter(1), focusedWindowID(0), nextWindowZOrder(1) {
     memset(sharedObjects, 0, sizeof(sharedObjects));
     memset(surfaces, 0, sizeof(surfaces));
+    memset(retiredSurfaces, 0, sizeof(retiredSurfaces));
+    retiredSurfaceCount = 0;
     memset(windows, 0, sizeof(windows));
     memset(queues, 0, sizeof(queues));
     memset(services, 0, sizeof(services));
@@ -576,6 +556,23 @@ void IPCManager::forgetSharedObject(SharedMemoryObject* object) {
             sharedObjects[i] = nullptr;
             return;
         }
+    }
+}
+
+void IPCManager::retireSurfaceBacking(SharedMemoryObject* backing) {
+    if (retiredSurfaceCount == MaxSurfaces) {
+        backing->release();   // full: as before, it lives as long as its mappings
+        return;
+    }
+    retiredSurfaces[retiredSurfaceCount++] = backing;
+}
+
+void IPCManager::releaseRetiredSurfaces(Process* compositor) {
+    while (retiredSurfaceCount > 0) {
+        SharedMemoryObject* backing = retiredSurfaces[--retiredSurfaceCount];
+        retiredSurfaces[retiredSurfaceCount] = nullptr;
+        backing->unmapAllFrom(compositor);
+        backing->release();
     }
 }
 
@@ -797,9 +794,9 @@ bool IPCManager::focusWindow(uint64_t id) {
         oldFocused->enqueueWindowEvent(WindowEventAction::FocusLost);
     }
 
-    if (target->getState() & WindowStateMinimized) {
-        target->control(WindowControlAction::Restore, target->getWidth(), target->getHeight());
-    }
+    // Not control(Restore): that would also take a maximized window back to
+    // its old size.
+    target->unminimize();
 
     focusedWindowID = id;
     target->setFocused(true);
@@ -881,6 +878,25 @@ bool IPCManager::postEventToFocusedWindow(const Event& event) {
     header.flags = IPCMessageFlagEvent;
     header.size = sizeof(event);
     if (!focused->getEventQueue()->enqueue(header, &event)) {
+        return false;
+    }
+
+    wakeQueueWaiters();
+    return true;
+}
+
+bool IPCManager::postEventToWindow(uint64_t windowId, const Event& event) {
+    WindowObject* window = lookupWindow(windowId);
+    if (!window || !window->getEventQueue() || (window->getState() & WindowStateClosed) != 0) {
+        return false;
+    }
+
+    IPCMessageHeader header = {};
+    header.id = 0;
+    header.senderPID = 0;
+    header.flags = IPCMessageFlagEvent;
+    header.size = sizeof(event);
+    if (!window->getEventQueue()->enqueue(header, &event)) {
         return false;
     }
 

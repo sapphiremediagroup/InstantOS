@@ -1,3 +1,5 @@
+#include <cpu/klock.hpp>
+#include <fs/storage/storage_lock.hpp>
 #include <graphics/console.hpp>
 #include <graphics/font.hpp>
 #include <cpu/cereal/cereal.hpp>
@@ -40,7 +42,6 @@ Console::Console(){
     posY = 0;
     drawColor = 0xcad3f5;
     backgroundColor = 0x494d64;
-    writeLock = 0;
     useVirtIO = false;
     copyScrollEnabled = false;
     framebufferOutputEnabled = true;
@@ -511,6 +512,12 @@ void Console::flushIfNeeded() {
     if (!useVirtIO || !framebuffer) {
         return;
     }
+    // Storage code (FAT32 logging) can run without the big kernel lock, which
+    // guards the GPU driver. The text is in the framebuffer already; the next
+    // flush made under the lock shows it.
+    if (StorageLock::heldByThisCpu() && !KernelLock::heldByThisCpu()) {
+        return;
+    }
 
     GPU& gpu = GPU::get();
     if (gpu.isInitialized()) {
@@ -532,14 +539,12 @@ void Console::drawText(const char* str){
 
 void Console::lock() {
     
-    while (__sync_lock_test_and_set(&writeLock, 1)) {
-        __asm__ volatile("pause" ::: "memory");
-    }
+    writeLock.lock();
 }
 
 void Console::unlock() {
     
-    __sync_lock_release(&writeLock);
+    writeLock.unlock();
 }
 
 void Console::writeCharUnlocked(char c) {

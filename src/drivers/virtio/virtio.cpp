@@ -129,6 +129,12 @@ void Virtqueue::setDesc(int idx, uint64_t addr, uint32_t len, uint16_t flags, ui
     desc[idx].next = next;
 }
 
+void Virtqueue::suppressInterrupts() {
+    if (avail) {
+        avail->flags = VIRTQ_AVAIL_F_NO_INTERRUPT;
+    }
+}
+
 void Virtqueue::addAvail(uint16_t descIdx) {
     if (!avail || queueSize == 0) {
         return;

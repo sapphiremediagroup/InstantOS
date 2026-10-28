@@ -4,12 +4,12 @@
 # Boots the full ISO machinery but replaces the boot "login" process with a
 # network-enabled launcher that spawns network-manager (packet pump) +
 # graphics-compositor + nsfb pointed at $URL. QEMU user-mode networking
-# (virtio-net + slirp) matches the kernel's hardcoded 10.0.2.x addressing, and
-# the boot-written /etc/resolv.conf points DNS at 10.0.2.3.
+# (virtio-net + slirp) hands the kernel's DHCP client 10.0.2.15, and
+# network-manager writes /etc/resolv.conf with slirp's DNS, 10.0.2.3.
 #
 # Usage: URL=http://example.com/ tools/run-netsurf-net.sh
 set -euo pipefail
-ROOT="/home/sky/projects/InstantOS"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="$ROOT/build"
 MLIBC_ROOT="$BUILD_DIR/mlibc-root"
 NS_SRC="$BUILD_DIR/netsurf-port/netsurf-3.11"
@@ -60,7 +60,7 @@ ARGS=(
   lib/mlibc/libm.so:"$MLIBC_ROOT/lib/libm.so"
   lib/mlibc/libdl.so:"$MLIBC_ROOT/lib/libdl.so"
   lib/mlibc/libpthread.so:"$MLIBC_ROOT/lib/libpthread.so"
-  netsurf/etc/cacert.pem:"$CACERT"
+  ssl/certs/ca-certificates.crt:"$CACERT"
 )
 while IFS= read -r f; do
   rel="${f#$RES/}"
@@ -86,19 +86,20 @@ xorriso -as mkisofs -R -J -joliet-long -iso-level 3 \
 
 rm -f "$LOG"
 set +e
-QMP="$OUT_DIR/qmp.sock"; rm -f "$QMP"
+# Unix sockets cannot live on a Windows (drvfs) mount such as /mnt/d.
+QMP="$(mktemp -d)/qmp.sock"
 timeout "$QEMU_TIMEOUT" "$QEMU" \
   -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
   -drive "if=pflash,format=raw,file=$OVMF_VARS" \
   -drive "file=$ISO,media=cdrom" \
-  -accel "$QEMU_ACCEL" -cpu max,+tsc -m 1G -smp 2 \
+  -accel "$QEMU_ACCEL" -cpu max,+tsc -m 1G -smp "${QEMU_SMP:-2}" \
   -device virtio-net-pci,netdev=net0,disable-legacy=on,disable-modern=off -netdev user,id=net0 \
   -serial "file:$LOG" -display none \
   -qmp "unix:$QMP,server,nowait" \
   -no-shutdown -no-reboot &
 QPID=$!
 sleep 60
-python3 /tmp/opencode/qmp-shot.py "$QMP" "$OUT_DIR/screenshot.ppm" 2>/dev/null || true
+python3 -c "import sys; sys.path.insert(0, '$ROOT/tools/netsurf-suite'); import drive; drive.Qmp('$QMP').screendump('$OUT_DIR/screenshot.ppm')" 2>/dev/null || true
 sleep 2
 kill $QPID 2>/dev/null; wait $QPID 2>/dev/null
 set -e

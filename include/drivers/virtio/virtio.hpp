@@ -125,6 +125,8 @@ public:
     
     // Queue operations
     void addAvail(uint16_t descIdx);
+    // Ask the device not to interrupt when it uses buffers from this queue.
+    void suppressInterrupts();
     bool hasUsed();
     uint32_t getUsed(uint32_t* len);
     

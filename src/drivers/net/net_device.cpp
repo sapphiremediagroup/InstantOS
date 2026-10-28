@@ -2,6 +2,7 @@
 #include <drivers/virtio/virtio_net.hpp>
 #include <drivers/net/rtl8139.hpp>
 #include <drivers/net/e1000.hpp>
+#include <drivers/net/rtl8169.hpp>
 
 namespace {
 NetDevice* gDevices[NetDeviceRegistry::MAX_DEVICES] = {};
@@ -22,6 +23,7 @@ void ensureDriversRegistered() {
     gDriversRegistered = true;
     NetDeviceRegistry::registerDevice(&VirtIONetDriver::get());
     NetDeviceRegistry::registerDevice(&E1000Driver::get());
+    NetDeviceRegistry::registerDevice(&RTL8169Driver::get());
     NetDeviceRegistry::registerDevice(&RTL8139Driver::get());
 }
 }

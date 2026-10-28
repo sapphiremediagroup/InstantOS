@@ -35,8 +35,10 @@ struct VirtIONetConfig {
 
 constexpr size_t VIRTIO_NET_MTU = 1514;  // Ethernet frame size
 constexpr size_t VIRTIO_NET_BUFFER_SIZE = sizeof(VirtIONetHdr) + VIRTIO_NET_MTU;
-constexpr size_t VIRTIO_NET_RX_BUFFERS = 32;
-constexpr size_t VIRTIO_NET_TX_BUFFERS = 64;
+// One buffer per descriptor. 32 RX buffers overflowed whenever a TCP peer had
+// more than 32 segments in flight, and every drop cost a peer retransmit.
+constexpr size_t VIRTIO_NET_RX_BUFFERS = 256;
+constexpr size_t VIRTIO_NET_TX_BUFFERS = 256;
 
 class VirtIONetDriver : public NetDevice {
 public:
@@ -55,6 +57,11 @@ public:
     
     // Status
     bool isLinkUp() const override;
+    bool interruptDriven() const override { return irqMode != IRQMode::None; }
+
+    // Interrupt handler hooks.
+    bool claimInterrupt();
+    bool usesMsix() const { return irqMode == IRQMode::Msix; }
 
     const char* name() const override { return "virtio-net"; }
 
@@ -62,7 +69,10 @@ public:
     int probePriority() const override { return 10; }
     
 private:
+    enum class IRQMode : uint8_t { None, Msix, Legacy };
+
     VirtIONetDriver();
+    void setupInterrupts();
     
     bool detectDevice();
     bool initDevice();
@@ -97,6 +107,9 @@ private:
     volatile uint32_t* notifyBase;
     uint32_t notifyOffMultiplier;
     volatile VirtIONetConfig* deviceCfg;
+    volatile uint8_t* isrStatus;  // ISR capability: read-to-clear, for INTx
+    IRQMode irqMode;
+    uint8_t irqVector;
     uint64_t negotiatedFeatures;
     
     // Queues
@@ -107,7 +120,9 @@ private:
     void* rxBuffers[VIRTIO_NET_RX_BUFFERS];
     uint64_t rxBuffersPhys[VIRTIO_NET_RX_BUFFERS];
     int rxDesc[VIRTIO_NET_RX_BUFFERS];
-    uint64_t txBuffers[VIRTIO_NET_TX_BUFFERS];
+    int16_t rxIndexOfDesc[VIRTIO_NET_RX_BUFFERS];  // descriptor -> rx buffer index
+    uint16_t rxRequeuedSinceNotify;
+    uint64_t txBuffers[VIRTIO_NET_TX_BUFFERS];      // one page per descriptor, kept
     
     // MAC address
     uint8_t macAddr[6];

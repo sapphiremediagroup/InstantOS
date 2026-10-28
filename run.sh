@@ -84,7 +84,7 @@ qemu-system-x86_64 \
   -device virtio-net-pci,netdev=net0,disable-legacy=on,disable-modern=off \
   -netdev user,id=net0 \
   -m 1G \
-  -smp 2 \
+  -smp "${QEMU_SMP:-2}" \
   -no-shutdown -no-reboot \
   -d int,cpu_reset,guest_errors \
   -D qemu.log "$@"

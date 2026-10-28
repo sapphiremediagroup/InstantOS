@@ -67,6 +67,7 @@ void _start(void) {
     const char* path = "/bin/nsfb";
     static const char* const argv[] = {
         "nsfb",
+        "-f", "instant",
         "-v",
         "-w", "1024",
         "-h", "768",

@@ -94,6 +94,7 @@ public:
     int mount(const char* path) override;
     int unmount() override;
     VNode* getRoot() override;
+    bool isBlockBacked() const override { return true; }
     
     static int nodeOpen(VNode* node, int flags);
     static int nodeClose(VNode* node);

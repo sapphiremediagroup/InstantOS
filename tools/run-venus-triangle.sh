@@ -47,6 +47,6 @@ exec "$QEMU" \
   -serial stdio \
   -monitor none \
   -m 1G \
-  -smp 2 \
+  -smp "${QEMU_SMP:-2}" \
   -no-shutdown -no-reboot \
   "$@"

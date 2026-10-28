@@ -36,7 +36,8 @@ compile_freestanding() { # <src> <out>
   "$LD" --gc-sections --build-id=none --hash-style=sysv -z max-page-size=0x1000 \
     -pie -e _start --dynamic-linker /lib/ld-instantos.so -o "$out" "$out.o"
 }
-compile_freestanding "$SRC_DIR/runner.c" "$OUT_DIR/runner"
+# RUNNER_SRC swaps in another /bin/login test program (tools/run-net-suite.sh).
+compile_freestanding "${RUNNER_SRC:-$SRC_DIR/runner.c}" "$OUT_DIR/runner"
 compile_freestanding "$SRC_DIR/helper.c" "$OUT_DIR/ostest-helper"
 # PROBE=1 swaps in a tiny thread_create diagnostic as /bin/login.
 if [ "${PROBE:-0}" = "1" ]; then compile_freestanding "$SRC_DIR/threadprobe.c" "$OUT_DIR/runner"; echo "PROBE: using threadprobe as /bin/login"; fi
@@ -69,6 +70,8 @@ ENTRIES=(
   lib/libinstant.so:"$LIBINSTANT_SO"
 )
 [ -f "$TTF" ] && ENTRIES+=("bin/JetBrainsMono-Regular.ttf:$TTF")
+# EXTRA_INITRD: more space-separated initrd/path:host/path entries.
+for entry in ${EXTRA_INITRD:-}; do ENTRIES+=("$entry"); done
 
 "$BUILD_DIR/mkInitrd_build/mkInitrd" "$INITRD" "${ENTRIES[@]}"
 

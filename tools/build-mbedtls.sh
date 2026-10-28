@@ -37,7 +37,7 @@ fi
 
 # Freestanding-against-mlibc flags, mirroring the zlib/libpng/libjpeg ports.
 # MBEDTLS_CONFIG_FILE points the whole tree at our custom config header.
-TARGET_CFLAGS="--target=x86_64-unknown-elf -ffreestanding -fPIC -fno-stack-protector -nostdlibinc -isystem $MLIBC_ROOT/include -I$MLIBC_ROOT/include -D_GNU_SOURCE -DMBEDTLS_CONFIG_FILE='<instantos_mbedtls_config.h>'"
+TARGET_CFLAGS="--target=x86_64-unknown-elf -ffreestanding -fPIC -fno-stack-protector -O2 -nostdlibinc -isystem $MLIBC_ROOT/include -I$MLIBC_ROOT/include -D_GNU_SOURCE -DMBEDTLS_CONFIG_FILE='<instantos_mbedtls_config.h>'"
 
 mkdir -p "$WORK_DIR"
 if [ ! -d "$SRC_DIR" ]; then

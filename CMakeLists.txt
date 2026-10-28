@@ -187,6 +187,50 @@ else()
     message(STATUS "bash/mlibc artifacts not found; skipping (run tools/build-mlibc.sh + tools/build-bash.sh)")
 endif()
 
+# Network tools (ping, nslookup/host, netcfg, sntp, dmesg) are mlibc programs, built here
+# whenever the mlibc runtime is; curl comes from tools/build-curl.sh and is
+# bundled when present.
+set(NET_TOOLS_INITRD_ENTRIES "")
+set(NET_TOOLS_DEPENDS "")
+set(NET_TOOLS_DIR "${CMAKE_BINARY_DIR}/net-tools")
+set(NET_TOOLS_SOURCE_DIR "${CMAKE_SOURCE_DIR}/outside/iUserApps/net-tools/src")
+if(EXISTS "${INSTANTOS_MLIBC_LIB_DIR}/libc.so" AND EXISTS "${INSTANTOS_MLIBC_LIB_DIR}/crt1.o")
+    set(NET_TOOLS_CFLAGS --target=x86_64-unknown-elf -ffreestanding -fPIE -fno-stack-protector -O2
+        -nostdlibinc -isystem ${CMAKE_BINARY_DIR}/mlibc-root/include -D_GNU_SOURCE -Wall)
+    set(NET_TOOLS_LDFLAGS --target=x86_64-unknown-elf -pie -nostdlib -fuse-ld=lld
+        -L${INSTANTOS_MLIBC_LIB_DIR} -Wl,--dynamic-linker,/lib/mlibc/ld-instantos.so -Wl,-rpath,/lib/mlibc
+        ${INSTANTOS_MLIBC_LIB_DIR}/crt1.o)
+    foreach(tool ping nslookup netcfg sntp dmesg)
+        add_custom_command(
+            OUTPUT ${NET_TOOLS_DIR}/${tool}
+            COMMAND ${CMAKE_COMMAND} -E make_directory ${NET_TOOLS_DIR}
+            COMMAND ${CMAKE_C_COMPILER} ${NET_TOOLS_CFLAGS} -c ${NET_TOOLS_SOURCE_DIR}/${tool}.c -o ${NET_TOOLS_DIR}/${tool}.o
+            COMMAND ${CMAKE_C_COMPILER} ${NET_TOOLS_LDFLAGS} -o ${NET_TOOLS_DIR}/${tool} ${NET_TOOLS_DIR}/${tool}.o -lc
+            DEPENDS ${NET_TOOLS_SOURCE_DIR}/${tool}.c ${NET_TOOLS_SOURCE_DIR}/instantos_net.h ${INSTANTOS_MLIBC_LIB_DIR}/libc.so
+            COMMENT "Building ${tool} against mlibc"
+            VERBATIM
+        )
+        list(APPEND NET_TOOLS_INITRD_ENTRIES bin/${tool}:${NET_TOOLS_DIR}/${tool})
+        list(APPEND NET_TOOLS_DEPENDS ${NET_TOOLS_DIR}/${tool})
+    endforeach()
+    list(APPEND NET_TOOLS_INITRD_ENTRIES bin/host:${NET_TOOLS_DIR}/nslookup)
+    if(EXISTS "${CMAKE_BINARY_DIR}/curl/curl")
+        list(APPEND NET_TOOLS_INITRD_ENTRIES bin/curl:${CMAKE_BINARY_DIR}/curl/curl)
+        list(APPEND NET_TOOLS_DEPENDS ${CMAKE_BINARY_DIR}/curl/curl)
+    endif()
+    # The runtime, unless bash already brings it.
+    if(NOT BASH_INITRD_ENTRIES)
+        list(APPEND NET_TOOLS_INITRD_ENTRIES
+            lib/mlibc/ld-instantos.so:${INSTANTOS_MLIBC_LIB_DIR}/ld-instantos.so
+            lib/mlibc/libc.so:${INSTANTOS_MLIBC_LIB_DIR}/libc.so
+        )
+    endif()
+    add_custom_target(net-tools DEPENDS ${NET_TOOLS_DEPENDS})
+    message(STATUS "Building the network tools against mlibc")
+else()
+    message(STATUS "mlibc not built; skipping the network tools (run tools/build-mlibc.sh)")
+endif()
+
 # Optional NetSurf framebuffer browser. Produced by tools/build-netsurf*.sh
 # (not by this CMake build), so it is bundled into the initrd only when the
 # nsfb binary and its mlibc runtime + resources are present. NetSurf links
@@ -209,6 +253,24 @@ if(EXISTS "${INSTANTOS_NETSURF_BINARY}" AND EXISTS "${INSTANTOS_MLIBC_LIB_DIR}/l
         ${INSTANTOS_NETSURF_BINARY}
         ${INSTANTOS_MLIBC_LIB_DIR}/libc.so
     )
+    # /bin/netsurf: what the desktop's WEB button runs. Sizes the window to
+    # the screen and execs nsfb on the compositor ("instant") surface.
+    if(NET_TOOLS_CFLAGS)
+        set(NETSURF_WRAPPER "${CMAKE_BINARY_DIR}/netsurf-wrapper/netsurf")
+        set(NETSURF_WRAPPER_SRC "${CMAKE_SOURCE_DIR}/outside/iUserApps/netsurf/src/netsurf.c")
+        add_custom_command(
+            OUTPUT ${NETSURF_WRAPPER}
+            COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/netsurf-wrapper
+            COMMAND ${CMAKE_C_COMPILER} ${NET_TOOLS_CFLAGS} -c ${NETSURF_WRAPPER_SRC} -o ${NETSURF_WRAPPER}.o
+            COMMAND ${CMAKE_C_COMPILER} ${NET_TOOLS_LDFLAGS} -o ${NETSURF_WRAPPER} ${NETSURF_WRAPPER}.o -lc
+            DEPENDS ${NETSURF_WRAPPER_SRC} ${INSTANTOS_MLIBC_LIB_DIR}/libc.so
+            COMMENT "Building the netsurf launcher against mlibc"
+            VERBATIM
+        )
+        add_custom_target(netsurf-wrapper DEPENDS ${NETSURF_WRAPPER})
+        list(APPEND NETSURF_INITRD_ENTRIES bin/netsurf:${NETSURF_WRAPPER})
+        list(APPEND NETSURF_INITRD_DEPENDS ${NETSURF_WRAPPER})
+    endif()
     # Bundle the NetSurf resource tree under /netsurf/res preserving structure.
     # FOLLOW_SYMLINKS is required: NetSurf ships many top-level resources
     # (default.css, welcome.html, netsurf.png, ...) as symlinks into the shared
@@ -233,25 +295,25 @@ else()
     message(STATUS "NetSurf artifacts not found; skipping (run tools/build-netsurf*.sh)")
 endif()
 
-# CA certificate bundle for TLS (https://). Placed under the already-mounted
-# /netsurf subtree at /netsurf/etc/cacert.pem; NetSurf is configured to use it
-# for full certificate-chain validation. Only bundled when fetched (run
+# CA certificate bundle for TLS (https://): the kernel mounts the initrd's
+# ssl/ subtree at /etc/ssl, so it is /etc/ssl/certs/ca-certificates.crt, the
+# default bundle of curl (tools/build-curl.sh). Only bundled when fetched (run
 # tools/fetch-cacert.sh).
 set(INSTANTOS_CACERT "${CMAKE_BINARY_DIR}/cacert/cacert.pem")
 if(EXISTS "${INSTANTOS_CACERT}")
-    list(APPEND NETSURF_INITRD_ENTRIES "netsurf/etc/cacert.pem:${INSTANTOS_CACERT}")
+    list(APPEND NETSURF_INITRD_ENTRIES "ssl/certs/ca-certificates.crt:${INSTANTOS_CACERT}")
     list(APPEND NETSURF_INITRD_DEPENDS "${INSTANTOS_CACERT}")
-    message(STATUS "Bundling CA certificate bundle into initrd (/netsurf/etc/cacert.pem)")
+    message(STATUS "Bundling CA certificate bundle into initrd (/etc/ssl/certs/ca-certificates.crt)")
 else()
     message(STATUS "CA bundle not found; https:// will fail cert validation (run tools/fetch-cacert.sh)")
 endif()
 
-add_custom_command(
-    OUTPUT ${INITRD_IMG}
-    COMMAND ${MKINITRD_EXE}
-        ${INITRD_IMG}
+# Every initrd entry. Also written to build/initrd-entries.txt, one per line,
+# so test images (tools/run-netsurf-suite.sh) can start from the real system.
+set(INSTANTOS_INITRD_ENTRIES
         bin/input-manager:${CMAKE_BINARY_DIR}/input-manager
         bin/cube:${CMAKE_BINARY_DIR}/cube
+        bin/ui-demo:${CMAKE_BINARY_DIR}/ui-demo
         bin/graphics-compositor:${CMAKE_BINARY_DIR}/graphics-compositor
         bin/storage-manager:${CMAKE_BINARY_DIR}/storage-manager
         bin/process-manager:${CMAKE_BINARY_DIR}/process-manager
@@ -290,13 +352,23 @@ add_custom_command(
         lib/libinstant.so:${CMAKE_BINARY_DIR}/libinstant.so
         lib/libm.so.6:${CMAKE_BINARY_DIR}/libinstant.so
         ${BASH_INITRD_ENTRIES}
+        ${NET_TOOLS_INITRD_ENTRIES}
         ${NETSURF_INITRD_ENTRIES}
-    DEPENDS mkInitrd_proj INSTANTOS.EFI cube input-manager graphics-compositor storage-manager process-manager network-manager font-manager session-manager login desktop-shell background-switcher file-browser terminal net-smoke ld-instantos ilibcxx ${TCC_INITRD_DEPENDS} ${CMAKE_SOURCE_DIR}/assets/fonts/JetBrainsMono-Regular.ttf ${CMAKE_SOURCE_DIR}/assets/fonts/StackSansNotch-Bold.ttf ${CMAKE_SOURCE_DIR}/assets/fonts/StackSansNotch-SemiBold.ttf ${CMAKE_SOURCE_DIR}/assets/fonts/StackSansNotch-Regular.ttf ${CMAKE_SOURCE_DIR}/assets/fonts/StackSansNotch-ExtraLight.ttf ${CMAKE_SOURCE_DIR}/assets/cursors/default.png ${CMAKE_SOURCE_DIR}/assets/images/InstantOS_sapph.png ${CMAKE_SOURCE_DIR}/assets/images/no_itnernet.png ${CMAKE_SOURCE_DIR}/assets/images/no_sound.png ${CMAKE_SOURCE_DIR}/assets/images/close.png ${CMAKE_SOURCE_DIR}/assets/images/minimize.png ${CMAKE_SOURCE_DIR}/assets/images/resize.png ${CMAKE_SOURCE_DIR}/assets/images/folder.svg ${CMAKE_SOURCE_DIR}/assets/images/file.svg ${CMAKE_SOURCE_DIR}/assets/backgrounds/instantos_1.png ${CMAKE_SOURCE_DIR}/assets/backgrounds/instantos_1_mono.png ${CMAKE_SOURCE_DIR}/assets/backgrounds/instantos_2.png ${CMAKE_SOURCE_DIR}/assets/backgrounds/instantos_2_mono.png ${CMAKE_SOURCE_DIR}/assets/backgrounds/instantos_3_color.png ${CMAKE_SOURCE_DIR}/assets/backgrounds/instantos_3_mono.png ${BASH_INITRD_DEPENDS} ${NETSURF_INITRD_DEPENDS}
+)
+string(REPLACE ";" "\n" INSTANTOS_INITRD_ENTRY_LINES "${INSTANTOS_INITRD_ENTRIES}")
+file(WRITE "${CMAKE_BINARY_DIR}/initrd-entries.txt" "${INSTANTOS_INITRD_ENTRY_LINES}\n")
+
+add_custom_command(
+    OUTPUT ${INITRD_IMG}
+    COMMAND ${MKINITRD_EXE}
+        ${INITRD_IMG}
+        ${INSTANTOS_INITRD_ENTRIES}
+    DEPENDS mkInitrd_proj INSTANTOS.EFI cube ui-demo input-manager graphics-compositor storage-manager process-manager network-manager font-manager session-manager login desktop-shell background-switcher file-browser terminal net-smoke ld-instantos ilibcxx ${TCC_INITRD_DEPENDS} ${CMAKE_SOURCE_DIR}/assets/fonts/JetBrainsMono-Regular.ttf ${CMAKE_SOURCE_DIR}/assets/fonts/StackSansNotch-Bold.ttf ${CMAKE_SOURCE_DIR}/assets/fonts/StackSansNotch-SemiBold.ttf ${CMAKE_SOURCE_DIR}/assets/fonts/StackSansNotch-Regular.ttf ${CMAKE_SOURCE_DIR}/assets/fonts/StackSansNotch-ExtraLight.ttf ${CMAKE_SOURCE_DIR}/assets/cursors/default.png ${CMAKE_SOURCE_DIR}/assets/images/InstantOS_sapph.png ${CMAKE_SOURCE_DIR}/assets/images/no_itnernet.png ${CMAKE_SOURCE_DIR}/assets/images/no_sound.png ${CMAKE_SOURCE_DIR}/assets/images/close.png ${CMAKE_SOURCE_DIR}/assets/images/minimize.png ${CMAKE_SOURCE_DIR}/assets/images/resize.png ${CMAKE_SOURCE_DIR}/assets/images/folder.svg ${CMAKE_SOURCE_DIR}/assets/images/file.svg ${CMAKE_SOURCE_DIR}/assets/backgrounds/instantos_1.png ${CMAKE_SOURCE_DIR}/assets/backgrounds/instantos_1_mono.png ${CMAKE_SOURCE_DIR}/assets/backgrounds/instantos_2.png ${CMAKE_SOURCE_DIR}/assets/backgrounds/instantos_2_mono.png ${CMAKE_SOURCE_DIR}/assets/backgrounds/instantos_3_color.png ${CMAKE_SOURCE_DIR}/assets/backgrounds/instantos_3_mono.png ${BASH_INITRD_DEPENDS} ${NET_TOOLS_DEPENDS} ${NETSURF_INITRD_DEPENDS}
     VERBATIM
 )
 
 add_custom_target(make_initrd ALL DEPENDS ${INITRD_IMG})
-add_dependencies(make_initrd INSTANTOS.EFI input-manager graphics-compositor storage-manager process-manager network-manager font-manager session-manager login desktop-shell background-switcher file-browser terminal cube net-smoke ld-instantos ilibcxx)
+add_dependencies(make_initrd INSTANTOS.EFI input-manager graphics-compositor storage-manager process-manager network-manager font-manager session-manager login desktop-shell background-switcher file-browser terminal cube ui-demo net-smoke ld-instantos ilibcxx)
 
 add_subdirectory(outside/iboot)
 

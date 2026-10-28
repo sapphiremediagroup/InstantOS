@@ -342,6 +342,9 @@ struct XHCISlotState {
     XHCITransferRequestBlock* keyboardRing;
     XHCITransferRequestBlock* mouseRing;
     uint8_t lastKeyboardReport[USB_HID_MAX_KEYBOARD_REPORT];
+    bool keyboardLedsKnown;
+    uint8_t keyboardLeds;          // lights set, as Keyboard::lockLeds()
+    uint8_t keyboardLedFailures;
 };
 
 struct XHCIControllerState {
@@ -410,16 +413,13 @@ public:
     }
 
     void Run(InterruptFrame* frame) override {
+        (void)frame;
         XHCIController::get().handleInterrupt();
-        if (g_inputActivity) {
-            g_inputActivity = false;
-            Process* current = Scheduler::get().getCurrentProcess();
-            const bool interruptedUser = frame && frame->cs == 0x23;
-            const bool runningIdle = current && current->getPriority() == ProcessPriority::Idle;
-            if (frame && (interruptedUser || runningIdle)) {
-                Scheduler::get().schedule(frame);
-            }
-        }
+        // A legacy INTx handler: the shared dispatcher sends the EOI after
+        // this returns, so it must not switch processes here. Doing so left
+        // the vector in service, which blocked the timer below it and halted
+        // that CPU for good. Whoever the input woke runs at the next tick.
+        g_inputActivity = false;
     }
 };
 
@@ -887,47 +887,6 @@ uint8_t max_endpoint_context_dci(const XHCISlotState& slot, uint8_t dci) {
     return maxDci;
 }
 
-char hid_usage_to_char(uint8_t usage, bool shift) {
-    static constexpr char normal[] = {
-        0, 0, 0, 0,
-        'a','b','c','d','e','f','g','h','i','j','k','l','m',
-        'n','o','p','q','r','s','t','u','v','w','x','y','z',
-        '1','2','3','4','5','6','7','8','9','0',
-        '\n', 0, '\b', '\t', ' ', '-', '=', '[', ']', '\\',
-        0, ';', '\'', '`', ',', '.', '/'
-    };
-    static constexpr char shifted[] = {
-        0, 0, 0, 0,
-        'A','B','C','D','E','F','G','H','I','J','K','L','M',
-        'N','O','P','Q','R','S','T','U','V','W','X','Y','Z',
-        '!','@','#','$','%','^','&','*','(',')',
-        '\n', 0, '\b', '\t', ' ', '_', '+', '{', '}', '|',
-        0, ':', '"', '~', '<', '>', '?'
-    };
-
-    if (usage >= sizeof(normal)) {
-        return 0;
-    }
-    return shift ? shifted[usage] : normal[usage];
-}
-
-uint16_t hid_modifier_byte_to_key_modifiers(uint8_t modifiers) {
-    uint16_t out = KeyModifierNone;
-    if (modifiers & 0x22) {
-        out |= KeyModifierShift;
-    }
-    if (modifiers & 0x11) {
-        out |= KeyModifierControl;
-    }
-    if (modifiers & 0x44) {
-        out |= KeyModifierAlt;
-    }
-    if (modifiers & 0x88) {
-        out |= KeyModifierSuper;
-    }
-    return out;
-}
-
 HIDKeyboardReportLayout boot_keyboard_layout() {
     HIDKeyboardReportLayout layout = {};
     layout.valid = true;
@@ -994,15 +953,6 @@ uint8_t keyboard_key_usage_at(const HIDKeyboardReportLayout& layout, const uint8
             static_cast<uint8_t>((layout.keyUsageMinimum + index) & 0xFF) : 0;
     }
     return static_cast<uint8_t>(hid_read_bits(report, reportLength, bitOffset, layout.keyArrayReportSize) & 0xFF);
-}
-
-bool report_had_key(const HIDKeyboardReportLayout& layout, const uint8_t* report, uint16_t reportLength, uint8_t usage) {
-    for (uint8_t i = 0; i < layout.keyArrayCount; ++i) {
-        if (keyboard_key_usage_at(layout, report, reportLength, i) == usage) {
-            return true;
-        }
-    }
-    return false;
 }
 
 void log_hid_report_prefix(uint8_t interfaceNumber, const uint8_t* reportDescriptor, uint16_t length) {
@@ -1546,23 +1496,20 @@ void complete_keyboard_transfer(XHCIControllerState& state, XHCISlotState& slot)
         return;
     }
 
-    const uint8_t hidModifiers = keyboard_modifier_byte(layout, report, slot.keyboardMaxPacket);
-    const uint16_t keyModifiers = hid_modifier_byte_to_key_modifiers(hidModifiers);
-    const bool shift = (keyModifiers & KeyModifierShift) != 0;
-    for (uint8_t i = 0; i < layout.keyArrayCount; ++i) {
-        const uint8_t usage = keyboard_key_usage_at(layout, report, slot.keyboardMaxPacket, i);
-        if (usage == 0 || report_had_key(layout, slot.lastKeyboardReport, slot.keyboardMaxPacket, usage)) {
-            continue;
-        }
-
-        const char c = hid_usage_to_char(usage, shift);
-        if (c != 0) {
-            Keyboard::get().injectKey(c, keyModifiers, "[usb:kbd]");
-            g_inputActivity = true;
-        }
+    // Presses and releases against the previous report.
+    uint8_t oldKeys[32] = {};
+    uint8_t newKeys[32] = {};
+    const uint8_t count = layout.keyArrayCount < 32 ? layout.keyArrayCount : 32;
+    for (uint8_t i = 0; i < count; ++i) {
+        oldKeys[i] = keyboard_key_usage_at(layout, slot.lastKeyboardReport, slot.keyboardMaxPacket, i);
+        newKeys[i] = keyboard_key_usage_at(layout, report, slot.keyboardMaxPacket, i);
     }
-
-    memcpy(slot.lastKeyboardReport, report, sizeof(slot.lastKeyboardReport));
+    if (Keyboard::get().hidKeyboardReport(keyboard_modifier_byte(layout, slot.lastKeyboardReport, slot.keyboardMaxPacket),
+                                          keyboard_modifier_byte(layout, report, slot.keyboardMaxPacket),
+                                          oldKeys, newKeys, count, "[usb:kbd]")) {
+        g_inputActivity = true;
+        memcpy(slot.lastKeyboardReport, report, sizeof(slot.lastKeyboardReport));
+    }
     submit_keyboard_transfer(state, slot);
 }
 
@@ -1752,8 +1699,8 @@ void complete_mouse_transfer(XHCIControllerState& state, XHCISlotState& slot) {
         const int8_t dx = static_cast<int8_t>(report[1]);
         const int8_t dy = static_cast<int8_t>(report[2]);
         const int8_t wheel = slot.mouseMaxPacket >= 4 ? static_cast<int8_t>(report[3]) : 0;
-        if ((report[0] & 0x07) != 0 || dx != 0 || dy != 0 || wheel != 0) {
-            Keyboard::get().injectPointerDelta(report[0], dx, dy, wheel, "[usb:mouse]");
+        // Every report: one with no motion may still release a button.
+        if (Keyboard::get().injectPointerDelta(report[0], dx, dy, wheel, "[usb:mouse]")) {
             g_inputActivity = true;
         }
     }
@@ -2061,6 +2008,33 @@ bool xhci_control_transfer(
         log_str(")\n");
     }
     return ok;
+}
+
+// The lock lights: a SET_REPORT (output) whenever the keyboard core's differ
+// from what this keyboard shows. From the tick's poll, never from event
+// handling: the control transfer drains the event ring while it waits.
+void sync_keyboard_leds(XHCIControllerState& state, XHCISlotState& slot) {
+    const uint8_t leds = Keyboard::get().lockLeds();
+    if (!slot.keyboardReady || slot.keyboardLedFailures >= 3 ||
+        (slot.keyboardLedsKnown && slot.keyboardLeds == leds)) {
+        return;
+    }
+    // With report IDs the report starts with its ID.
+    const uint8_t reportId = slot.keyboardLayout.valid ? slot.keyboardLayout.reportId : 0;
+    uint8_t report[2] = {reportId, leds};
+    UsbSetupPacket setup = {};
+    setup.requestType = 0x21;
+    setup.request = USB_REQUEST_SET_REPORT;
+    setup.value = static_cast<uint16_t>(0x0200 | reportId);   // output report
+    setup.index = slot.keyboardInterface;
+    setup.length = reportId != 0 ? 2 : 1;
+    if (xhci_control_transfer(state, slot, setup, reportId != 0 ? report : report + 1, setup.length)) {
+        slot.keyboardLedsKnown = true;
+        slot.keyboardLeds = leds;
+        slot.keyboardLedFailures = 0;
+    } else if (++slot.keyboardLedFailures == 3) {
+        log_str("[usb:kbd] keyboard does not take its lights\n");
+    }
 }
 
 bool get_descriptor(XHCIControllerState& state, XHCISlotState& slot, uint8_t type, uint16_t length, void* out) {
@@ -2842,18 +2816,21 @@ void handle_controller_interrupt(XHCIControllerState& state) {
     const uint32_t status = mmio_read32(state.operationalBase, XHCI_OP_USBSTS);
     const uint32_t iman = mmio_read32(interrupterBase, XHCI_IR_IMAN);
 
-    if ((status & (XHCI_STS_EINT | XHCI_STS_PCD)) == 0 && (iman & XHCI_IMAN_IP) == 0) {
-        return;
-    }
-
-    drain_events(state);
-
+    // Acknowledge first, then drain. Draining resubmits interrupt transfers,
+    // and one the device can answer at once (a mouse with motion queued)
+    // completes while we are still here: acknowledging afterwards wiped
+    // that event's flags, so it sat in the ring unseen and the device was
+    // never polled again (the mouse froze after a couple of reports).
     if (status & (XHCI_STS_EINT | XHCI_STS_PCD)) {
         mmio_write32(state.operationalBase, XHCI_OP_USBSTS, status & (XHCI_STS_EINT | XHCI_STS_PCD));
     }
     if (iman & XHCI_IMAN_IP) {
         mmio_write32(interrupterBase, XHCI_IR_IMAN, XHCI_IMAN_IP | XHCI_IMAN_IE);
     }
+
+    // Always look at the ring (one cycle-bit read when it is empty), so the
+    // timer's poll also catches an event whose interrupt went missing.
+    drain_events(state);
 }
 
 bool read_xhci_bar(uint8_t bus, uint8_t slot, uint8_t func, uint64_t& outBase, bool& outIs64) {
@@ -3317,13 +3294,16 @@ bool XHCIController::initialize() {
 
 void XHCIController::poll() {
     handleInterrupt();
-    if (g_inputActivity) {
-        g_inputActivity = false;
-        Process* current = Scheduler::get().getCurrentProcess();
-        if (current && current->getPriority() == ProcessPriority::Idle) {
-            Scheduler::get().yield();
+    for (uint8_t i = 0; i < initializedControllers; ++i) {
+        for (uint16_t slot = 0; slot < XHCI_MAX_SLOTS; ++slot) {
+            sync_keyboard_leds(g_controllers[i], g_controllers[i].slots[slot]);
         }
     }
+    // This runs inside the boot CPU's timer interrupt, which reschedules
+    // itself (Timer::Run) once the interrupt is acknowledged. Yielding here
+    // switched away before the EOI, and that CPU never got another tick:
+    // USB input (and everything else on the tick) stopped for good.
+    g_inputActivity = false;
 }
 
 bool XHCIController::claimPendingInterrupt() {

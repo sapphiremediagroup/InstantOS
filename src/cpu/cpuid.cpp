@@ -484,6 +484,40 @@ bool CPU::avxEnabledByOS() {
     return features.avxEnabled;
 }
 
+bool CPU::initializeSecondary() {
+    if (!initialized) {
+        return false;
+    }
+
+    enableBaseFPUAndSIMD(features);
+    if (features.nxEnabled) {
+        enableNoExecute();
+    }
+    if (features.umipEnabled) {
+        enableUserModeInstructionPrevention();
+    }
+    if (features.fsgsbaseEnabled) {
+        enableFsgsbase();
+    }
+    if (features.xsaveEnabled) {
+        enableXsave();
+        writeXcr0(features.xsaveMask);
+        if (features.pkuEnabled) {
+            enableProtectionKeys();
+        }
+    }
+    if (features.smepEnabled) {
+        enableSmep();
+    }
+
+    asm volatile("fninit");
+    if (features.pkuEnabled) {
+        writePkru(0);
+    }
+    asm volatile("ldmxcsr %0" : : "m"(kDefaultMxcsr));
+    return true;
+}
+
 bool CPU::usesXsave() {
     return features.xsaveEnabled;
 }

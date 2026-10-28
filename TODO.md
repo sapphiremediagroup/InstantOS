@@ -79,3 +79,23 @@ WSL; keep the Windows `build/` tree lean (C: is tight).
 - [ ] Cross-cutting: every latent kernel/libc bug shaken out by configure/cc1
       gets a minimized permanent check in os-testsuite. Track WHPX/TCG soak
       performance (a full bootstrap is long); use serial-marker resumability.
+
+## Desktop polish (paused 2026-10-28)
+
+Step 1 is done: the taskbar's centre pill lists the open windows (focus,
+minimize, restore; launchers marked when their app runs). The rest:
+
+- [ ] Live clock: the compositor blocks in `queue_receive` with no timeout, so
+      the taskbar clock only redraws when something else changes. Wake once a
+      minute (on the minute) and redraw just the clock.
+- [ ] Apps follow their window's size: nothing handles
+      `WindowEventAction::Resized`, so resized/maximized windows keep drawing at
+      their first size. Terminal (re-wrap, `TIOCSWINSZ` so bash gets SIGWINCH),
+      NetSurf (`NSFB_EVENT_RESIZE`), file browser, wallpaper picker.
+- [ ] Keyboard window management: Alt/Super+Tab, Super+Up/Down
+      (maximize/restore/minimize), Alt+F4; double-click a title bar to
+      maximize; keep windows from being dragged off screen. Maximize should
+      leave the taskbar uncovered (it is x=y=16, screen size minus 32 now).
+- [ ] Display: the wallpaper is dithered (also under TCG); under WHPX the
+      picture was ~960 px wide with `setScanout failed`; `-vga none` stalls
+      the boot after `[iBoot] Framebuffer acquired.`

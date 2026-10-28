@@ -1,5 +1,6 @@
 #include <cpu/cereal/cereal.hpp>
 #include <memory/pmm.hpp>
+#include <common/spinlock.hpp>
 
 
 namespace {
@@ -203,6 +204,11 @@ uint64_t  PMM::s_usableFrames = 0;
 bool      PMM::s_initialized = false;
 uint16_t* PMM::s_refcount    = nullptr;
 uint64_t  PMM::s_allocCursor = 1;
+
+// Guards the bitmap, refcounts and counters. Heap growth allocates frames
+// under the heap lock, and storage code runs without the big kernel lock, so
+// the PMM cannot rely on the BKL.
+static IrqSpinlock s_pmmLock("pmm");
 
 // ── Bit-manipulation helpers ──────────────────────────────────────────────
 void PMM::SetFrame(uint64_t frame) {
@@ -452,6 +458,7 @@ uint64_t PMM::FindContiguous(uint64_t count) {
 
 // ── AllocFrame ────────────────────────────────────────────────────────────
 uint64_t PMM::AllocFrame() {
+    IrqSpinlockGuard guard(s_pmmLock);
     if (!s_initialized) return 0;
 
     // Next-fit: resume scanning from the cursor, then wrap to the front so
@@ -474,6 +481,7 @@ uint64_t PMM::AllocFrame() {
 // Refcount-aware: a shared frame is only released when its last reference
 // drops.  This makes address-space teardown and munmap copy-on-write safe.
 void PMM::FreeFrame(uint64_t physAddr) {
+    IrqSpinlockGuard guard(s_pmmLock);
     if (!s_initialized) return;
 
     uint64_t frame = physAddr / PAGE_SIZE;
@@ -493,6 +501,7 @@ void PMM::FreeFrame(uint64_t physAddr) {
 
 // ── AllocFrames ───────────────────────────────────────────────────────────
 uint64_t PMM::AllocFrames(uint64_t count) {
+    IrqSpinlockGuard guard(s_pmmLock);
     if (!s_initialized || count == 0) return 0;
 
     uint64_t start = FindContiguous(count);
@@ -512,6 +521,7 @@ uint64_t PMM::AllocFrames(uint64_t count) {
 // identity map and must therefore stay clear of the non-PIE user image window
 // (see PMM::KERNEL_HIGH_ALLOC_MIN). Returns 0 if no qualifying run exists.
 uint64_t PMM::AllocFramesAbove(uint64_t count, uint64_t minPhys) {
+    IrqSpinlockGuard guard(s_pmmLock);
     if (!s_initialized || count == 0) return 0;
 
     uint64_t frame = minPhys / PAGE_SIZE;
@@ -540,8 +550,36 @@ uint64_t PMM::AllocFramesAbove(uint64_t count, uint64_t minPhys) {
     return 0;   // no contiguous run at/above minPhys
 }
 
+uint64_t PMM::AllocFramesBelow(uint64_t count, uint64_t maxPhys) {
+    IrqSpinlockGuard guard(s_pmmLock);
+    if (!s_initialized || count == 0) return 0;
+
+    uint64_t limit = maxPhys / PAGE_SIZE;
+    if (limit > s_totalFrames) limit = s_totalFrames;
+
+    uint64_t runStart = 0;
+    uint64_t runLen = 0;
+    for (uint64_t frame = 1; frame < limit; frame++) {   // frame 0 is the null guard
+        if (TestFrame(frame)) {
+            runLen = 0;
+            continue;
+        }
+        if (runLen == 0) runStart = frame;
+        if (++runLen == count) {
+            for (uint64_t f = runStart; f < runStart + count; f++) {
+                SetFrame(f);
+                s_refcount[f] = 1;
+                s_usedFrames++;
+            }
+            return runStart * PAGE_SIZE;
+        }
+    }
+    return 0;   // no contiguous run below maxPhys
+}
+
 // ── FreeFrames ────────────────────────────────────────────────────────────
 void PMM::FreeFrames(uint64_t physAddr, uint64_t count) {
+    IrqSpinlockGuard guard(s_pmmLock);
     if (!s_initialized || count == 0) return;
 
     uint64_t startFrame = physAddr / PAGE_SIZE;
@@ -560,6 +598,7 @@ void PMM::FreeFrames(uint64_t physAddr, uint64_t count) {
 
 // ── Reference counting ─────────────────────────────────────────────────────
 void PMM::IncRef(uint64_t physAddr) {
+    IrqSpinlockGuard guard(s_pmmLock);
     if (!s_initialized) return;
 
     uint64_t frame = physAddr / PAGE_SIZE;
@@ -581,6 +620,7 @@ uint16_t PMM::RefCount(uint64_t physAddr) {
 }
 
 void PMM::ReserveRange(uint64_t physAddr, uint64_t bytes) {
+    IrqSpinlockGuard guard(s_pmmLock);
     if (!s_initialized || bytes == 0) return;
 
     uint64_t start = physAddr & ~(PAGE_SIZE - 1);
