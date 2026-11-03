@@ -23,7 +23,12 @@ CC="${CC:-clang}"
 
 # A small, dependency-light set to validate the sysdeps we have. Expanded as
 # more sysdeps land (df/stat -f need statfs, chown needs ownership, etc.).
-PROGRAMS="${PROGRAMS:-echo cat ls pwd mkdir rmdir rm mv ln cp touch chmod true false head wc env stat df chown chgrp id mkfifo mknod shuf mktemp sort whoami sleep uptime who users}"
+# The second half is what autoconf configure scripts and Makefiles call (the
+# GCC self-host runs need expr, basename, tr, uname, ...). stat and df are out
+# for now: they need struct statfs, which the mlibc headers no longer provide.
+PROGRAMS="${PROGRAMS:-echo cat ls pwd mkdir rmdir rm mv ln cp touch chmod true false head tail wc env chown chgrp id mkfifo mknod shuf mktemp sort whoami sleep uptime who users \
+expr basename dirname tr uname cut uniq tee od date comm printf test readlink realpath nproc \
+join paste split md5sum cksum seq yes tsort fold expand unexpand nl fmt tac dd du tty nice nohup timeout printenv logname link unlink sync truncate base64 sha256sum}"
 
 if [ ! -f "$MLIBC_ROOT/lib/crt1.o" ] || [ ! -f "$MLIBC_ROOT/lib/libc.so" ]; then
   printf 'mlibc sysroot missing (%s); run tools/build-mlibc.sh first\n' "$MLIBC_ROOT" >&2
@@ -48,6 +53,9 @@ cd "$OBJ_DIR"
 # on a non-Linux freestanding target. These describe the InstantOS+mlibc runtime.
 cat > config.cache <<'EOF'
 ac_cv_func_malloc_0_nonnull=yes
+# iconv.h in the sysroot is NetSurf's shim (its library links into NetSurf only).
+am_cv_func_iconv=no
+am_cv_lib_iconv=no
 ac_cv_func_realloc_0_nonnull=yes
 gl_cv_func_malloc_0_nonnull=1
 ac_cv_func_working_mktime=yes

@@ -13,8 +13,9 @@ set -euo pipefail
 HOSTED=/home/sky/gcc-port/gcc-hosted-install
 CROSS=/home/sky/gcc-port/gcc-install
 SYSROOT=/home/sky/gcc-port/instantos-sysroot
-BINUTILS_HOSTED=/home/sky/projects/InstantOS/build/binutils-hosted-root
-MLIBC_GCC=/home/sky/projects/InstantOS/build/mlibc-root-gcc
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+BINUTILS_HOSTED="$REPO/build/binutils-hosted-root"
+MLIBC_GCC="$REPO/build/mlibc-root-gcc"
 TRIPLE=x86_64-unknown-instantos
 GVER=13.3.0
 ROOT="${GCCHOST_ROOT:-/home/sky/gcc-port/gcchost-root}"

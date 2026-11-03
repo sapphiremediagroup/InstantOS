@@ -6,7 +6,31 @@ Cereal& Cereal::get() {
     return instance;
 }
 
+// The serial port is only driven under a hypervisor (CPUID 1 ECX bit 31),
+// where the tests read it. A real PC's COM1 usually has nothing on it, yet
+// every character waits for the UART (38400 baud here: 0.26 ms a character,
+// with interrupts off; a log line cost the HD 530 PC about 20 ms). There the
+// log lives in the ring alone (KernelLog, dmesg, log-saver's /kernel.log).
+// Windows QEMU under WHPX does not set the hypervisor bit, so QEMU is also
+// recognised by its fw_cfg device: selecting key 0 (the signature) on port
+// 0x510 makes port 0x511 read "QEMU". A PC does not decode those ports (the
+// write goes nowhere, the reads give 0xFF).
+static bool runningUnderQemu() {
+    outw(0x510, 0x0000);
+    const char expected[4] = {'Q', 'E', 'M', 'U'};
+    for (char c : expected) {
+        if (inb(0x511) != static_cast<uint8_t>(c)) return false;
+    }
+    return true;
+}
+
 void Cereal::initialize() {
+    uint32_t eax = 1, ebx = 0, ecx = 0, edx = 0;
+    asm volatile("cpuid" : "+a"(eax), "=b"(ebx), "+c"(ecx), "=d"(edx));
+    if ((ecx & (1u << 31)) == 0 && !runningUnderQemu()) {
+        initialized = false;
+        return;
+    }
     outb(COM1 + 1, 0x00);
     outb(COM1 + 3, 0x80);
     outb(COM1 + 0, 0x03);
@@ -82,6 +106,30 @@ size_t Cereal::copyLog(char* out, size_t capacity) {
     const uint64_t count = held < capacity ? held : capacity;
     for (uint64_t i = 0; i < count; ++i) {
         out[i] = logRing[(logWritten - count + i) % kLogSize];
+    }
+    unlock(flags);
+    return count;
+}
+
+uint64_t Cereal::logPosition() {
+    uint64_t flags = lock();
+    const uint64_t position = logWritten;
+    unlock(flags);
+    return position;
+}
+
+size_t Cereal::copyLogSince(uint64_t position, char* out, size_t capacity) {
+    uint64_t flags = lock();
+    const uint64_t oldest = logWritten < kLogSize ? 0 : logWritten - kLogSize;
+    if (position < oldest) {
+        position = oldest;
+    }
+    uint64_t count = position < logWritten ? logWritten - position : 0;
+    if (count > capacity) {
+        count = capacity;
+    }
+    for (uint64_t i = 0; i < count; ++i) {
+        out[i] = logRing[(position + i) % kLogSize];
     }
     unlock(flags);
     return count;

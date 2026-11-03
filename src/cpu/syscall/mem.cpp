@@ -1,9 +1,11 @@
+#include <graphics/intel_gen9_drm.hpp>
 #include <cpu/syscall/syscall.hpp>
 #include <cpu/process/scheduler.hpp>
 #include <memory/pmm.hpp>
 #include <memory/vmm.hpp>
 #include <common/string.hpp>
 #include <fs/vfs/vfs.hpp>
+#include <cpu/syscall/user_mapping.hpp>
 
 namespace {
 uint64_t pageFlagsForProtection(uint64_t prot, bool defaultReadWrite) {
@@ -64,12 +66,15 @@ void unmapUserPages(PageTable* pageTable, uint64_t addr, size_t pages) {
             // "already backed" check would leave the supervisor identity page in
             // place and a user access would fault (observed: ld.so loading a small
             // dependency at a low fixed base over the identity window).
+            const uint64_t entry = VMM::LeafEntryIn(pageTable, va);
             VMM::UnmapPageFrom(pageTable, va);
 
             // Only return the frame to the PMM when it is genuinely owned by this
             // address space; never free the inherited identity map (double-free /
             // frame-reuse corruption -- root cause of the P7.1 crashes).
-            if (!sharedIdentity) {
+            // A kSharedFrame page (IPC shared memory, a device frame buffer, a
+            // GPU buffer object) belongs to its manager, which frees it.
+            if (!sharedIdentity && !(entry & kSharedFrame)) {
                 PMM::FreeFrame(frame);
             }
         }
@@ -193,6 +198,32 @@ uint64_t Syscall::sys_mmap_file(uint64_t argsPtr) {
         }
     }
 
+    // A GPU buffer object (mmap on /dev/dri/renderD128 at a GEM_MMAP_OFFSET
+    // offset): its pages are mapped now, shared, and the region keeps the
+    // object alive.
+    if (drm::isDrmNode(node)) {
+        drm::MmapTarget target{};
+        const uint64_t resolved = drm::resolveMmap(node, offset, aligned_length, &target);
+        if (resolved != 0) {
+            return resolved;
+        }
+        uint64_t pageFlags = Present | UserSuper | kSharedFrame | target.cacheFlags;
+        if (prot & MemoryProtWrite) pageFlags |= ReadWrite;
+        if (!(prot & MemoryProtExecute)) pageFlags |= NoExecute;
+        {
+            KernelAsScope kas;
+            for (size_t i = 0; i < pages; i++) {
+                VMM::MapPageInto(pageTable, virt + i * PAGE_SIZE, target.pages[i], pageFlags);
+            }
+        }
+        if (!current->mmapAddObjectRegion(virt, aligned_length, prot, target.object)) {
+            KernelAsScope kas;
+            unmapUserPages(pageTable, virt, pages);
+            return syscall_error(SysErrNoMemory);
+        }
+        return virt;
+    }
+
     if (!current->mmapAddFileRegion(virt, aligned_length, prot, file, offset, fileLength, shared)) {
         return syscall_error(SysErrNoMemory);
     }
@@ -267,4 +298,47 @@ uint64_t Syscall::sys_munmap(uint64_t addr, uint64_t length) {
 
     return 0;
 }
-                                                                                
+
+uint64_t mapDmaBufIntoCurrent(VNode* dmaBuf, uint64_t length) {
+    Process* current = Scheduler::get().getCurrentProcess();
+    if (!current || !dmaBuf || length == 0) {
+        return 0;
+    }
+    const size_t pages = (length + PAGE_SIZE - 1) / PAGE_SIZE;
+    const uint64_t alignedLength = pages * PAGE_SIZE;
+    drm::MmapTarget target {};
+    if (drm::resolveMmap(dmaBuf, 0, alignedLength, &target) != 0) {
+        return 0;
+    }
+    const uint64_t virt = current->reserveMmapRegion(alignedLength);
+    if (virt == 0) {
+        return 0;
+    }
+    const uint64_t pageFlags = Present | UserSuper | ReadWrite | NoExecute | kSharedFrame | target.cacheFlags;
+    PageTable* pageTable = current->getPageTable();
+    {
+        KernelAsScope kas;
+        for (size_t i = 0; i < pages; i++) {
+            VMM::MapPageInto(pageTable, virt + i * PAGE_SIZE, target.pages[i], pageFlags);
+        }
+    }
+    if (!current->mmapAddObjectRegion(virt, alignedLength, MemoryProtRead | MemoryProtWrite, target.object)) {
+        KernelAsScope kas;
+        unmapUserPages(pageTable, virt, pages);
+        return 0;
+    }
+    return virt;
+}
+
+void unmapRangeOfCurrent(uint64_t address, uint64_t length) {
+    Process* current = Scheduler::get().getCurrentProcess();
+    if (!current || address == 0 || length == 0) {
+        return;
+    }
+    const size_t pages = (length + PAGE_SIZE - 1) / PAGE_SIZE;
+    {
+        KernelAsScope kas;
+        unmapUserPages(current->getPageTable(), address, pages);
+    }
+    current->mmapRemoveRange(address, pages * PAGE_SIZE);
+}

@@ -15,7 +15,7 @@ GCC_SRC="${GCC_SRC:-/home/sky/gcc-port/gcc-13.3.0}"
 BUILD="${GCC_HOSTED_BUILD:-/home/sky/gcc-port/build-hosted}"
 PREFIX="${GCC_HOSTED_PREFIX:-/home/sky/gcc-port/gcc-hosted-install}"
 CROSS_BIN="/home/sky/gcc-port/gcc-install/bin"
-BINUTILS_CROSS="/home/sky/projects/InstantOS/build/binutils-cross/bin"
+BINUTILS_CROSS="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/build/binutils-cross/bin"
 
 # The cross compiler (host compiler) + cross binutils (host & target tools).
 export PATH="$CROSS_BIN:$BINUTILS_CROSS:$PATH"
@@ -62,7 +62,8 @@ if [ "${STOP_AFTER_CONFIGURE:-0}" = "1" ]; then
 fi
 
 # Build + install only the compiler (host=instantos binaries).
-make -C "$BUILD" -j"$(nproc)" all-gcc MAKEINFO=true
+# JOBS: parallel compiles; each cc1plus of gcc's big files takes several hundred MB.
+make -C "$BUILD" -j"${JOBS:-$(nproc)}" all-gcc MAKEINFO=true
 make -C "$BUILD" install-gcc MAKEINFO=true DESTDIR="$PREFIX"
 
 echo "hosted gcc compiler installed under: $PREFIX"

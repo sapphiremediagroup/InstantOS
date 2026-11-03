@@ -3,6 +3,8 @@
 #include <common/string.hpp>
 #include <cpu/cereal/cereal.hpp>
 #include <cpu/process/scheduler.hpp>
+#include <cpu/syscall/user_mapping.hpp>
+#include <fs/vfs/vfs.hpp>
 #include <graphics/console.hpp>
 #include <memory/pmm.hpp>
 
@@ -176,10 +178,21 @@ void SharedMemoryObject::unmapAllFrom(Process* process) {
 }
 
 SurfaceObject::SurfaceObject(uint64_t idValue, uint32_t widthValue, uint32_t heightValue, uint32_t formatValue, SharedMemoryObject* backingObject)
-    : id(idValue), width(widthValue), height(heightValue), format(formatValue), backing(backingObject), refCount(1),
+    : id(idValue), width(widthValue), height(heightValue), format(formatValue), backing(backingObject), buffer(nullptr),
+      pitch(widthValue * 4), mappedPid(0), mappedAddress(0), attachCount(0), releasePending(false), refCount(1),
       committed(false), dirtyX(0), dirtyY(0), dirtyWidth(widthValue), dirtyHeight(heightValue) {
     if (backing) {
         backing->retain();
+    }
+}
+
+SurfaceObject::SurfaceObject(uint64_t idValue, uint32_t widthValue, uint32_t heightValue, uint32_t formatValue,
+                             uint32_t pitchValue, FileDescriptor* bufferValue)
+    : id(idValue), width(widthValue), height(heightValue), format(formatValue), backing(nullptr), buffer(bufferValue),
+      pitch(pitchValue), mappedPid(0), mappedAddress(0), attachCount(0), releasePending(false), refCount(1),
+      committed(false), dirtyX(0), dirtyY(0), dirtyWidth(widthValue), dirtyHeight(heightValue) {
+    if (buffer) {
+        VFS::get().retain(buffer);
     }
 }
 
@@ -187,6 +200,23 @@ SurfaceObject::~SurfaceObject() {
     if (backing) {
         IPCManager::get().retireSurfaceBacking(backing);
     }
+    if (buffer) {
+        // Mapped in the compositor or not, the reference goes at its next
+        // window list, as a shared surface's memory does.
+        IPCManager::get().retireSurfaceBuffer(buffer, mappedPid, mappedAddress, mappedAddress ? getSize() : 0);
+    }
+}
+
+void SurfaceObject::attached() {
+    attachCount++;
+    unshown = buffer != nullptr;
+}
+
+void SurfaceObject::detached() {
+    if (attachCount > 0) {
+        attachCount--;
+    }
+    releasePending = true;
 }
 
 void SurfaceObject::retain() {
@@ -206,7 +236,25 @@ void SurfaceObject::release() {
 }
 
 uint64_t SurfaceObject::mapInto(Process* process) {
-    return backing ? backing->mapInto(process) : 0;
+    if (backing) {
+        return backing->mapInto(process);
+    }
+    if (!buffer || !process) {
+        return 0;
+    }
+    // One mapping, the compositor's (the only one that maps surfaces).
+    if (mappedAddress && mappedPid == process->getPID()) {
+        return mappedAddress;
+    }
+    if (mappedAddress) {
+        return 0;
+    }
+    if (process != Scheduler::get().getCurrentProcess()) {
+        return 0;
+    }
+    mappedAddress = mapDmaBufIntoCurrent(buffer->getNode(), getSize());
+    mappedPid = mappedAddress ? process->getPID() : 0;
+    return mappedAddress;
 }
 
 void SurfaceObject::commit(uint32_t x, uint32_t y, uint32_t widthValue, uint32_t heightValue) {
@@ -263,6 +311,7 @@ WindowObject::WindowObject(
 
 WindowObject::~WindowObject() {
     if (surface) {
+        surface->detached();
         surface->release();
     }
     if (queue) {
@@ -303,8 +352,10 @@ void WindowObject::attachSurface(SurfaceObject* value) {
 
     if (value) {
         value->retain();
+        value->attached();
     }
     if (surface) {
+        surface->detached();
         surface->release();
     }
     surface = value;
@@ -328,7 +379,8 @@ void WindowObject::setFocused(bool focused) {
     }
 }
 
-void WindowObject::control(WindowControlAction action, int32_t maxWidth, int32_t maxHeight) {
+void WindowObject::control(WindowControlAction action, int32_t maxX, int32_t maxY, int32_t maxWidth,
+                           int32_t maxHeight) {
     switch (action) {
         case WindowControlAction::Restore:
             if (state & WindowStateClosed) {
@@ -361,10 +413,10 @@ void WindowObject::control(WindowControlAction action, int32_t maxWidth, int32_t
             }
             state &= ~WindowStateMinimized;
             state |= WindowStateMaximized;
-            x = 16;
-            y = 16;
-            width = maxWidth > 32 ? maxWidth - 32 : maxWidth;
-            height = maxHeight > 32 ? maxHeight - 32 : maxHeight;
+            x = maxX;
+            y = maxY;
+            width = maxWidth > 1 ? maxWidth : 1;
+            height = maxHeight > 1 ? maxHeight : 1;
             break;
         case WindowControlAction::Close:
             state |= WindowStateClosed;
@@ -508,6 +560,8 @@ IPCManager::IPCManager() : requestCounter(1), surfaceIDCounter(1), windowIDCount
     memset(surfaces, 0, sizeof(surfaces));
     memset(retiredSurfaces, 0, sizeof(retiredSurfaces));
     retiredSurfaceCount = 0;
+    memset(retiredBuffers, 0, sizeof(retiredBuffers));
+    retiredBufferCount = 0;
     memset(windows, 0, sizeof(windows));
     memset(queues, 0, sizeof(queues));
     memset(services, 0, sizeof(services));
@@ -567,12 +621,46 @@ void IPCManager::retireSurfaceBacking(SharedMemoryObject* backing) {
     retiredSurfaces[retiredSurfaceCount++] = backing;
 }
 
+void IPCManager::retireSurfaceBuffer(FileDescriptor* buffer, uint32_t pid, uint64_t address, uint64_t length) {
+    if (retiredBufferCount == MaxSurfaces) {
+        // Full: let go now. A mapping left in the compositor keeps the pages
+        // (its region holds the object), so this is safe, only untidy.
+        VFS::get().close(buffer);
+        return;
+    }
+    retiredBuffers[retiredBufferCount++] = {buffer, pid, address, length};
+}
+
 void IPCManager::releaseRetiredSurfaces(Process* compositor) {
     while (retiredSurfaceCount > 0) {
         SharedMemoryObject* backing = retiredSurfaces[--retiredSurfaceCount];
         retiredSurfaces[retiredSurfaceCount] = nullptr;
         backing->unmapAllFrom(compositor);
         backing->release();
+    }
+    while (retiredBufferCount > 0) {
+        RetiredBuffer retired = retiredBuffers[--retiredBufferCount];
+        if (retired.address && compositor && retired.pid == compositor->getPID() &&
+            compositor == Scheduler::get().getCurrentProcess()) {
+            unmapRangeOfCurrent(retired.address, retired.length);
+        }
+        VFS::get().close(retired.buffer);
+    }
+    // Every surface no window shows is free for its owner again, and every
+    // one a window shows is now shown (the compositor draws this list).
+    bool freed = false;
+    for (size_t i = 0; i < MaxSurfaces; i++) {
+        if (surfaces[i] && surfaces[i]->inUse() && surfaces[i]->getBuffer()) {
+            surfaces[i]->listed();
+            freed = freed || !surfaces[i]->inUse();
+            if (surfaces[i]->isAttached() && surfaces[i]->isUnshown()) {
+                surfaces[i]->markShown();
+                freed = true;
+            }
+        }
+    }
+    if (freed) {
+        Scheduler::get().wakeAllBlockedProcesses();   // SurfaceWaitIdle, a paced WindowAttachSurface
     }
 }
 
@@ -686,6 +774,16 @@ SurfaceObject* IPCManager::createSurface(uint32_t width, uint32_t height, uint32
         return nullptr;
     }
 
+    registerSurface(object);
+    return object;
+}
+
+SurfaceObject* IPCManager::createBufferSurface(FileDescriptor* buffer, uint32_t width, uint32_t height, uint32_t pitch,
+                                               uint32_t format) {
+    SurfaceObject* object = new SurfaceObject(surfaceIDCounter++, width, height, format, pitch, buffer);
+    if (!object) {
+        return nullptr;
+    }
     registerSurface(object);
     return object;
 }
@@ -830,13 +928,14 @@ bool IPCManager::resizeWindow(uint64_t id, int32_t width, int32_t height) {
     return true;
 }
 
-bool IPCManager::controlWindow(uint64_t id, WindowControlAction action, int32_t maxWidth, int32_t maxHeight) {
+bool IPCManager::controlWindow(uint64_t id, WindowControlAction action, int32_t maxX, int32_t maxY,
+                               int32_t maxWidth, int32_t maxHeight) {
     WindowObject* window = lookupWindow(id);
     if (!window) {
         return false;
     }
 
-    window->control(action, maxWidth, maxHeight);
+    window->control(action, maxX, maxY, maxWidth, maxHeight);
     if (action == WindowControlAction::Close) {
         window->enqueueWindowEvent(WindowEventAction::CloseRequested);
     } else if (action == WindowControlAction::Minimize || action == WindowControlAction::Restore || action == WindowControlAction::Maximize) {

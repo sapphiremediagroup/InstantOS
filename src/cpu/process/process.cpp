@@ -1,4 +1,6 @@
+#include <memory/mapped_object.hpp>
 #include <cpu/process/process.hpp>
+#include <graphics/intel_gen9.hpp>
 #include <memory/heap.hpp>
 #include <memory/vmm.hpp>
 #include <memory/pmm.hpp>
@@ -70,6 +72,7 @@ struct VmaRegion {
     uint64_t fileOffset;    // file byte offset mapped at `start`
     uint64_t fileLength;    // bytes from fileOffset sourced from the file (EOF clamp)
     bool shared;            // MAP_SHARED (write back) vs MAP_PRIVATE (copy)
+    MappedObject* object;   // pages owned by this object (referenced), or nullptr
     VmaRegion* next;
 };
 
@@ -159,6 +162,9 @@ void releaseSharedState(ProcessSharedState* state) {
         VmaRegion* next = v->next;
         if (v->file) {
             VFS::get().close(v->file);
+        }
+        if (v->object) {
+            v->object->release();
         }
         delete v;
         v = next;
@@ -420,6 +426,8 @@ Process::Process(uint32_t pid, Process* sharedFrom, uint64_t stackSize)
 
 Process::~Process() {
     IPCManager::get().cleanupProcess(this);
+    // The compositor's scanout buffers must not stay on screen without it.
+    intel_gen9::IntelGen9Driver::get().displayProcessGone(pid);
 
     if (threadObject) {
         threadObject->completed = true;
@@ -719,6 +727,10 @@ bool vmaSplitAt(VmaRegion*& list, uint64_t addr) {
             tail->prot = r->prot;
             tail->file = r->file;
             tail->shared = r->shared;
+            tail->object = r->object;
+            if (tail->object) {
+                tail->object->retain();
+            }
             // The file window splits at `delta`: the tail starts that far in.
             tail->fileOffset = r->fileOffset + delta;
             tail->fileLength = (r->fileLength > delta) ? (r->fileLength - delta) : 0;
@@ -807,6 +819,32 @@ bool Process::mmapAddFileRegion(uint64_t start, uint64_t length, uint64_t prot,
     return true;
 }
 
+// A region whose pages the caller has mapped already (kSharedFrame) and
+// `object` owns; the region keeps a reference to it until it is dropped.
+bool Process::mmapAddObjectRegion(uint64_t start, uint64_t length, uint64_t prot, MappedObject* object) {
+    if (!sharedState || length == 0 || !object) {
+        return false;
+    }
+    mmapRemoveRange(start, length);
+    VmaRegion* node = new VmaRegion{};
+    if (!node) {
+        return false;
+    }
+    node->start = start;
+    node->end = start + length;
+    node->prot = prot;
+    node->shared = true;
+    node->object = object;
+    object->retain();
+    VmaRegion** link = &sharedState->vmaList;
+    while (*link && (*link)->start < start) {
+        link = &(*link)->next;
+    }
+    node->next = *link;
+    *link = node;
+    return true;
+}
+
 void Process::mmapRemoveRange(uint64_t start, uint64_t length) {
     if (!sharedState || length == 0) {
         return;
@@ -827,6 +865,9 @@ void Process::mmapRemoveRange(uint64_t start, uint64_t length) {
             // before the frames are unmapped, so no writeback is needed here.
             if (r->file) {
                 VFS::get().close(r->file);
+            }
+            if (r->object) {
+                r->object->release();
             }
             delete r;
         } else {
@@ -905,6 +946,11 @@ bool Process::handleDemandFault(uint64_t faultAddr) {
     if (VMM::VirtualToPhysicalIn(sharedState->pageTable, va)) {
         return true;
     }
+    // An object's region is mapped whole when it is made; a page missing
+    // there is a real fault, never a place for an anonymous frame.
+    if (region->object) {
+        return false;
+    }
 
     uint64_t phys = PMM::AllocFrame();
     if (!phys) {
@@ -977,9 +1023,13 @@ bool Process::mmapCloneRegionsFrom(const Process* parent) {
         copy->fileOffset = r->fileOffset;
         copy->fileLength = r->fileLength;
         copy->shared = r->shared;
+        copy->object = r->object;
         copy->next = nullptr;
         if (copy->file) {
             VFS::get().retain(copy->file);
+        }
+        if (copy->object) {
+            copy->object->retain();
         }
         *link = copy;
         link = &copy->next;
@@ -1189,6 +1239,9 @@ bool Process::terminateIfKilled() {
 }
 
 void Process::closeFilesOnExit() {
+    // The compositor's scanout buffers must not stay on screen once it is
+    // gone, reaped or not (also from ~Process).
+    intel_gen9::IntelGen9Driver::get().displayProcessGone(pid);
     // POSIX _exit semantics: drop this process's file descriptors at termination
     // so a lingering zombie no longer pins shared file descriptions (e.g. a pipe
     // write end). Without this, a peer blocked reading that pipe never sees EOF
@@ -1232,11 +1285,11 @@ uint64_t Process::allocateFDAt(int slot, FileDescriptor* fd, uint32_t rights, bo
                                                retainFileHandle, releaseFileHandle, closeOnExec);
 }
 
-void Process::cloneHandlesFrom(Process* source, bool skipCloseOnExec) {
+void Process::cloneHandlesFrom(Process* source, bool skipCloseOnExec, bool filesOnly) {
     if (!sharedState || !source || !source->sharedState) {
         return;
     }
-    sharedState->handleTable.cloneFrom(source->sharedState->handleTable, skipCloseOnExec);
+    sharedState->handleTable.cloneFrom(source->sharedState->handleTable, skipCloseOnExec, filesOnly);
 }
 
 FileDescriptor* Process::getFD(uint64_t fileHandle) {

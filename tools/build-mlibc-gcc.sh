@@ -7,7 +7,12 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export PATH="$ROOT/build/binutils-cross/bin:$PATH"
 
-export MLIBC_CROSS_FILE="$ROOT/tools/mlibc/instantos-x86_64-gcc.ini"
+# Meson cross files take absolute paths only: point the checked-in one's tool
+# paths at this checkout (it was written for a repo at /home/sky/projects).
+mkdir -p "$ROOT/build"
+sed "s#/home/sky/projects/InstantOS#$ROOT#g" "$ROOT/tools/mlibc/instantos-x86_64-gcc.ini" \
+  > "$ROOT/build/instantos-x86_64-gcc.ini"
+export MLIBC_CROSS_FILE="$ROOT/build/instantos-x86_64-gcc.ini"
 export MLIBC_BUILD_DIR="${MLIBC_BUILD_DIR:-$ROOT/build/mlibc-build-gcc}"
 export MLIBC_INSTALL_DIR="${MLIBC_INSTALL_DIR:-$ROOT/build/mlibc-root-gcc}"
 # GNU strip from binutils-cross (llvm-strip also works, but keep it all-GNU).

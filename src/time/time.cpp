@@ -13,8 +13,17 @@ uint64_t wall_offset_ns = 0;
 }
 
 bool time_init() {
+    uint32_t model = 0;
+    uint32_t microcode = 0;
     if (!cpu_has_tsc_deadline()) {
         Console::get().drawText("[TIME] CPU does not support TSC deadline mode; using PIT\n");
+        pit_enable_timer_mode();
+    } else if (tsc_deadline_has_errata(&model, &microcode)) {
+        Console::get().drawText("[TIME] TSC deadline timer unreliable on this CPU (model ");
+        Console::get().drawNumber(model);
+        Console::get().drawText(", microcode ");
+        Console::get().drawNumber(microcode);
+        Console::get().drawText("); using PIT\n");
         pit_enable_timer_mode();
     } else {
         tsc_frequency = detect_tsc_frequency();
@@ -33,7 +42,7 @@ bool time_init() {
             }
         }
     }
-    if (!cpu_has_tsc_deadline() || cycles_per_ms == 0 || cycles_per_us == 0) {
+    if (!time_tick_is_tsc_deadline()) {
         Console::get().drawText(tsc_enable_clocksource() ? "[TIME] PIT tick, TSC clock\n"
                                                          : "[TIME] PIT tick and clock\n");
     }

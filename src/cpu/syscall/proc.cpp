@@ -728,7 +728,10 @@ uint64_t Syscall::sys_spawn(uint64_t path, uint64_t argv, uint64_t envp) {
         newProc->setCpuAffinity(current->getCpuAffinity());
         // Inherit the parent's open file descriptors (stdin/stdout/stderr and
         // any others) so spawned programs share the controlling terminal.
-        newProc->cloneHandlesFrom(current, true);
+        // Only those: a new program cannot use the parent's windows, surfaces
+        // or service connections, and holding them would keep the parent's
+        // window on screen after it exits, for as long as the child runs.
+        newProc->cloneHandlesFrom(current, true, true);
     }
 
     Scheduler::get().addProcess(newProc);

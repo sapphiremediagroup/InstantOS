@@ -6,6 +6,7 @@ struct CPUFeatures {
     bool cpuidSupported;
     bool fpu;
     bool tsc;
+    bool pat;
     bool fxsave;
     bool nx;
     bool nxEnabled;

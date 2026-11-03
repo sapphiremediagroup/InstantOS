@@ -12,6 +12,7 @@ namespace {
 
 volatile uint32_t s_locked = 0;
 volatile uint32_t s_owner = 0;   // owning CPU index + 1; 0 while free
+volatile uint32_t s_ownerSite = 0;   // the owner's outermost entry site (watchdog)
 uint32_t s_depth = 0;            // nesting depth; only the owner touches it
 
 // Pause iterations before a wait is reported (same scale as Spinlock).
@@ -143,9 +144,18 @@ void unlock() {
 
 namespace KernelLock {
 
+uint32_t debugOwner() {
+    return __atomic_load_n(&s_owner, __ATOMIC_RELAXED);
+}
+
+uint32_t debugOwnerSite() {
+    return s_ownerSite;
+}
+
 // Bookkeeping once this CPU has taken the free lock (outermost entry).
 static void acquired(uint32_t me, uint32_t site, uint64_t spinStart, bool contended) {
     __atomic_store_n(&s_owner, me, __ATOMIC_RELAXED);
+    s_ownerSite = site;
     s_depth = 1;
 
 #ifdef KLOCK_PROFILE

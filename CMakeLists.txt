@@ -187,6 +187,34 @@ else()
     message(STATUS "bash/mlibc artifacts not found; skipping (run tools/build-mlibc.sh + tools/build-bash.sh)")
 endif()
 
+# The graphics compositor on mlibc and libc++ (step 8a,
+# tools/build-compositor-mlibc.sh, so it can link Mesa) whenever the mlibc
+# runtime and libc++ are built; the native one (ilibcxx) otherwise, or with
+# -DINSTANTOS_COMPOSITOR_MLIBC=OFF. Either is /bin/graphics-compositor.
+option(INSTANTOS_COMPOSITOR_MLIBC "Build the graphics compositor on mlibc when mlibc and libc++ are built" ON)
+set(INSTANTOS_COMPOSITOR_BINARY ${CMAKE_BINARY_DIR}/graphics-compositor)
+set(COMPOSITOR_MLIBC_DEPENDS "")
+if(INSTANTOS_COMPOSITOR_MLIBC AND EXISTS "${INSTANTOS_MLIBC_LIB_DIR}/libc.so" AND EXISTS "${INSTANTOS_MLIBC_LIB_DIR}/libc++.a")
+    set(_ilibcxx ${CMAKE_SOURCE_DIR}/outside/iUserApps/outside/ilibcxx)
+    set(_compositor ${CMAKE_SOURCE_DIR}/outside/iUserApps/graphics-compositor)
+    file(GLOB COMPOSITOR_MLIBC_SOURCES CONFIGURE_DEPENDS
+        ${_compositor}/src/*.cpp ${_compositor}/src/*.hpp ${_compositor}/mlibc/shim/*.hpp
+        ${_ilibcxx}/src/ui/*.cpp ${_ilibcxx}/include/ui/*.hpp ${_ilibcxx}/src/svg_renderer.cpp ${_ilibcxx}/src/syscall.cpp
+        ${_ilibcxx}/include/syscall.hpp ${_ilibcxx}/include/resizer.hpp ${_ilibcxx}/include/anti_aliasing.hpp
+        ${_ilibcxx}/include/service_protocol.hpp ${_ilibcxx}/include/svg_renderer.hpp ${_ilibcxx}/include/time.hpp)
+    set(INSTANTOS_COMPOSITOR_BINARY ${CMAKE_BINARY_DIR}/compositor-mlibc/graphics-compositor)
+    add_custom_command(
+        OUTPUT ${INSTANTOS_COMPOSITOR_BINARY}
+        COMMAND ${CMAKE_COMMAND} -E env MLIBC_ROOT=${CMAKE_BINARY_DIR}/mlibc-root
+                COMPOSITOR_MLIBC_OUT=${CMAKE_BINARY_DIR}/compositor-mlibc
+                bash ${CMAKE_SOURCE_DIR}/tools/build-compositor-mlibc.sh
+        DEPENDS ${COMPOSITOR_MLIBC_SOURCES} ${CMAKE_SOURCE_DIR}/tools/build-compositor-mlibc.sh
+                ${INSTANTOS_MLIBC_LIB_DIR}/libc.so ${INSTANTOS_MLIBC_LIB_DIR}/libc++.a
+        COMMENT "Building the graphics compositor on mlibc"
+        VERBATIM)
+    list(APPEND COMPOSITOR_MLIBC_DEPENDS ${INSTANTOS_COMPOSITOR_BINARY})
+endif()
+
 # Network tools (ping, nslookup/host, netcfg, sntp, dmesg) are mlibc programs, built here
 # whenever the mlibc runtime is; curl comes from tools/build-curl.sh and is
 # bundled when present.
@@ -200,7 +228,7 @@ if(EXISTS "${INSTANTOS_MLIBC_LIB_DIR}/libc.so" AND EXISTS "${INSTANTOS_MLIBC_LIB
     set(NET_TOOLS_LDFLAGS --target=x86_64-unknown-elf -pie -nostdlib -fuse-ld=lld
         -L${INSTANTOS_MLIBC_LIB_DIR} -Wl,--dynamic-linker,/lib/mlibc/ld-instantos.so -Wl,-rpath,/lib/mlibc
         ${INSTANTOS_MLIBC_LIB_DIR}/crt1.o)
-    foreach(tool ping nslookup netcfg sntp dmesg)
+    foreach(tool ping nslookup netcfg sntp dmesg unix-test)
         add_custom_command(
             OUTPUT ${NET_TOOLS_DIR}/${tool}
             COMMAND ${CMAKE_COMMAND} -E make_directory ${NET_TOOLS_DIR}
@@ -217,6 +245,28 @@ if(EXISTS "${INSTANTOS_MLIBC_LIB_DIR}/libc.so" AND EXISTS "${INSTANTOS_MLIBC_LIB
     if(EXISTS "${CMAKE_BINARY_DIR}/curl/curl")
         list(APPEND NET_TOOLS_INITRD_ENTRIES bin/curl:${CMAKE_BINARY_DIR}/curl/curl)
         list(APPEND NET_TOOLS_DEPENDS ${CMAKE_BINARY_DIR}/curl/curl)
+    endif()
+    # libdrm's probe of the render node (tools/build-libdrm.sh) and the C++
+    # runtime's smoke test (tools/build-libcxx.sh).
+    foreach(port_tool drm-probe cxx-smoke)
+        if(EXISTS "${CMAKE_BINARY_DIR}/${port_tool}/${port_tool}")
+            list(APPEND NET_TOOLS_INITRD_ENTRIES bin/${port_tool}:${CMAKE_BINARY_DIR}/${port_tool}/${port_tool})
+            list(APPEND NET_TOOLS_DEPENDS ${CMAKE_BINARY_DIR}/${port_tool}/${port_tool})
+        endif()
+    endforeach()
+    # Mesa (tools/build-mesa.sh): its libraries in /lib/mlibc, where it
+    # looks for them, and the off-screen GL and Vulkan tests.
+    set(MESA_RUNTIME_DIR ${CMAKE_BINARY_DIR}/mesa-root/initrd)
+    if(EXISTS "${MESA_RUNTIME_DIR}/gl-offscreen")
+        file(GLOB MESA_RUNTIME_LIBS RELATIVE ${MESA_RUNTIME_DIR} ${MESA_RUNTIME_DIR}/lib*.so*)
+        foreach(mesa_lib ${MESA_RUNTIME_LIBS})
+            list(APPEND NET_TOOLS_INITRD_ENTRIES lib/mlibc/${mesa_lib}:${MESA_RUNTIME_DIR}/${mesa_lib})
+            list(APPEND NET_TOOLS_DEPENDS ${MESA_RUNTIME_DIR}/${mesa_lib})
+        endforeach()
+        foreach(mesa_test gl-offscreen vk-offscreen gl-window vk-window)
+            list(APPEND NET_TOOLS_INITRD_ENTRIES bin/${mesa_test}:${MESA_RUNTIME_DIR}/${mesa_test})
+            list(APPEND NET_TOOLS_DEPENDS ${MESA_RUNTIME_DIR}/${mesa_test})
+        endforeach()
     endif()
     # The runtime, unless bash already brings it.
     if(NOT BASH_INITRD_ENTRIES)
@@ -308,20 +358,32 @@ else()
     message(STATUS "CA bundle not found; https:// will fail cert validation (run tools/fetch-cacert.sh)")
 endif()
 
+# The line icons base programs share (CLAUDE.md "Base program style"):
+# white 24-unit SVGs that apps tint, in /bin/icons.
+file(GLOB INSTANTOS_ICON_FILES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/assets/icons/*.svg)
+set(ICON_INITRD_ENTRIES)
+foreach(icon ${INSTANTOS_ICON_FILES})
+    get_filename_component(icon_name ${icon} NAME)
+    list(APPEND ICON_INITRD_ENTRIES "bin/icons/${icon_name}:${icon}")
+endforeach()
+
 # Every initrd entry. Also written to build/initrd-entries.txt, one per line,
 # so test images (tools/run-netsurf-suite.sh) can start from the real system.
 set(INSTANTOS_INITRD_ENTRIES
         bin/input-manager:${CMAKE_BINARY_DIR}/input-manager
         bin/cube:${CMAKE_BINARY_DIR}/cube
         bin/ui-demo:${CMAKE_BINARY_DIR}/ui-demo
-        bin/graphics-compositor:${CMAKE_BINARY_DIR}/graphics-compositor
+        bin/graphics-compositor:${INSTANTOS_COMPOSITOR_BINARY}
         bin/storage-manager:${CMAKE_BINARY_DIR}/storage-manager
+        bin/log-saver:${CMAKE_BINARY_DIR}/log-saver
+        bin/gpu-test:${CMAKE_BINARY_DIR}/gpu-test
+        bin/reboot:${CMAKE_BINARY_DIR}/reboot
+        bin/poweroff:${CMAKE_BINARY_DIR}/reboot
         bin/process-manager:${CMAKE_BINARY_DIR}/process-manager
         bin/network-manager:${CMAKE_BINARY_DIR}/network-manager
         bin/font-manager:${CMAKE_BINARY_DIR}/font-manager
         bin/session-manager:${CMAKE_BINARY_DIR}/session-manager
         bin/login:${CMAKE_BINARY_DIR}/login
-        bin/desktop-shell:${CMAKE_BINARY_DIR}/desktop-shell
         bin/background-switcher:${CMAKE_BINARY_DIR}/background-switcher
         bin/file-browser:${CMAKE_BINARY_DIR}/file-browser
         bin/terminal:${CMAKE_BINARY_DIR}/terminal
@@ -332,15 +394,11 @@ set(INSTANTOS_INITRD_ENTRIES
         bin/StackSansNotch-SemiBold.ttf:${CMAKE_SOURCE_DIR}/assets/fonts/StackSansNotch-SemiBold.ttf
         bin/StackSansNotch-Regular.ttf:${CMAKE_SOURCE_DIR}/assets/fonts/StackSansNotch-Regular.ttf
         bin/StackSansNotch-ExtraLight.ttf:${CMAKE_SOURCE_DIR}/assets/fonts/StackSansNotch-ExtraLight.ttf
+        bin/StackSansText-Regular.ttf:${CMAKE_SOURCE_DIR}/assets/fonts/StackSansText-Regular.ttf
+        bin/StackSansText-Medium.ttf:${CMAKE_SOURCE_DIR}/assets/fonts/StackSansText-Medium.ttf
+        bin/StackSansText-SemiBold.ttf:${CMAKE_SOURCE_DIR}/assets/fonts/StackSansText-SemiBold.ttf
         bin/cursors/default.png:${CMAKE_SOURCE_DIR}/assets/cursors/default.png
         bin/images/InstantOS_sapph.png:${CMAKE_SOURCE_DIR}/assets/images/InstantOS_sapph.png
-        bin/images/no_itnernet.png:${CMAKE_SOURCE_DIR}/assets/images/no_itnernet.png
-        bin/images/no_sound.png:${CMAKE_SOURCE_DIR}/assets/images/no_sound.png
-        bin/images/close.png:${CMAKE_SOURCE_DIR}/assets/images/close.png
-        bin/images/minimize.png:${CMAKE_SOURCE_DIR}/assets/images/minimize.png
-        bin/images/resize.png:${CMAKE_SOURCE_DIR}/assets/images/resize.png
-        bin/images/folder.svg:${CMAKE_SOURCE_DIR}/assets/images/folder.svg
-        bin/images/file.svg:${CMAKE_SOURCE_DIR}/assets/images/file.svg
         bin/backgrounds/instantos_1.png:${CMAKE_SOURCE_DIR}/assets/backgrounds/instantos_1.png
         bin/backgrounds/instantos_1_mono.png:${CMAKE_SOURCE_DIR}/assets/backgrounds/instantos_1_mono.png
         bin/backgrounds/instantos_2.png:${CMAKE_SOURCE_DIR}/assets/backgrounds/instantos_2.png
@@ -354,6 +412,7 @@ set(INSTANTOS_INITRD_ENTRIES
         ${BASH_INITRD_ENTRIES}
         ${NET_TOOLS_INITRD_ENTRIES}
         ${NETSURF_INITRD_ENTRIES}
+        ${ICON_INITRD_ENTRIES}
 )
 string(REPLACE ";" "\n" INSTANTOS_INITRD_ENTRY_LINES "${INSTANTOS_INITRD_ENTRIES}")
 file(WRITE "${CMAKE_BINARY_DIR}/initrd-entries.txt" "${INSTANTOS_INITRD_ENTRY_LINES}\n")
@@ -363,12 +422,12 @@ add_custom_command(
     COMMAND ${MKINITRD_EXE}
         ${INITRD_IMG}
         ${INSTANTOS_INITRD_ENTRIES}
-    DEPENDS mkInitrd_proj INSTANTOS.EFI cube ui-demo input-manager graphics-compositor storage-manager process-manager network-manager font-manager session-manager login desktop-shell background-switcher file-browser terminal net-smoke ld-instantos ilibcxx ${TCC_INITRD_DEPENDS} ${CMAKE_SOURCE_DIR}/assets/fonts/JetBrainsMono-Regular.ttf ${CMAKE_SOURCE_DIR}/assets/fonts/StackSansNotch-Bold.ttf ${CMAKE_SOURCE_DIR}/assets/fonts/StackSansNotch-SemiBold.ttf ${CMAKE_SOURCE_DIR}/assets/fonts/StackSansNotch-Regular.ttf ${CMAKE_SOURCE_DIR}/assets/fonts/StackSansNotch-ExtraLight.ttf ${CMAKE_SOURCE_DIR}/assets/cursors/default.png ${CMAKE_SOURCE_DIR}/assets/images/InstantOS_sapph.png ${CMAKE_SOURCE_DIR}/assets/images/no_itnernet.png ${CMAKE_SOURCE_DIR}/assets/images/no_sound.png ${CMAKE_SOURCE_DIR}/assets/images/close.png ${CMAKE_SOURCE_DIR}/assets/images/minimize.png ${CMAKE_SOURCE_DIR}/assets/images/resize.png ${CMAKE_SOURCE_DIR}/assets/images/folder.svg ${CMAKE_SOURCE_DIR}/assets/images/file.svg ${CMAKE_SOURCE_DIR}/assets/backgrounds/instantos_1.png ${CMAKE_SOURCE_DIR}/assets/backgrounds/instantos_1_mono.png ${CMAKE_SOURCE_DIR}/assets/backgrounds/instantos_2.png ${CMAKE_SOURCE_DIR}/assets/backgrounds/instantos_2_mono.png ${CMAKE_SOURCE_DIR}/assets/backgrounds/instantos_3_color.png ${CMAKE_SOURCE_DIR}/assets/backgrounds/instantos_3_mono.png ${BASH_INITRD_DEPENDS} ${NET_TOOLS_DEPENDS} ${NETSURF_INITRD_DEPENDS}
+    DEPENDS mkInitrd_proj INSTANTOS.EFI cube ui-demo input-manager graphics-compositor storage-manager log-saver gpu-test reboot process-manager network-manager font-manager session-manager login background-switcher file-browser terminal net-smoke ld-instantos ilibcxx ${TCC_INITRD_DEPENDS} ${CMAKE_SOURCE_DIR}/assets/fonts/JetBrainsMono-Regular.ttf ${CMAKE_SOURCE_DIR}/assets/fonts/StackSansNotch-Bold.ttf ${CMAKE_SOURCE_DIR}/assets/fonts/StackSansNotch-SemiBold.ttf ${CMAKE_SOURCE_DIR}/assets/fonts/StackSansNotch-Regular.ttf ${CMAKE_SOURCE_DIR}/assets/fonts/StackSansNotch-ExtraLight.ttf ${CMAKE_SOURCE_DIR}/assets/fonts/StackSansText-Regular.ttf ${CMAKE_SOURCE_DIR}/assets/fonts/StackSansText-Medium.ttf ${CMAKE_SOURCE_DIR}/assets/fonts/StackSansText-SemiBold.ttf ${CMAKE_SOURCE_DIR}/assets/cursors/default.png ${CMAKE_SOURCE_DIR}/assets/images/InstantOS_sapph.png ${CMAKE_SOURCE_DIR}/assets/backgrounds/instantos_1.png ${CMAKE_SOURCE_DIR}/assets/backgrounds/instantos_1_mono.png ${CMAKE_SOURCE_DIR}/assets/backgrounds/instantos_2.png ${CMAKE_SOURCE_DIR}/assets/backgrounds/instantos_2_mono.png ${CMAKE_SOURCE_DIR}/assets/backgrounds/instantos_3_color.png ${CMAKE_SOURCE_DIR}/assets/backgrounds/instantos_3_mono.png ${BASH_INITRD_DEPENDS} ${NET_TOOLS_DEPENDS} ${NETSURF_INITRD_DEPENDS} ${INSTANTOS_ICON_FILES} ${COMPOSITOR_MLIBC_DEPENDS}
     VERBATIM
 )
 
 add_custom_target(make_initrd ALL DEPENDS ${INITRD_IMG})
-add_dependencies(make_initrd INSTANTOS.EFI input-manager graphics-compositor storage-manager process-manager network-manager font-manager session-manager login desktop-shell background-switcher file-browser terminal cube ui-demo net-smoke ld-instantos ilibcxx)
+add_dependencies(make_initrd INSTANTOS.EFI input-manager graphics-compositor storage-manager log-saver gpu-test reboot process-manager network-manager font-manager session-manager login background-switcher file-browser terminal cube ui-demo net-smoke ld-instantos ilibcxx)
 
 add_subdirectory(outside/iboot)
 
@@ -437,7 +496,7 @@ add_custom_target(copy ALL
 add_custom_command(
     OUTPUT ${EFI_IMG}
     COMMAND ${CMAKE_COMMAND} -E make_directory "${ISO_EFI_DIR}"
-    COMMAND dd if=/dev/zero of=${EFI_IMG} bs=1M count=48
+    COMMAND dd if=/dev/zero of=${EFI_IMG} bs=1M count=128
 
     COMMAND mformat -i ${EFI_IMG} ::
 

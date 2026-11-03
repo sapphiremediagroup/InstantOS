@@ -538,6 +538,23 @@ uint64_t VMM::VirtualToPhysicalIn(PageTable* pml4, uint64_t virtualAddr) {
     return (pte & ADDR_MASK) | (virtualAddr & 0xFFF);
 }
 
+// The 4 KiB leaf entry mapping `virtualAddr` (flags included), or 0 when
+// none is present or a large page maps it.
+uint64_t VMM::LeafEntryIn(PageTable* pml4, uint64_t virtualAddr) {
+    if (!pml4) return 0;
+    uint64_t pml4e = pml4->entries[PML4Index(virtualAddr)];
+    if (!(pml4e & Present)) return 0;
+    auto* pdpt = reinterpret_cast<PageTable*>(pml4e & ADDR_MASK);
+    uint64_t pdpte = pdpt->entries[PDPTIndex(virtualAddr)];
+    if (!(pdpte & Present) || (pdpte & LargePage)) return 0;
+    auto* pd = reinterpret_cast<PageTable*>(pdpte & ADDR_MASK);
+    uint64_t pde = pd->entries[PDIndex(virtualAddr)];
+    if (!(pde & Present) || (pde & LargePage)) return 0;
+    auto* pt = reinterpret_cast<PageTable*>(pde & ADDR_MASK);
+    uint64_t pte = pt->entries[PTIndex(virtualAddr)];
+    return (pte & Present) ? pte : 0;
+}
+
 void VMM::MapRange(uint64_t virtualBase, uint64_t physBase,
                    uint64_t pageCount, uint64_t flags) {
     for (uint64_t i = 0; i < pageCount; i++)

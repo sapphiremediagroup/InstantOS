@@ -265,6 +265,19 @@ void printFeatureStatus(const char* label, bool supported, bool enabled) {
     }
     Console::get().setTextColor(0xFFFFFF);
 }
+
+// PAT entry 5 (PAT bit + PWT in a 4 KiB PTE) becomes write-combining
+// (WriteCombine in vmm.hpp); the reset value there is write-through, which no
+// mapping uses. Every CPU must hold the same table.
+void programPat() {
+    constexpr uint32_t kMsrPat = 0x277;
+    constexpr uint64_t kPatWriteCombining = 0x01;
+    constexpr int kWcEntry = 5;
+    uint64_t pat = rdmsr(kMsrPat);
+    pat &= ~(0xFFULL << (kWcEntry * 8));
+    pat |= kPatWriteCombining << (kWcEntry * 8);
+    wrmsr(kMsrPat, pat);
+}
 }
 
 bool CPU::initialize() {
@@ -296,6 +309,7 @@ bool CPU::initialize() {
     if (maxBasicLeaf >= 1 && __get_cpuid(1, &eax, &ebx, &ecx, &edx)) {
         features.fpu = (edx & bit_FPU) != 0;
         features.tsc = (edx & bit_TSC) != 0;
+        features.pat = (edx & (1u << 16)) != 0;
         features.fxsave = (edx & bit_FXSR) != 0;
         features.mmx = (edx & bit_MMX) != 0;
         features.sse = (edx & bit_SSE) != 0;
@@ -418,6 +432,9 @@ bool CPU::initialize() {
         enableSmep();
         features.smepEnabled = true;
     }
+    if (features.pat) {
+        programPat();
+    }
 
     initialized = true;
 
@@ -489,6 +506,9 @@ bool CPU::initializeSecondary() {
         return false;
     }
 
+    if (features.pat) {
+        programPat();
+    }
     enableBaseFPUAndSIMD(features);
     if (features.nxEnabled) {
         enableNoExecute();

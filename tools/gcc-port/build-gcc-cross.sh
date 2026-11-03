@@ -9,7 +9,7 @@
 #   RECONFIGURE=1           force reconfigure
 set -euo pipefail
 
-REPO="/home/sky/projects/InstantOS"
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BUILD_DIR="$REPO/build"
 NATIVE="/home/sky/gcc-port"
 SRC="$NATIVE/gcc-13.3.0"
@@ -86,6 +86,12 @@ fi
 PATH="$BX:$PATH" make -C "$OBJ" -j"$JOBS" all-gcc
 PATH="$BX:$PATH" make -C "$OBJ" -j"$JOBS" all-target-libgcc
 PATH="$BX:$PATH" make -C "$OBJ" install-gcc install-target-libgcc
+# C++: the target runtime (libstdc++.so.6, libsupc++.a) against mlibc. Needs
+# the cross gcc/libgcc installed above.
+case ",$LANGS," in *,c++,*)
+  PATH="$PREFIX/bin:$BX:$PATH" make -C "$OBJ" -j"$JOBS" all-target-libstdc++-v3
+  PATH="$PREFIX/bin:$BX:$PATH" make -C "$OBJ" install-target-libstdc++-v3 ;;
+esac
 
 echo "gcc-cross installed to $PREFIX"
 ls "$PREFIX/bin"

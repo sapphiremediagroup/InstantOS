@@ -556,6 +556,14 @@ void Console::writeCharUnlocked(char c) {
     handleAnsiChar(c);
 }
 
+void Console::drawRawUnlocked(const char* str) {
+    if (!str || !framebuffer) return;
+    while (*str) {
+        handleAnsiChar(*str);
+        str++;
+    }
+}
+
 void Console::drawTextUnlocked(const char* str) {
     
     if (!str) return;

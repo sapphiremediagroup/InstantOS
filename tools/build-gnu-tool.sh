@@ -52,6 +52,9 @@ rm -rf "$OBJ_DIR"; mkdir -p "$OBJ_DIR"; cd "$OBJ_DIR"
 # gnulib/autoconf answers for the InstantOS+mlibc runtime (superset).
 cat > config.cache <<'EOF'
 ac_cv_func_malloc_0_nonnull=yes
+# iconv.h in the sysroot is NetSurf's shim (its library links into NetSurf only).
+am_cv_func_iconv=no
+am_cv_lib_iconv=no
 ac_cv_func_realloc_0_nonnull=yes
 gl_cv_func_malloc_0_nonnull=1
 ac_cv_func_working_mktime=yes

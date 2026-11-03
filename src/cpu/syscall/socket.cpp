@@ -1,6 +1,7 @@
 #include <cpu/syscall/syscall.hpp>
 #include <cpu/process/scheduler.hpp>
 #include <cpu/syscall/tcp_internal.hpp>
+#include <cpu/syscall/unix_socket.hpp>
 #include <cpu/cereal/cereal.hpp>
 #include <common/string.hpp>
 #include <common/krandom.hpp>
@@ -365,7 +366,7 @@ SocketObject* resolveSocket(Process* process, uint64_t handle, uint32_t rights, 
         }
         return nullptr;
     }
-    if (entry->type != HandleType::Socket) {
+    if (entry->type != HandleType::Socket || unixsock::isUnixEntry(entry)) {
         if (error) {
             *error = syscall_error(SysErrNotSocket);
         }
@@ -855,6 +856,9 @@ int16_t pollSocketHandle(void* object, uint32_t rights, int16_t events) {
 }
 
 uint64_t Syscall::sys_socket(uint64_t domain, uint64_t type, uint64_t protocol) {
+    if (domain == unixsock::kAfUnix) {
+        return unixsock::create(static_cast<int>(type), static_cast<int>(protocol));
+    }
     if (domain != kAfInet) {
         return syscall_error(SysErrAddressFamilyNotSupported);
     }
@@ -900,6 +904,7 @@ uint64_t Syscall::sys_socket(uint64_t domain, uint64_t type, uint64_t protocol) 
 }
 
 uint64_t Syscall::sys_bind(uint64_t socketHandle, uint64_t address, uint64_t addressLength) {
+    if (auto* u = unixsock::fromHandle(socketHandle)) return unixsock::bind(u, address, addressLength);
     uint64_t error = 0;
     SocketObject* socket = resolveSocket(
         Scheduler::get().getCurrentProcess(),
@@ -935,6 +940,7 @@ uint64_t Syscall::sys_bind(uint64_t socketHandle, uint64_t address, uint64_t add
 }
 
 uint64_t Syscall::sys_connect(uint64_t socketHandle, uint64_t address, uint64_t addressLength) {
+    if (auto* u = unixsock::fromHandle(socketHandle)) return unixsock::connect(u, address, addressLength);
     uint64_t error = 0;
     SocketObject* socket = resolveSocket(
         Scheduler::get().getCurrentProcess(),
@@ -1062,6 +1068,7 @@ uint64_t Syscall::sys_connect(uint64_t socketHandle, uint64_t address, uint64_t 
 }
 
 uint64_t Syscall::sys_listen(uint64_t socketHandle, uint64_t backlog) {
+    if (auto* u = unixsock::fromHandle(socketHandle)) return unixsock::listen(u, backlog);
     uint64_t error = 0;
     SocketObject* socket = resolveSocket(
         Scheduler::get().getCurrentProcess(),
@@ -1081,6 +1088,7 @@ uint64_t Syscall::sys_listen(uint64_t socketHandle, uint64_t backlog) {
 }
 
 uint64_t Syscall::sys_accept(uint64_t socketHandle, uint64_t address, uint64_t addressLength) {
+    if (auto* u = unixsock::fromHandle(socketHandle)) return unixsock::accept(u, address, addressLength);
     uint64_t error = 0;
     SocketObject* socket = resolveSocket(
         Scheduler::get().getCurrentProcess(),
@@ -1148,6 +1156,7 @@ uint64_t Syscall::sys_accept(uint64_t socketHandle, uint64_t address, uint64_t a
 }
 
 uint64_t Syscall::sys_send(uint64_t socketHandle, uint64_t buffer, uint64_t length, uint64_t flags) {
+    if (auto* u = unixsock::fromHandle(socketHandle)) return unixsock::send(u, buffer, length, flags);
     uint64_t error = 0;
     SocketObject* socket = resolveSocket(
         Scheduler::get().getCurrentProcess(),
@@ -1245,6 +1254,7 @@ uint64_t Syscall::sys_send(uint64_t socketHandle, uint64_t buffer, uint64_t leng
 
 uint64_t Syscall::sys_sendto(uint64_t socketHandle, uint64_t buffer, uint64_t length, uint64_t flags,
                              uint64_t address) {
+    if (auto* u = unixsock::fromHandle(socketHandle)) return unixsock::send(u, buffer, length, flags);   // connected only
     if (address == 0) {
         return sys_send(socketHandle, buffer, length, flags);
     }
@@ -2379,6 +2389,7 @@ uint64_t Syscall::sys_recv(uint64_t socketHandle, uint64_t buffer, uint64_t leng
 // at `addressOut` unless it is 0.
 uint64_t Syscall::sys_recvfrom(uint64_t socketHandle, uint64_t buffer, uint64_t length, uint64_t flags,
                                uint64_t addressOut) {
+    if (auto* u = unixsock::fromHandle(socketHandle)) return unixsock::recv(u, buffer, length, flags);
     uint64_t error = 0;
     SocketObject* socket = resolveSocket(
         Scheduler::get().getCurrentProcess(),
@@ -2491,6 +2502,7 @@ uint64_t Syscall::sys_recvfrom(uint64_t socketHandle, uint64_t buffer, uint64_t 
 }
 
 uint64_t Syscall::sys_shutdown(uint64_t socketHandle, uint64_t how) {
+    if (auto* u = unixsock::fromHandle(socketHandle)) return unixsock::shutdown(u, how);
     uint64_t error = 0;
     SocketObject* socket = resolveSocket(
         Scheduler::get().getCurrentProcess(),
@@ -2527,6 +2539,7 @@ uint64_t Syscall::sys_getsockopt(
     uint64_t optionValue,
     uint64_t optionLength
 ) {
+    if (auto* u = unixsock::fromHandle(socketHandle)) return unixsock::getsockopt(u, level, optionName, optionValue, optionLength);
     if (optionValue == 0 || optionLength == 0) {
         return syscall_error(SysErrInvalid);
     }
@@ -2624,6 +2637,7 @@ uint64_t Syscall::sys_setsockopt(
     uint64_t optionValue,
     uint64_t optionLength
 ) {
+    if (auto* u = unixsock::fromHandle(socketHandle)) return unixsock::setsockopt(u, level, optionName, optionValue, optionLength);
     if (optionValue == 0) {
         return syscall_error(SysErrInvalid);
     }
@@ -2761,6 +2775,7 @@ static uint64_t copySocketNameToUser(
 }
 
 uint64_t Syscall::sys_getsockname(uint64_t socketHandle, uint64_t addrPtr, uint64_t addrLenPtr) {
+    if (auto* u = unixsock::fromHandle(socketHandle)) return unixsock::getsockname(u, addrPtr, addrLenPtr);
     uint64_t error = 0;
     SocketObject* socket = resolveSocket(
         Scheduler::get().getCurrentProcess(),
@@ -2786,6 +2801,7 @@ uint64_t Syscall::sys_getsockname(uint64_t socketHandle, uint64_t addrPtr, uint6
 }
 
 uint64_t Syscall::sys_getpeername(uint64_t socketHandle, uint64_t addrPtr, uint64_t addrLenPtr) {
+    if (auto* u = unixsock::fromHandle(socketHandle)) return unixsock::getpeername(u, addrPtr, addrLenPtr);
     uint64_t error = 0;
     SocketObject* socket = resolveSocket(
         Scheduler::get().getCurrentProcess(),
@@ -2802,4 +2818,25 @@ uint64_t Syscall::sys_getpeername(uint64_t socketHandle, uint64_t addrPtr, uint6
     }
     return copySocketNameToUser(
         socket->peerAddress, socket->peerAddressLength, addrPtr, addrLenPtr);
+}
+
+uint64_t Syscall::sys_socketpair(uint64_t domain, uint64_t type, uint64_t protocol, uint64_t handlesOut) {
+    if (domain != unixsock::kAfUnix) {
+        return syscall_error(domain == kAfInet ? SysErrOperationNotSupported : SysErrAddressFamilyNotSupported);
+    }
+    return unixsock::socketPair(static_cast<int>(type), static_cast<int>(protocol), handlesOut);
+}
+
+uint64_t Syscall::sys_socket_sendmsg(uint64_t socketHandle, uint64_t message, uint64_t flags) {
+    if (auto* u = unixsock::fromHandle(socketHandle)) {
+        return unixsock::sendMsg(u, message, flags);
+    }
+    return syscall_error(SysErrOperationNotSupported);   // mlibc then uses Send/SendTo
+}
+
+uint64_t Syscall::sys_socket_recvmsg(uint64_t socketHandle, uint64_t message, uint64_t flags) {
+    if (auto* u = unixsock::fromHandle(socketHandle)) {
+        return unixsock::recvMsg(u, message, flags);
+    }
+    return syscall_error(SysErrOperationNotSupported);
 }

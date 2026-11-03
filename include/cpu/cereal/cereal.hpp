@@ -18,6 +18,12 @@ public:
     // KernelLog (dmesg) reads it back. Copies the newest bytes, oldest first,
     // up to `capacity`; returns how many.
     size_t copyLog(char* out, size_t capacity);
+    // Bytes ever written: a position to copy from later with copyLogSince
+    // (what one operation logged).
+    uint64_t logPosition();
+    // The bytes written since `position` that the ring still holds (oldest
+    // first), up to `capacity`; returns how many.
+    size_t copyLogSince(uint64_t position, char* out, size_t capacity);
 
 private:
     Cereal() : initialized(false), lockFlag(0) {}

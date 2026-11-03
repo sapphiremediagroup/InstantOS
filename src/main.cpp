@@ -44,6 +44,7 @@
 #include <graphics/virtio_gpu.hpp>
 #include <graphics/venus.hpp>
 #include <graphics/intel_gen9.hpp>
+#include <graphics/intel_gen9_drm.hpp>
 unsigned long long runtimeBase;
 
 namespace {
@@ -1011,41 +1012,60 @@ extern "C" void InstantOS(BootInfo* bootInfo) {
 
     SATABlockDevice* device = nullptr;
     FAT32FS* fs = nullptr;
+    bool instantOSDisk = false;   // "/" is an InstantOS data partition on a real disk
     KernelStorage::reset();
     Console::get().drawText("\033[2Jdetecting ahci\n");
     auto controller = AHCIDetector::detectAndInitialize();
     if (controller) {
-        auto port = controller->getPort(0);
-        if (port && port->isActive()) {
-            static SATABlockDevice _device(port);
-            device = &_device;
-            KernelStorage::setDevice("ahci0", device, device->getSize(), 512, true, true);
-
+        // The disk to mount from. A GPT disk is a real computer's disk, shared
+        // with other systems: only an "InstantOS data" partition on it is ever
+        // mounted (gptFindInstantOSPartition), and such a partition wins over
+        // anything else. A disk without GPT (the test images: MBR-partitioned or
+        // a bare ext4 volume) is used as before when no such partition exists.
+        BlockDevice* fsDevice = nullptr;
+        bool wholeDisk = false;
+        bool foundInstantOS = false;
+        int chosenPort = -1;
+        for (int index = 0; index < controller->getPortCount() && !foundInstantOS; ++index) {
+            AHCIPort* candidatePort = controller->getPort(index);
+            if (!candidatePort || !candidatePort->isActive()) {
+                continue;
+            }
+            SATABlockDevice* disk = new SATABlockDevice(candidatePort);
             uint64_t partStart = 0;
             uint64_t partLength = 0;
             uint8_t partType = 0;
-            bool gptLinux = false;
-
-            // Choose the root filesystem device. UEFI disks are GPT, so try GPT
-            // first (preferring a Linux-typed partition, i.e. the ext4 root);
-            // then a legacy MBR partition (FAT or Linux/ext*); finally accept an
-            // unpartitioned ("superfloppy") ext4 volume spanning the whole disk.
-            BlockDevice* fsDevice = nullptr;
-            bool wholeDisk = false;
-            if (gptFindPartition(device, &partStart, &partLength, &gptLinux)) {
-                static PartitionBlockDevice _gptPartition(device, partStart, partLength);
-                fsDevice = &_gptPartition;
-                Console::get().drawText("[GPT] partition lbaStart=");
-                Console::get().drawNumber((int64_t)(partStart / 512));
-                Console::get().drawText(gptLinux ? " type=Linux\n" : " type=other\n");
-            } else if (mbrFindPartition(device, &partStart, &partLength, &partType)) {
-                static PartitionBlockDevice _partition(device, partStart, partLength);
-                fsDevice = &_partition;
-            } else if (Ext4FS::probe(device)) {
-                fsDevice = device;
+            const GptSearch search = gptFindInstantOSPartition(disk, &partStart, &partLength);
+            if (search == GptSearch::Found) {
+                fsDevice = new PartitionBlockDevice(disk, partStart, partLength);
+                wholeDisk = false;
+                foundInstantOS = true;
+            } else if (search == GptSearch::NotInstantOS) {
+                Console::get().drawText("[storage] a GPT disk without an InstantOS partition: not mounted\n");
+                continue;
+            } else if (fsDevice) {
+                continue;   // a test image was already taken
+            } else if (mbrFindPartition(disk, &partStart, &partLength, &partType)) {
+                fsDevice = new PartitionBlockDevice(disk, partStart, partLength);
+                wholeDisk = false;
+            } else if (Ext4FS::probe(disk)) {
+                fsDevice = disk;
                 wholeDisk = true;
+            } else {
+                continue;
             }
-
+            device = disk;
+            chosenPort = index;
+        }
+        instantOSDisk = foundInstantOS;
+        if (device) {
+            KernelStorage::setDevice("ahci0", device, device->getSize(), 512, true, true);
+            Console::get().drawText(foundInstantOS ? "[storage] InstantOS partition on port "
+                                                   : "[storage] disk image on port ");
+            Console::get().drawNumber(chosenPort);
+            Console::get().drawText("\n");
+        }
+        {
             if (fsDevice && Ext4FS::probe(fsDevice)) {
                 static Ext4FS _ext4(fsDevice);
                 int mountResult = VFS::get().mount(&_ext4, "/");
@@ -1071,20 +1091,10 @@ extern "C" void InstantOS(BootInfo* bootInfo) {
                     Console::get().drawText(" ]\n");
                 }
             } else {
+                // No disk to use: run from the initrd alone ("/" lists the mounts).
                 KernelStorage::setMount("/", "fat32", -1);
-                Console::get().drawText("Partition table: [ ");
-                Console::get().setTextColor(0xFF0000);
-                Console::get().drawText("FAIL");
-                Console::get().setTextColor(0xFFFFFF);
-                Console::get().drawText(" ]\n");
+                Console::get().drawText("[storage] nothing to mount\n");
             }
-        } else {
-            KernelStorage::setMount("/", "fat32", -1);
-            Console::get().drawText("AHCI Port: [ ");
-            Console::get().setTextColor(0xFF0000);
-            Console::get().drawText("FAIL");
-            Console::get().setTextColor(0xFFFFFF);
-            Console::get().drawText(" ]\n");
         }
     } else {
         KernelStorage::setMount("/", "fat32", -1);
@@ -1275,6 +1285,13 @@ extern "C" void InstantOS(BootInfo* bootInfo) {
             Console::get().setTextColor(0xFFFFFF);
             Console::get().drawText(" ]\n");
 
+            // /sys: as much of Linux's sysfs as libdrm reads to identify the
+            // GPU's render node (intel_gen9_sysfs.cpp); empty without one.
+            static RamFS sysfs;
+            if (VFS::get().mount(&sysfs, "/sys") == 0 && intel_gen9::IntelGen9Driver::get().isInitialized()) {
+                drm::publishSysfs();
+            }
+
 
 
             if (libMountResult == 0) {
@@ -1282,6 +1299,11 @@ extern "C" void InstantOS(BootInfo* bootInfo) {
                 // graphics-compositor takes over the framebuffer, so login starts it after authentication.
                 launchInitrdService("/bin/input-manager");
                 launchInitrdService("/bin/storage-manager");
+                // Real hardware has no serial port: keep the kernel log on our
+                // partition (never on a test image).
+                if (instantOSDisk) {
+                    launchInitrdService("/bin/log-saver");
+                }
                 launchInitrdService("/bin/process-manager");
                 launchInitrdService("/bin/network-manager");
                 launchInitrdService("/bin/font-manager");

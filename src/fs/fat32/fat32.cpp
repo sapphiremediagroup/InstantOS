@@ -2,6 +2,7 @@
 #include <fs/ahci/ahci.hpp>
 #include <graphics/console.hpp>
 #include <memory/heap.hpp>
+#include <common/string.hpp>
 
 FAT32FS::FAT32FS(BlockDevice* device) : FileSystem("fat32"), device(device), rootNode(nullptr), fatStart(0), dataStart(0), clusterSize(0), rootDirCluster(0) {
     ops.open = nodeOpen;
@@ -25,6 +26,9 @@ FAT32FS::FAT32FS(BlockDevice* device) : FileSystem("fat32"), device(device), roo
 }
 
 FAT32FS::~FAT32FS() {
+    for (FatCacheSlot& slot : fatCache) {
+        if (slot.data) kfree(slot.data);
+    }
     if (rootNode) {
         FAT32Node* node = (FAT32Node*)rootNode->getData();
         if (node) kfree(node);
@@ -109,95 +113,107 @@ uint64_t FAT32FS::clusterToSector(uint32_t cluster) {
 }
 
 bool FAT32FS::readSector(uint64_t sector, void* buffer) {
-    return device->read(sector * bpb.bytesPerSector, buffer, bpb.bytesPerSector);
+    return readSectors(sector, 1, buffer);
 }
 
 bool FAT32FS::writeSector(uint64_t sector, const void* buffer) {
-    return device->write(sector * bpb.bytesPerSector, buffer, bpb.bytesPerSector);
+    return writeSectors(sector, 1, buffer);
+}
+
+// One device call, so one disk command per 64 KiB (the AHCI bounce buffer)
+// instead of one per sector.
+bool FAT32FS::readSectors(uint64_t sector, uint32_t count, void* buffer) {
+    return device->read(sector * bpb.bytesPerSector, buffer, (uint64_t)count * bpb.bytesPerSector);
+}
+
+bool FAT32FS::writeSectors(uint64_t sector, uint32_t count, const void* buffer) {
+    return device->write(sector * bpb.bytesPerSector, buffer, (uint64_t)count * bpb.bytesPerSector);
+}
+
+// Data clusters on the volume; valid cluster numbers are 2 .. count + 1.
+uint32_t FAT32FS::clusterCount() const {
+    return (bpb.totalSectors32 - dataStart) / bpb.sectorsPerCluster;
 }
 
 bool FAT32FS::readCluster(uint32_t cluster, void* buffer) {
     if (cluster < 2 || cluster >= FAT32_EOC) return false;
-    
-    uint64_t sector = clusterToSector(cluster);
-    uint8_t* buf = (uint8_t*)buffer;
-    
-    for (uint32_t i = 0; i < bpb.sectorsPerCluster; i++) {
-        if (!readSector(sector + i, buf + (i * bpb.bytesPerSector))) {
-            return false;
-        }
-    }
-    
-    return true;
+    return readSectors(clusterToSector(cluster), bpb.sectorsPerCluster, buffer);
 }
 
 bool FAT32FS::writeCluster(uint32_t cluster, const void* buffer) {
     if (cluster < 2 || cluster >= FAT32_EOC) return false;
-    
-    uint64_t sector = clusterToSector(cluster);
-    const uint8_t* buf = (const uint8_t*)buffer;
-    
-    for (uint32_t i = 0; i < bpb.sectorsPerCluster; i++) {
-        if (!writeSector(sector + i, buf + (i * bpb.bytesPerSector))) {
-            return false;
+    return writeSectors(clusterToSector(cluster), bpb.sectorsPerCluster, buffer);
+}
+
+// The cached copy of one sector of the first FAT, read on a miss into the
+// least recently used slot. Writes go through it to every FAT copy at once
+// (writeFATEntry), so it never differs from the disk. Only this driver
+// writes the FAT while the volume is mounted (format refuses then), and all
+// of it runs under the storage lock.
+uint8_t* FAT32FS::fatSectorFor(uint32_t sector) {
+    FatCacheSlot* victim = &fatCache[0];
+    for (FatCacheSlot& slot : fatCache) {
+        if (slot.valid && slot.sector == sector) {
+            slot.lastUse = ++fatCacheClock;
+            return slot.data;
+        }
+        if (!slot.valid) {
+            if (victim->valid) victim = &slot;
+        } else if (victim->valid && slot.lastUse < victim->lastUse) {
+            victim = &slot;
         }
     }
-    
-    return true;
+    if (!victim->data) {
+        victim->data = (uint8_t*)kmalloc(bpb.bytesPerSector);
+        if (!victim->data) return nullptr;
+    }
+    victim->valid = false;
+    if (!readSector(sector, victim->data)) return nullptr;
+    victim->sector = sector;
+    victim->valid = true;
+    victim->lastUse = ++fatCacheClock;
+    return victim->data;
 }
 
 bool FAT32FS::readFATEntry(uint32_t cluster, uint32_t* value) {
     if (!value) return false;
-    
+
     uint32_t fatOffset = cluster * 4;
     uint32_t fatSector = fatStart + (fatOffset / bpb.bytesPerSector);
     uint32_t entryOffset = fatOffset % bpb.bytesPerSector;
-    
-    uint8_t* buffer = (uint8_t*)kmalloc(bpb.bytesPerSector);
-    if (!buffer) return false;
-    
-    if (!readSector(fatSector, buffer)) {
-        kfree(buffer);
-        return false;
-    }
-    
-    *value = *(uint32_t*)(buffer + entryOffset) & 0x0FFFFFFF;
-    kfree(buffer);
+
+    const uint8_t* data = fatSectorFor(fatSector);
+    if (!data) return false;
+    *value = *(const uint32_t*)(data + entryOffset) & 0x0FFFFFFF;
     return true;
 }
 
+// Sets the entry in the cached sector and writes that sector to each FAT
+// copy (they mirror each other), two commands for two FATs where reading and
+// rewriting each copy took four.
 bool FAT32FS::writeFATEntry(uint32_t cluster, uint32_t value) {
     uint32_t fatOffset = cluster * 4;
     uint32_t fatSector = fatStart + (fatOffset / bpb.bytesPerSector);
     uint32_t entryOffset = fatOffset % bpb.bytesPerSector;
-    
-    uint8_t* buffer = (uint8_t*)kmalloc(bpb.bytesPerSector);
-    if (!buffer) return false;
-    
-    if (!readSector(fatSector, buffer)) {
-        kfree(buffer);
-        return false;
-    }
-    
-    uint32_t* entry = (uint32_t*)(buffer + entryOffset);
+
+    uint8_t* data = fatSectorFor(fatSector);
+    if (!data) return false;
+    uint32_t* entry = (uint32_t*)(data + entryOffset);
     *entry = (*entry & 0xF0000000) | (value & 0x0FFFFFFF);
-    
-    bool result = writeSector(fatSector, buffer);
-    kfree(buffer);
-    
-    if (result && bpb.numFATs > 1) {
-        uint32_t fat2Sector = fatSector + bpb.fatSize32;
-        buffer = (uint8_t*)kmalloc(bpb.bytesPerSector);
-        if (buffer) {
-            if (readSector(fat2Sector, buffer)) {
-                entry = (uint32_t*)(buffer + entryOffset);
-                *entry = (*entry & 0xF0000000) | (value & 0x0FFFFFFF);
-                writeSector(fat2Sector, buffer);
+
+    bool result = true;
+    for (uint32_t copy = 0; copy < bpb.numFATs; ++copy) {
+        if (!writeSector(fatSector + (uint64_t)copy * bpb.fatSize32, data)) {
+            result = copy != 0;   // the first FAT is the one read back
+            if (copy == 0) {
+                // The disk may not hold what the cache now says: drop it.
+                for (FatCacheSlot& slot : fatCache) {
+                    if (slot.valid && slot.sector == fatSector) slot.valid = false;
+                }
             }
-            kfree(buffer);
+            break;
         }
     }
-    
     return result;
 }
 
@@ -213,18 +229,26 @@ bool FAT32FS::setNextCluster(uint32_t cluster, uint32_t value) {
     return writeFATEntry(cluster, value);
 }
 
+// The next free cluster from where the last search ended, wrapping around
+// once (the FSInfo sector's "next free" hint, kept in memory). Scanning from
+// cluster 2 every time read past every used cluster on each allocation.
 uint32_t FAT32FS::allocateCluster() {
-    uint32_t totalClusters = (bpb.totalSectors32 - dataStart) / bpb.sectorsPerCluster;
-    
-    for (uint32_t i = 2; i < totalClusters; i++) {
+    const uint32_t total = clusterCount();
+    if (total == 0) return 0;
+    uint32_t start = nextFreeHint;
+    if (start < 2 || start >= total + 2) start = 2;
+
+    for (uint32_t n = 0; n < total; n++) {
+        const uint32_t i = 2 + (start - 2 + n) % total;
         uint32_t value;
         if (readFATEntry(i, &value) && value == FAT32_FREE) {
             if (writeFATEntry(i, FAT32_EOC)) {
+                nextFreeHint = i + 1;
                 return i;
             }
         }
     }
-    
+
     return 0;
 }
 
@@ -251,20 +275,26 @@ bool FAT32FS::updateDirEntry(uint32_t parentCluster, const char* name, uint32_t 
     if (!findEntry(parentCluster, name, &entry, &entryCluster, &entryOffset)) {
         return false;
     }
+    const uint32_t oldCluster = ((uint32_t)entry.fstClusHI << 16) | entry.fstClusLO;
+    if (entry.fileSize == newSize && oldCluster == firstCluster) {
+        return true;   // a write inside the file: nothing to record
+    }
 
-    void* buffer = kmalloc(clusterSize);
+    // Only the sector that holds the entry is rewritten, not its cluster.
+    uint8_t* buffer = (uint8_t*)kmalloc(bpb.bytesPerSector);
     if (!buffer) return false;
-    if (!readCluster(entryCluster, buffer)) {
+    const uint64_t sector = clusterToSector(entryCluster) + entryOffset / bpb.bytesPerSector;
+    if (!readSector(sector, buffer)) {
         kfree(buffer);
         return false;
     }
 
-    FAT32DirEntry* e = (FAT32DirEntry*)((uint8_t*)buffer + entryOffset);
+    FAT32DirEntry* e = (FAT32DirEntry*)(buffer + entryOffset % bpb.bytesPerSector);
     e->fileSize = newSize;
     e->fstClusHI = (firstCluster >> 16) & 0xFFFF;
     e->fstClusLO = firstCluster & 0xFFFF;
 
-    bool result = writeCluster(entryCluster, buffer);
+    bool result = writeSector(sector, buffer);
     kfree(buffer);
     return result;
 }
@@ -345,6 +375,17 @@ FAT32Node* FAT32FS::createNodeFromEntry(FAT32DirEntry* entry, const char* longNa
     return node;
 }
 
+// FAT names are case-insensitive (ASCII): "/GLA.TXT" and "/gla.txt" are one file.
+static bool fatNameEquals(const char* a, const char* b) {
+    for (;; ++a, ++b) {
+        char x = *a, y = *b;
+        if (x >= 'A' && x <= 'Z') x += 32;
+        if (y >= 'A' && y <= 'Z') y += 32;
+        if (x != y) return false;
+        if (x == 0) return true;
+    }
+}
+
 bool FAT32FS::findEntry(uint32_t dirCluster, const char* name, FAT32DirEntry* entry, uint32_t* entryCluster, uint32_t* entryOffset) {
     uint32_t cluster = dirCluster;
     char longName[256] = {0};
@@ -402,9 +443,7 @@ bool FAT32FS::findEntry(uint32_t dirCluster, const char* name, FAT32DirEntry* en
             
             bool match = false;
             if (longName[0]) {
-                int j = 0;
-                while (name[j] && longName[j] && name[j] == longName[j]) j++;
-                match = (name[j] == '\0' && longName[j] == '\0');
+                match = fatNameEquals(name, longName);
             } else {
                 char shortName[256];
                 int nameLen = 0;
@@ -423,9 +462,7 @@ bool FAT32FS::findEntry(uint32_t dirCluster, const char* name, FAT32DirEntry* en
                 }
                 shortName[nameLen] = '\0';
                 
-                int j = 0;
-                while (name[j] && shortName[j] && name[j] == shortName[j]) j++;
-                match = (name[j] == '\0' && shortName[j] == '\0');
+                match = fatNameEquals(name, shortName);
             }
             
             if (match) {
@@ -582,10 +619,7 @@ bool FAT32FS::deleteEntry(uint32_t dirCluster, const char* name) {
             }
             shortName[nameLen] = '\0';
             
-            int j = 0;
-            while (name[j] && shortName[j] && name[j] == shortName[j]) j++;
-            
-            if (name[j] == '\0' && shortName[j] == '\0') {
+            if (fatNameEquals(name, shortName)) {
                 entries[i].name[0] = 0xE5;
                 bool result = writeCluster(cluster, buffer);
                 kfree(buffer);
@@ -610,77 +644,92 @@ int FAT32FS::nodeClose(VNode* node) {
 
 int64_t FAT32FS::nodeRead(VNode* node, void* buffer, uint64_t size, uint64_t offset) {
     if (!node || !buffer) return -1;
-    
+
     FAT32Node* fatNode = (FAT32Node*)node->getData();
     if (!fatNode || fatNode->isDirectory) return -1;
-    
+
     if (offset >= fatNode->size) return 0;
-    
+
     if (offset + size > fatNode->size) {
         size = fatNode->size - offset;
     }
-    
+
     FAT32FS* fs = (FAT32FS*)node->getFS();
     uint64_t bytesRead = 0;
     uint8_t* dest = (uint8_t*)buffer;
-    
+
     uint32_t cluster = fatNode->cluster;
     uint64_t clusterOffset = offset / fs->clusterSize;
-    
+
     for (uint64_t i = 0; i < clusterOffset && cluster >= 2 && cluster < FAT32_EOC; i++) {
         cluster = fs->getNextCluster(cluster);
     }
-    
+
     uint64_t offsetInCluster = offset % fs->clusterSize;
-    
+    uint8_t* clusterBuffer = nullptr;
+
     while (bytesRead < size && cluster >= 2 && cluster < FAT32_EOC) {
-        void* clusterBuffer = kmalloc(fs->clusterSize);
-        if (!clusterBuffer) return bytesRead;
-        
-        if (!fs->readCluster(cluster, clusterBuffer)) {
-            kfree(clusterBuffer);
-            return bytesRead;
+        if (offsetInCluster == 0 && size - bytesRead >= fs->clusterSize) {
+            // Whole clusters that follow each other on the disk (the usual
+            // layout of a file) are read in one go, straight into the
+            // caller's buffer.
+            uint32_t run = 1;
+            uint32_t next = fs->getNextCluster(cluster);
+            while (next == cluster + run && (uint64_t)(run + 1) * fs->clusterSize <= size - bytesRead) {
+                ++run;
+                next = fs->getNextCluster(next);
+            }
+            if (!fs->readSectors(fs->clusterToSector(cluster), run * fs->bpb.sectorsPerCluster, dest + bytesRead)) {
+                break;
+            }
+            bytesRead += (uint64_t)run * fs->clusterSize;
+            cluster = next;
+            continue;
         }
-        
+
+        if (!clusterBuffer) {
+            clusterBuffer = (uint8_t*)kmalloc(fs->clusterSize);
+            if (!clusterBuffer) break;
+        }
+        if (!fs->readCluster(cluster, clusterBuffer)) {
+            break;
+        }
+
         uint64_t toRead = fs->clusterSize - offsetInCluster;
         if (toRead > size - bytesRead) {
             toRead = size - bytesRead;
         }
-        
-        uint8_t* src = (uint8_t*)clusterBuffer + offsetInCluster;
-        for (uint64_t i = 0; i < toRead; i++) {
-            dest[bytesRead + i] = src[i];
-        }
-        
-        kfree(clusterBuffer);
+        memcpy(dest + bytesRead, clusterBuffer + offsetInCluster, toRead);
         bytesRead += toRead;
         offsetInCluster = 0;
         cluster = fs->getNextCluster(cluster);
     }
-    
+
+    if (clusterBuffer) kfree(clusterBuffer);
     return bytesRead;
 }
 
 int64_t FAT32FS::nodeWrite(VNode* node, const void* buffer, uint64_t size, uint64_t offset) {
     if (!node || !buffer) return -1;
-    
+
     FAT32Node* fatNode = (FAT32Node*)node->getData();
     if (!fatNode || fatNode->isDirectory) return -1;
-    
+
     FAT32FS* fs = (FAT32FS*)node->getFS();
     uint64_t bytesWritten = 0;
     const uint8_t* src = (const uint8_t*)buffer;
-    
+    const uint32_t bps = fs->bpb.bytesPerSector;
+
     uint32_t cluster = fatNode->cluster;
-    
+
     if (cluster == 0) {
         cluster = fs->allocateCluster();
         if (cluster == 0) return -1;
         fatNode->cluster = cluster;
     }
-    
+
     uint64_t clusterOffset = offset / fs->clusterSize;
-    
+
     for (uint64_t i = 0; i < clusterOffset; i++) {
         uint32_t next = fs->getNextCluster(cluster);
         if (next >= FAT32_EOC) {
@@ -690,66 +739,59 @@ int64_t FAT32FS::nodeWrite(VNode* node, const void* buffer, uint64_t size, uint6
         }
         cluster = next;
     }
-    
+
     uint64_t offsetInCluster = offset % fs->clusterSize;
-    
+    uint8_t* clusterBuffer = (uint8_t*)kmalloc(fs->clusterSize);
+    if (!clusterBuffer) return -1;
+
     while (bytesWritten < size) {
-        void* clusterBuffer = kmalloc(fs->clusterSize);
-        if (!clusterBuffer) return bytesWritten;
-        
-        if (offsetInCluster > 0 || (size - bytesWritten) < fs->clusterSize) {
-            if (!fs->readCluster(cluster, clusterBuffer)) {
-                for (uint32_t i = 0; i < fs->clusterSize; i++) {
-                    ((uint8_t*)clusterBuffer)[i] = 0;
-                }
-            }
-        }
-        
         uint64_t toWrite = fs->clusterSize - offsetInCluster;
         if (toWrite > size - bytesWritten) {
             toWrite = size - bytesWritten;
         }
-        
-        uint8_t* dest = (uint8_t*)clusterBuffer + offsetInCluster;
-        for (uint64_t i = 0; i < toWrite; i++) {
-            dest[i] = src[bytesWritten + i];
+
+        // Only the sectors the bytes land in are written; those at either end
+        // that keep other bytes are read first. Appending a log line is then
+        // one sector read and one sector write, not a cluster of each.
+        const uint64_t end = offsetInCluster + toWrite;
+        const uint32_t firstSector = (uint32_t)(offsetInCluster / bps);
+        const uint32_t sectors = (uint32_t)((end + bps - 1) / bps) - firstSector;
+        uint8_t* span = clusterBuffer + (uint64_t)firstSector * bps;
+        const uint64_t spanSector = fs->clusterToSector(cluster) + firstSector;
+        if (offsetInCluster % bps != 0 || end % bps != 0) {
+            if (!fs->readSectors(spanSector, sectors, span)) {
+                memset(span, 0, (uint64_t)sectors * bps);
+            }
         }
-        
-        if (!fs->writeCluster(cluster, clusterBuffer)) {
-            kfree(clusterBuffer);
-            return bytesWritten;
+        memcpy(clusterBuffer + offsetInCluster, src + bytesWritten, toWrite);
+
+        if (!fs->writeSectors(spanSector, sectors, span)) {
+            break;
         }
-        
-        kfree(clusterBuffer);
+
         bytesWritten += toWrite;
         offsetInCluster = 0;
-        
+
         if (bytesWritten < size) {
             uint32_t next = fs->getNextCluster(cluster);
             if (next >= FAT32_EOC) {
                 next = fs->allocateCluster();
-                if (next == 0) return bytesWritten;
+                if (next == 0) break;
                 fs->setNextCluster(cluster, next);
             }
             cluster = next;
         }
     }
-    
-    if (offset + size > fatNode->size) {
-        fatNode->size = offset + size;
+    kfree(clusterBuffer);
+
+    if (offset + bytesWritten > fatNode->size) {
+        fatNode->size = offset + bytesWritten;
     }
 
     // Persist the updated size and first cluster to the directory entry so the
     // file metadata survives and reads see the correct length.
-    bool upd = fs->updateDirEntry(fatNode->parentCluster, fatNode->name, fatNode->size, fatNode->cluster);
-    Console::get().drawText("[fat.write] name='"); Console::get().drawText(fatNode->name);
-    Console::get().drawText("' off="); Console::get().drawNumber((int64_t)offset);
-    Console::get().drawText(" size="); Console::get().drawNumber((int64_t)size);
-    Console::get().drawText(" newSize="); Console::get().drawNumber((int64_t)fatNode->size);
-    Console::get().drawText(" pcl="); Console::get().drawNumber((int64_t)fatNode->parentCluster);
-    Console::get().drawText(" upd="); Console::get().drawNumber(upd ? 1 : 0);
-    Console::get().drawText("\n");
-    
+    fs->updateDirEntry(fatNode->parentCluster, fatNode->name, fatNode->size, fatNode->cluster);
+
     return bytesWritten;
 }
 
@@ -1200,16 +1242,34 @@ int FAT32FS::nodeStatfs(VNode* node, FsStats* stats) {
     FAT32FS* fs = (FAT32FS*)node->getFS();
     if (!fs) return -1;
 
-    uint32_t totalClusters = (fs->bpb.totalSectors32 - fs->dataStart) / fs->bpb.sectorsPerCluster;
+    const uint32_t totalClusters = fs->clusterCount();
 
-    // Count free clusters by scanning the FAT.
+    // Count free clusters, reading the FAT 64 KiB at a time: an entry at a
+    // time it was a disk command per cluster (half a million on 2 GB).
     uint64_t freeClusters = 0;
-    for (uint32_t i = 2; i < totalClusters + 2; i++) {
-        uint32_t value;
-        if (fs->readFATEntry(i, &value) && value == FAT32_FREE) {
-            freeClusters++;
+    constexpr uint32_t kChunkBytes = 64 * 1024;
+    uint8_t* chunk = (uint8_t*)kmalloc(kChunkBytes);
+    if (!chunk) return -1;
+    const uint32_t entriesPerSector = fs->bpb.bytesPerSector / 4;
+    const uint32_t sectorsPerChunk = kChunkBytes / fs->bpb.bytesPerSector;
+    const uint64_t lastEntry = (uint64_t)totalClusters + 2;   // exclusive
+    for (uint64_t first = 0; first < lastEntry; first += (uint64_t)sectorsPerChunk * entriesPerSector) {
+        const uint64_t sector = first / entriesPerSector;
+        uint64_t sectors = (lastEntry - first + entriesPerSector - 1) / entriesPerSector;
+        if (sectors > sectorsPerChunk) sectors = sectorsPerChunk;
+        if (!fs->readSectors(fs->fatStart + sector, (uint32_t)sectors, chunk)) {
+            kfree(chunk);
+            return -1;
+        }
+        const uint32_t* entries = (const uint32_t*)chunk;
+        for (uint64_t k = 0; k < sectors * entriesPerSector; ++k) {
+            const uint64_t cluster = first + k;
+            if (cluster >= 2 && cluster < lastEntry && (entries[k] & 0x0FFFFFFF) == FAT32_FREE) {
+                freeClusters++;
+            }
         }
     }
+    kfree(chunk);
 
     stats->blockSize = fs->clusterSize;
     stats->totalBlocks = totalClusters;

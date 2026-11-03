@@ -221,13 +221,17 @@ void HandleTable::closeOnExecHandles() {
     }
 }
 
-void HandleTable::cloneFrom(const HandleTable& source, bool skipCloseOnExec) {
+void HandleTable::cloneFrom(const HandleTable& source, bool skipCloseOnExec, bool filesOnly) {
     for (int slot = 0; slot < MaxHandles; slot++) {
         const HandleEntry& src = source.entries[slot];
         if (src.type == HandleType::None || !src.object) {
             continue;
         }
         if (skipCloseOnExec && src.closeOnExec) {
+            continue;
+        }
+        if (filesOnly && src.type != HandleType::File && src.type != HandleType::Pipe &&
+            src.type != HandleType::Socket) {
             continue;
         }
 

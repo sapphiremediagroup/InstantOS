@@ -10,6 +10,7 @@
 #include <graphics/console.hpp>
 #include <graphics/gpu.hpp>
 #include <graphics/virtio_gpu.hpp>
+#include <graphics/intel_gen9.hpp>
 #include <graphics/venus.hpp>
 #include <common/string.hpp>
 #include <common/ports.hpp>
@@ -17,6 +18,9 @@
 #include <time/time.hpp>
 #include <time/tsc_timer.hpp>
 #include <fs/storage/storage.hpp>
+#include <fs/storage/storage_lock.hpp>
+#include <fs/ahci/ahci.hpp>
+#include <cpu/acpi/acpi.hpp>
 #include <cpuid.h>
 
 size_t strncpyToUser(char* user_dest, const char* kernel_src, size_t max_len) {
@@ -113,13 +117,18 @@ bool mapFramebufferIntoCurrentProcess(iFramebuffer* fb, uint64_t* userBase) {
     const size_t pages = (fbSizeBytes + PAGE_SIZE - 1) / PAGE_SIZE;
 
     uint64_t flags = Present | ReadWrite | UserSuper | NoExecute | kSharedFrame;
+    // A device frame buffer (the firmware's, in the GPU aperture on a real PC)
+    // is written by the CPU only: write-combining. virtio-gpu's is RAM.
     VirtIOGPUDriver& gpu = VirtIOGPUDriver::get();
     if (!gpu.isInitialized() || gpu.getFramebuffer() != fb->getRaw()) {
-        flags |= CacheDisab;
+        flags |= WriteCombine;
     }
 
     VMM::MapRangeInto(current->getPageTable(), USER_FB_BASE, fbPhys, pages, flags);
     *userBase = USER_FB_BASE;
+    // The screen is the compositor's now: kernel messages go to the log only
+    // (dmesg, /kernel.log), not over the desktop. Panics turn it back on.
+    Console::get().setFramebufferOutputEnabled(false);
     return true;
 }
 }
@@ -245,6 +254,33 @@ uint64_t Syscall::sys_kernel_log(uint64_t buffer, uint64_t length) {
     return copied ? count : syscall_error(SysErrInvalid);
 }
 
+// Restarts or powers off the machine; root only. The drives' write caches are
+// flushed first (the FAT32 driver writes through, but the drive may still hold
+// the data), so the last kernel log lines and files reach the disk.
+uint64_t Syscall::sys_reboot(uint64_t mode) {
+    Process* current = Scheduler::get().getCurrentProcess();
+    if (!current || !current->isPrivileged()) {
+        return syscall_error(SysErrPermission);
+    }
+    const auto how = static_cast<RebootMode>(mode);
+    if (how != RebootMode::Restart && how != RebootMode::PowerOff) {
+        return syscall_error(SysErrInvalid);
+    }
+    Cereal::get().write(how == RebootMode::Restart ? "[power] restarting\n" : "[power] powering off\n");
+    {
+        StorageLock::Section storage;
+        if (!AHCIPort::flushAll()) {
+            Cereal::get().write("[power] a disk flush failed\n");
+        }
+    }
+    if (how == RebootMode::PowerOff) {
+        ACPI::get().sysShutdown();
+        Cereal::get().write("[power] power-off did not take; restarting instead\n");
+    }
+    ACPI::get().reboot();
+    return 0;
+}
+
 // settimeofday/clock_settime(CLOCK_REALTIME); root only, like Linux.
 uint64_t Syscall::sys_set_unix_time(uint64_t unixNs) {
     Process* current = Scheduler::get().getCurrentProcess();
@@ -325,6 +361,142 @@ uint64_t Syscall::sys_fb_map() {
     }
 
     return userBase;
+}
+
+// The compositor's scanout buffers (Display syscall), mapped above the
+// framebuffer's own mapping, 256 MiB apart.
+constexpr uint64_t USER_SCANOUT_BASE = USER_FB_BASE + 0x10000000ULL;
+constexpr uint64_t USER_SCANOUT_STRIDE = 0x10000000ULL;
+static_assert(intel_gen9::IntelGen9Driver::kScanoutBuffers == kDisplayMaxBuffers);
+
+namespace {
+
+// Without the Intel display the buffers are RAM pages and a flip copies one
+// to the framebuffer (and flushes it, for virtio-gpu): the compositor's
+// double buffering can be watched in QEMU. It never runs unless the
+// compositor is told to use flips (/display.cfg).
+struct EmulatedDisplay {
+    uint64_t* frames[kDisplayMaxBuffers];
+    uint64_t pageCount;
+};
+EmulatedDisplay s_emulated = {};
+
+uint64_t emulatedDisplay(iFramebuffer* fb, Process* current, DisplayCommand command, uint64_t arg) {
+    const uint64_t pitchBytes = fb->getPitch() * 4;
+    const uint64_t bytes = pitchBytes * fb->getHeight();
+    switch (command) {
+        case DisplayCommand::Acquire: {
+            if (!Syscall::isValidUserPointer(arg, sizeof(DisplayBuffersInfo))) {
+                return syscall_error(SysErrInvalid);
+            }
+            // Only a caller that asks for emulation (flags = kDisplayEmulated) gets it.
+            DisplayBuffersInfo info = {};
+            if (!Syscall::copyFromUser(&info, arg, sizeof(info)) || (info.flags & kDisplayEmulated) == 0) {
+                return syscall_error(SysErrNoDevice);
+            }
+            info = {};
+            const uint64_t pages = (bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+            if (pages * PAGE_SIZE > USER_SCANOUT_STRIDE) {
+                return syscall_error(SysErrNoDevice);
+            }
+            for (uint32_t i = 0; i < kDisplayMaxBuffers; ++i) {
+                if (!s_emulated.frames[i]) {
+                    auto* frames = static_cast<uint64_t*>(kmalloc(pages * sizeof(uint64_t)));
+                    if (!frames) {
+                        return syscall_error(SysErrNoMemory);
+                    }
+                    for (uint64_t page = 0; page < pages; ++page) {
+                        frames[page] = PMM::AllocFrame();
+                        if (frames[page] == 0) {
+                            return syscall_error(SysErrNoMemory);   // leaks; test-only path
+                        }
+                    }
+                    s_emulated.frames[i] = frames;
+                    s_emulated.pageCount = pages;
+                }
+                const uint64_t base = USER_SCANOUT_BASE + i * USER_SCANOUT_STRIDE;
+                for (uint64_t page = 0; page < s_emulated.pageCount; ++page) {
+                    VMM::MapPageInto(current->getPageTable(), base + page * PAGE_SIZE, s_emulated.frames[i][page],
+                                     Present | ReadWrite | UserSuper | NoExecute | kSharedFrame);
+                }
+                info.address[i] = base;
+            }
+            info.count = kDisplayMaxBuffers;
+            info.width = fb->getWidth();
+            info.height = fb->getHeight();
+            info.pitch = static_cast<uint32_t>(pitchBytes);
+            info.flags = kDisplayEmulated;
+            return Syscall::copyToUser(arg, &info, sizeof(info)) ? 0 : syscall_error(SysErrInvalid);
+        }
+        case DisplayCommand::Flip: {
+            if (arg >= kDisplayMaxBuffers || !s_emulated.frames[arg]) {
+                return syscall_error(SysErrInvalid);
+            }
+            auto* screen = reinterpret_cast<uint8_t*>(fb->getRaw());
+            for (uint64_t page = 0; page < s_emulated.pageCount; ++page) {
+                const uint64_t offset = page * PAGE_SIZE;
+                const uint64_t count = bytes - offset < PAGE_SIZE ? bytes - offset : PAGE_SIZE;
+                memcpy(screen + offset, reinterpret_cast<const void*>(VMM::PhysToVirt(s_emulated.frames[arg][page])),
+                       count);
+            }
+            GPU& gpu = GPU::get();
+            if (gpu.isInitialized()) {
+                gpu.flush(0, 0, fb->getWidth(), fb->getHeight());
+            }
+            return 0;
+        }
+        case DisplayCommand::Wait:
+        case DisplayCommand::Release:
+            return 0;
+        case DisplayCommand::ExportBuffer:
+            return syscall_error(SysErrNoDevice);   // the emulated buffers are not GPU memory
+    }
+    return syscall_error(SysErrInvalid);
+}
+
+} // namespace
+
+uint64_t Syscall::sys_display(uint64_t command, uint64_t arg) {
+    if (!currentProcessOwnsFramebuffer()) {
+        return syscall_error(SysErrPermission);
+    }
+    Process* current = Scheduler::get().getCurrentProcess();
+    intel_gen9::IntelGen9Driver& gpu = intel_gen9::IntelGen9Driver::get();
+    if (!gpu.isInitialized()) {
+        iFramebuffer* fb = Console::get().getFramebuffer();
+        if (!fb || !current) {
+            return syscall_error(SysErrNoDevice);
+        }
+        return emulatedDisplay(fb, current, static_cast<DisplayCommand>(command), arg);
+    }
+    switch (static_cast<DisplayCommand>(command)) {
+        case DisplayCommand::Acquire: {
+            if (!isValidUserPointer(arg, sizeof(DisplayBuffersInfo))) {
+                return syscall_error(SysErrInvalid);
+            }
+            DisplayBuffersInfo info = {};
+            if (!gpu.displayAcquire(current, USER_SCANOUT_BASE, USER_SCANOUT_STRIDE, info.address)) {
+                return syscall_error(SysErrNoDevice);
+            }
+            info.count = intel_gen9::IntelGen9Driver::kScanoutBuffers;
+            info.width = gpu.mode().width;
+            info.height = gpu.mode().height;
+            info.pitch = gpu.mode().stride;
+            return copyToUser(arg, &info, sizeof(info)) ? 0 : syscall_error(SysErrInvalid);
+        }
+        case DisplayCommand::Flip:
+            return gpu.displayFlip(static_cast<uint32_t>(arg)) ? 0 : syscall_error(SysErrInvalid);
+        case DisplayCommand::Wait:
+            return gpu.displayWait(arg > 1000 ? 1000 : arg) ? 0 : syscall_error(SysErrTimedOut);
+        case DisplayCommand::Release:
+            gpu.displayRelease();
+            return 0;
+        case DisplayCommand::ExportBuffer: {
+            const int64_t handle = gpu.displayExportBuffer(static_cast<uint32_t>(arg));
+            return static_cast<uint64_t>(handle);   // a handle, or -errno
+        }
+    }
+    return syscall_error(SysErrInvalid);
 }
 
 uint64_t Syscall::sys_fb_flush(uint64_t x, uint64_t y, uint64_t w, uint64_t h) {

@@ -21,7 +21,9 @@ public:
     
     uint32_t getGSIBase() const { return gsiBase; }
     uint32_t getMaxRedirect();
-    
+    // The whole redirection entry (diagnostics: the lock-up watchdog).
+    uint64_t readRedirect(uint8_t irq);
+
 private:
     volatile uint32_t* base;
     uint32_t gsiBase;

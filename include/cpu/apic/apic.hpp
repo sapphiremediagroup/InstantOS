@@ -19,7 +19,11 @@ public:
     // CPUs enabled in the MADT, including the boot CPU (see cpu/smp.hpp).
     uint8_t getCPUCount() const { return cpuCount; }
     uint8_t getAPICId(uint8_t index) const { return apicIds[index]; }
-    
+
+    // The GSI an ISA IRQ arrives on (MADT overrides) and its IOAPIC.
+    IOAPIC* getIOAPICForGSI(uint32_t gsi);
+    uint32_t resolveIRQ(uint8_t irq);
+
 private:
     APICManager() : initialized(false), ioapicCount(0), overrideCount(0), cpuCount(0) {}
     
@@ -36,7 +40,4 @@ private:
     uint8_t overrideCount;
     uint8_t apicIds[16];
     uint8_t cpuCount;
-    
-    IOAPIC* getIOAPICForGSI(uint32_t gsi);
-    uint32_t resolveIRQ(uint8_t irq);
 };

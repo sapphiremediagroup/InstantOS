@@ -124,6 +124,10 @@ public:
     void setBackgroundColor(Color color);
     void setVirtIO(bool enabled) { useVirtIO = enabled; }
     void setCopyScrollEnabled(bool enabled) { copyScrollEnabled = enabled; }
+    // Onto the screen only (not the serial port or the kernel log), taking no
+    // lock and even while framebuffer output is off: for the lock-up
+    // watchdog, which may run while a hung CPU holds those locks.
+    void drawRawUnlocked(const char* str);
     void setFramebufferOutputEnabled(bool enabled) { framebufferOutputEnabled = enabled; }
     iFramebuffer* getFramebuffer() { return framebuffer; }
 

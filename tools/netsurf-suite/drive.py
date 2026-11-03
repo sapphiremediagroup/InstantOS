@@ -38,14 +38,16 @@ LOGO = (0xe7, 0x6f, 0x51)
 PAGE2 = (0xff, 0xbe, 0x0b)
 PAGE3 = (0x3a, 0x86, 0xff)
 
-# graphics-compositor/src/common.hpp
-TASKBAR_CENTER_WIDTH = 420
-TASKBAR_SLOTS = 5
-TASKBAR_HEIGHT = 66
-TASKBAR_BOTTOM_MARGIN = 25
+# graphics-compositor/src/common.hpp: one bar kTaskbarMargin from the edges,
+# app tiles centred in it (only the 5 pinned ones while no other app runs)
+TASKBAR_MARGIN = 12
+TASKBAR_HEIGHT = 52
+TILE_SIZE = 44
+TILE_GAP = 6
+TILE_COUNT = 5
 WEB_SLOT = 4
 BORDER = 1
-TITLE_BAR = 34
+TITLE_BAR = 40
 
 
 class Qmp:
@@ -239,10 +241,11 @@ class Drive:
         before = self.shot("desktop")
         W, H = before.width, before.height
 
-        # 1. the Web slot, centre of the taskbar's fifth fifth
-        slot = TASKBAR_CENTER_WIDTH // TASKBAR_SLOTS
-        x = (W - TASKBAR_CENTER_WIDTH) // 2 + WEB_SLOT * slot + slot // 2
-        y = H - TASKBAR_BOTTOM_MARGIN - TASKBAR_HEIGHT // 2
+        # 1. the Web tile, the fifth of the centred tiles
+        tiles = TILE_COUNT * TILE_SIZE + (TILE_COUNT - 1) * TILE_GAP
+        bar_width = W - 2 * TASKBAR_MARGIN
+        x = TASKBAR_MARGIN + (bar_width - tiles) // 2 + WEB_SLOT * (TILE_SIZE + TILE_GAP) + TILE_SIZE // 2
+        y = H - TASKBAR_MARGIN - TASKBAR_HEIGHT // 2
         self.click(x, y)
         self.shot("web-click")   # where the pointer ended up, for a failed run
         win = self.wait(self.netsurf_window, 90)

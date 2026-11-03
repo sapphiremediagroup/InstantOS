@@ -2,6 +2,7 @@
 #include <common/string.hpp>
 #include <common/ports.hpp>
 #include <memory/vmm.hpp>
+#include <time/tsc_timer.hpp>
 #include <stddef.h>
 #include <cpu/acpi/acpi_tables.hpp>
 
@@ -430,21 +431,48 @@ void ACPI::shutdown() {
     ecamCount = 0;
 }
 
-void ACPI::reboot() {
-    if (!initialized) return;
+namespace {
+// Gives a reset method time to take effect before the next is tried.
+void waitBeforeNextResetMethod() {
+    const uint64_t deadline = time_get_uptime_ms() + 100;
+    while (time_get_uptime_ms() < deadline) {
+        asm volatile("pause");
+    }
+}
+}
 
-    Fadt* fadt = static_cast<Fadt*>(findTable("FACP"));
-    if (fadt && fadtHasField(fadt, offsetof(Fadt, resetValue), sizeof(fadt->resetValue))) {
-        acpiWriteRegister8(fadtResetRegister(fadt), fadt->resetValue);
+// Resets the machine, trying in turn what Linux's reboot tries on x86: the
+// FADT's reset register, the keyboard controller's pulse, then the chipset's
+// reset control register (0xCF9), and as a last resort a triple fault. A
+// machine without a PS/2 controller reads 0xFF from port 0x64, so its wait
+// is bounded.
+void ACPI::reboot() {
+    if (initialized) {
+        Fadt* fadt = static_cast<Fadt*>(findTable("FACP"));
+        if (fadt && fadtHasField(fadt, offsetof(Fadt, resetValue), sizeof(fadt->resetValue))) {
+            acpiWriteRegister8(fadtResetRegister(fadt), fadt->resetValue);
+            waitBeforeNextResetMethod();
+        }
     }
 
-    uint8_t good = 0x02;
-    while (good & 0x02) {
-        good = inb(0x64);
+    for (int tries = 0; tries < 100000 && (inb(0x64) & 0x02); ++tries) {
+        asm volatile("pause");
     }
     outb(0x64, 0xFE);
+    waitBeforeNextResetMethod();
 
-    asm volatile("cli; hlt");
+    outb(0xCF9, 0x02);   // prepare a hard reset...
+    outb(0xCF9, 0x06);   // ...and do it (Linux's BOOT_CF9_FORCE)
+    waitBeforeNextResetMethod();
+
+    struct [[gnu::packed]] {
+        uint16_t limit;
+        uint64_t base;
+    } noIdt = {0, 0};
+    asm volatile("lidt %0; int3" : : "m"(noIdt));
+    while (true) {
+        asm volatile("cli; hlt");
+    }
 }
 
 void ACPI::sysShutdown() {

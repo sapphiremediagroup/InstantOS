@@ -225,6 +225,12 @@ void IOAPIC::unmaskIRQ(uint8_t irq) {
   write(reg, low & ~(1 << 16));
 }
 
+uint64_t IOAPIC::readRedirect(uint8_t irq) {
+  const uint32_t reg = IOAPIC_REG_REDTBL + (irq * 2);
+  const uint64_t low = read(reg);
+  return low | (static_cast<uint64_t>(read(reg + 1)) << 32);
+}
+
 uint32_t IOAPIC::getMaxRedirect() {
   uint32_t ver = read(IOAPIC_REG_VER);
   return (ver >> 16) & 0xFF;

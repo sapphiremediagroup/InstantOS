@@ -15,6 +15,8 @@
 #include <interrupts/keyboard.hpp>
 #include <memory/pmm.hpp>
 #include <memory/vmm.hpp>
+#include <time/tsc_timer.hpp>
+#include <cpu/tlb.hpp>
 
 namespace {
 constexpr uint16_t PCI_VENDOR_ID = 0x00;
@@ -121,6 +123,7 @@ constexpr uint32_t XHCI_TRB_TYPE_CONFIGURE_ENDPOINT_COMMAND = 12;
 constexpr uint32_t XHCI_TRB_TYPE_EVALUATE_CONTEXT_COMMAND = 13;
 constexpr uint32_t XHCI_TRB_TYPE_RESET_ENDPOINT_COMMAND = 14;
 constexpr uint32_t XHCI_TRB_TYPE_STOP_ENDPOINT_COMMAND = 15;
+constexpr uint32_t XHCI_TRB_TYPE_SET_TR_DEQUEUE_COMMAND = 16;
 constexpr uint32_t XHCI_TRB_CYCLE = 1 << 0;
 constexpr uint32_t XHCI_TRB_ISP = 1 << 2;
 constexpr uint32_t XHCI_TRB_IOC = 1 << 5;
@@ -158,7 +161,16 @@ constexpr uint32_t XHCI_TRANSFER_RING_TRBS = 256;
 constexpr uint32_t XHCI_MAX_TRACKED_CONTROLLERS = 4;
 constexpr uint32_t XHCI_MAX_SLOTS = 256;
 constexpr uint32_t XHCI_COMMAND_TIMEOUT = 2000000;
-constexpr uint32_t XHCI_TRANSFER_TIMEOUT = 4000000;
+// Control transfers are waited for by polling with interrupts off (in the
+// tick's poll for the keyboard lights, holding the big kernel lock), so the
+// wait is bounded in time, not in loop rounds: 4,000,000 rounds of register
+// reads were several seconds on the PC. 5 s is Linux's USB_CTRL_SET_TIMEOUT,
+// for enumeration; the lights use kLedTransferTimeoutMs.
+constexpr uint64_t XHCI_TRANSFER_TIMEOUT_MS = 5000;
+// USB 2.0 9.2.6.4: a request's data stage within 500 ms, its status within 50.
+// A keyboard answers a SET_REPORT in a few ms; one that does not is not
+// waited for long, since the whole system waits with it.
+constexpr uint64_t kLedTransferTimeoutMs = 100;
 constexpr uint32_t XHCI_PORT_RESET_TIMEOUT = 2000000;
 constexpr uint32_t XHCI_PORT_SETTLE_DELAY = 200000;
 constexpr uint32_t XHCI_PORT_POST_RESET_DELAY = 100000;
@@ -413,13 +425,31 @@ public:
     }
 
     void Run(InterruptFrame* frame) override {
-        (void)frame;
         XHCIController::get().handleInterrupt();
-        // A legacy INTx handler: the shared dispatcher sends the EOI after
-        // this returns, so it must not switch processes here. Doing so left
-        // the vector in service, which blocked the timer below it and halted
-        // that CPU for good. Whoever the input woke runs at the next tick.
+        // It must not switch processes here: the vector would stay in
+        // service, which blocks the timer below it and halts that CPU for
+        // good. Whoever the input woke runs at the next tick.
         g_inputActivity = false;
+        // On a shared INTx line the dispatcher sends the EOI after all its
+        // handlers. A vector registered for us alone (MSI, or a _PRT GSI) has
+        // no dispatcher, so the EOI is ours: without it the first interrupt
+        // stayed in service and, on the boot CPU, blocked its timer for good
+        // (a real PC's xHCI interrupted the boot CPU once and froze it).
+        if (frame && ownsVector(static_cast<uint8_t>(frame->interrupt))) {
+            LAPIC::get().sendEOI();
+        }
+    }
+
+    // Marks a vector registered to this handler directly.
+    void claimVector(uint8_t vector) {
+        ownVectors[vector / 64] |= 1ULL << (vector % 64);
+    }
+
+private:
+    uint64_t ownVectors[4] = {};
+
+    bool ownsVector(uint8_t vector) const {
+        return (ownVectors[vector / 64] & (1ULL << (vector % 64))) != 0;
     }
 };
 
@@ -1112,7 +1142,8 @@ void submit_keyboard_transfer(XHCIControllerState& state, XHCISlotState& slot);
 void complete_keyboard_transfer(XHCIControllerState& state, XHCISlotState& slot);
 void submit_mouse_transfer(XHCIControllerState& state, XHCISlotState& slot);
 void complete_mouse_transfer(XHCIControllerState& state, XHCISlotState& slot);
-bool xhci_control_transfer(XHCIControllerState& state, XHCISlotState& slot, const UsbSetupPacket& setup, void* data, uint16_t length);
+bool xhci_control_transfer(XHCIControllerState& state, XHCISlotState& slot, const UsbSetupPacket& setup, void* data, uint16_t length,
+                           uint64_t timeoutMs = XHCI_TRANSFER_TIMEOUT_MS);
 bool bring_up_connected_port(XHCIControllerState& state, uint8_t portIndex);
 bool enumerate_device(XHCIControllerState& state, const XHCIEnumerationTarget& target);
 bool enumerate_hub(XHCIControllerState& state, XHCISlotState& hubSlot);
@@ -1253,10 +1284,16 @@ void drain_events(XHCIControllerState& state) {
             const uint8_t slotId = static_cast<uint8_t>(event.control >> XHCI_TRB_SLOT_ID_SHIFT);
             if (slotId != 0) {
                 XHCISlotState& slot = state.slots[slotId];
-                if (slot.transferPending && event_trb_pointer(event) == slot.pendingTransferPhys) {
+                const uint32_t code = trb_completion_code(event);
+                const uint32_t endpointId = (event.control >> XHCI_TRB_ENDPOINT_ID_SHIFT) & 0x1F;
+                // The status stage's event ends a control transfer; so does an
+                // error on any of its TRBs (a STALL in the data stage points
+                // at the data TRB, and nothing more comes: ep0 is halted).
+                const bool ep0Error = endpointId == 1 && code != XHCI_COMPLETION_SUCCESS && code != 13;
+                if (slot.transferPending && (event_trb_pointer(event) == slot.pendingTransferPhys || ep0Error)) {
                     slot.transferPending = false;
                     slot.transferCompleted = true;
-                    slot.lastTransferCompletionCode = trb_completion_code(event);
+                    slot.lastTransferCompletionCode = code;
                 }
                 if (slot.keyboardPending && event_trb_pointer(event) == slot.pendingKeyboardTransferPhys) {
                     slot.keyboardPending = false;
@@ -1412,6 +1449,16 @@ bool command_reset_endpoint(XHCIControllerState& state, uint8_t slotId, uint8_t 
     XHCITransferRequestBlock command = {};
     command.control = (XHCI_TRB_TYPE_RESET_ENDPOINT_COMMAND << XHCI_TRB_TYPE_SHIFT) |
         (transferStatePreserve ? (1U << 9) : 0) |
+        (static_cast<uint32_t>(endpointId) << XHCI_TRB_ENDPOINT_ID_SHIFT) |
+        (static_cast<uint32_t>(slotId) << XHCI_TRB_SLOT_ID_SHIFT);
+    return submit_command(state, command, nullptr);
+}
+
+bool command_set_tr_dequeue(XHCIControllerState& state, uint8_t slotId, uint8_t endpointId, uint64_t dequeuePhys,
+                            bool cycle) {
+    XHCITransferRequestBlock command = {};
+    command.parameter = dequeuePhys | (cycle ? 1u : 0u);   // DCS in bit 0, stream context type 0
+    command.control = (XHCI_TRB_TYPE_SET_TR_DEQUEUE_COMMAND << XHCI_TRB_TYPE_SHIFT) |
         (static_cast<uint32_t>(endpointId) << XHCI_TRB_ENDPOINT_ID_SHIFT) |
         (static_cast<uint32_t>(slotId) << XHCI_TRB_SLOT_ID_SHIFT);
     return submit_command(state, command, nullptr);
@@ -1910,17 +1957,24 @@ uint64_t enqueue_ep0_trb(XHCISlotState& slot, XHCITransferRequestBlock trb) {
     return ep0_trb_phys(slot, index);
 }
 
-bool wait_transfer(XHCIControllerState& state, XHCISlotState& slot) {
-    for (uint32_t i = 0; i < XHCI_TRANSFER_TIMEOUT; ++i) {
+bool wait_transfer(XHCIControllerState& state, XHCISlotState& slot, uint64_t timeoutMs) {
+    const uint64_t start = time_get_uptime_ms();
+    for (;;) {
         handle_controller_interrupt(state);
         if (slot.transferCompleted) {
             return slot.lastTransferCompletionCode == XHCI_COMPLETION_SUCCESS ||
                 slot.lastTransferCompletionCode == 13;
         }
+        if (time_get_uptime_ms() - start >= timeoutMs) {
+            break;
+        }
+        TLB::pollPending();   // interrupts are off: a shootdown may wait for us
         io_wait();
     }
 
-    log_str("[usb:xhci] transfer timeout slot=");
+    log_str("[usb:xhci] transfer timeout after ");
+    log_dec(timeoutMs);
+    log_str(" ms slot=");
     log_dec(slot.slotId);
     log_str(" trb=");
     log_hex(slot.pendingTransferPhys);
@@ -1929,12 +1983,37 @@ bool wait_transfer(XHCIControllerState& state, XHCISlotState& slot) {
     return false;
 }
 
+// A failed control transfer leaves ep0 unusable: an error (a STALL, which a
+// device sends for a request it does not support, included) halts it, and
+// after a timeout the xHC may still be working on its TRBs. Every later
+// request then timed out too (the PC's keyboard STALLs SET_PROTOCOL, and
+// SET_IDLE and each lights SET_REPORT after it waited seconds for nothing).
+// As Linux's xhci does for a halted endpoint (xhci_handle_halted_endpoint):
+// Reset Endpoint (or Stop Endpoint when it was not halted), then Set TR
+// Dequeue Pointer past what was queued, so the next request starts clean.
+void recover_ep0(XHCIControllerState& state, XHCISlotState& slot, bool halted) {
+    constexpr uint8_t kEp0 = 1;
+    bool stopped = halted ? command_reset_endpoint(state, slot.slotId, kEp0, false)
+                          : command_stop_endpoint(state, slot.slotId, kEp0, false);
+    if (!stopped) {
+        // Its state was not what the failure suggested: try the other one.
+        stopped = halted ? command_stop_endpoint(state, slot.slotId, kEp0, false)
+                         : command_reset_endpoint(state, slot.slotId, kEp0, false);
+    }
+    const bool moved = command_set_tr_dequeue(state, slot.slotId, kEp0, ep0_trb_phys(slot, slot.ep0Enqueue),
+                                              slot.ep0Cycle);
+    log_str("[usb:xhci] ep0 of slot ");
+    log_dec(slot.slotId);
+    log_str(stopped && moved ? " recovered after the failure\n" : " could not be recovered\n");
+}
+
 bool xhci_control_transfer(
     XHCIControllerState& state,
     XHCISlotState& slot,
     const UsbSetupPacket& setup,
     void* data,
-    uint16_t length
+    uint16_t length,
+    uint64_t timeoutMs
 ) {
     if (!slot.ep0Ring || length > XHCI_MAX_CONTROL_TRANSFER_BYTES) {
         return false;
@@ -1991,7 +2070,7 @@ bool xhci_control_transfer(
     asm volatile("" ::: "memory");
     mmio_write32(state.doorbellBase, slot.slotId * 4, 1);
 
-    const bool ok = wait_transfer(state, slot);
+    const bool ok = wait_transfer(state, slot, timeoutMs);
     if (ok && in && data && length > 0) {
         memcpy(data, dma, length);
     }
@@ -2006,6 +2085,7 @@ bool xhci_control_transfer(
         log_str("(");
         log_str(completion_code_name(slot.lastTransferCompletionCode));
         log_str(")\n");
+        recover_ep0(state, slot, slot.lastTransferCompletionCode != 0);
     }
     return ok;
 }
@@ -2028,7 +2108,8 @@ void sync_keyboard_leds(XHCIControllerState& state, XHCISlotState& slot) {
     setup.value = static_cast<uint16_t>(0x0200 | reportId);   // output report
     setup.index = slot.keyboardInterface;
     setup.length = reportId != 0 ? 2 : 1;
-    if (xhci_control_transfer(state, slot, setup, reportId != 0 ? report : report + 1, setup.length)) {
+    if (xhci_control_transfer(state, slot, setup, reportId != 0 ? report : report + 1, setup.length,
+                              kLedTransferTimeoutMs)) {
         slot.keyboardLedsKnown = true;
         slot.keyboardLeds = leds;
         slot.keyboardLedFailures = 0;
@@ -2967,6 +3048,7 @@ bool bind_prt_interrupt(uint8_t bus, uint8_t slot, uint8_t function, XHCIControl
     const uint8_t vector = nextPrtVector++;
     const uint8_t targetCore = static_cast<uint8_t>(LAPIC::get().getId());
 
+    get_xhci_interrupt_handler().claimVector(vector);
     ISR::registerIRQ(vector, &get_xhci_interrupt_handler());
     if (!APICManager::get().mapGSI(gsi, vector, targetCore, flags)) {
         return false;
@@ -3123,6 +3205,7 @@ bool initialize_register_model(uint8_t bus, uint8_t slot, uint8_t function, uint
     mmio_write64(interrupterBase, XHCI_IR_ERDP, state.eventRingPhys | XHCI_ERDP_EHB);
 
     if (PCI::get().registerMSIInterrupt(0, bus, slot, function, &get_xhci_interrupt_handler(), &state.irqVector)) {
+        get_xhci_interrupt_handler().claimVector(state.irqVector);
         state.irqRegistered = true;
         state.msiEnabled = true;
         log_str("[usb:xhci] irq msi vector=");

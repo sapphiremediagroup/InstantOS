@@ -122,6 +122,11 @@ public:
     void Run(InterruptFrame* frame) override {
         (void)frame;
         owner.handleInterrupt();
+        // An MSI vector is ours alone, so the EOI is ours too; on a shared
+        // INTx line the dispatcher sends it after all its handlers.
+        if (owner.getIRQMode() == VirtIOGPUDriver::IRQMode::MSI) {
+            LAPIC::get().sendEOI();
+        }
     }
 
 private:

@@ -31,6 +31,8 @@ struct PerCPUData {
     uint64_t tlbPages;             // 80: 0 = flush everything
     // Device interrupts this CPU served (not timer, scheduler or TLB vectors).
     uint64_t deviceIrqs;           // 88
+    // The syscall this CPU is in, ~0 when none (for the lock-up watchdog).
+    volatile uint64_t currentSyscall = ~0ULL;   // 96
 };
 
 static_assert(__builtin_offsetof(PerCPUData, kernelStack) == 0, "syscallEntry reads gs:[0]");

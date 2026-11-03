@@ -350,7 +350,7 @@ uint64_t Syscall::handle(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
         case WindowResize:
             return sys_window_resize(arg1, arg2, arg3);
         case WindowControl:
-            return sys_window_control(arg1, arg2);
+            return sys_window_control(arg1, arg2, arg3, arg4, arg5);
         case QueueCreate:
             return sys_queue_create();
         case QueueSend:
@@ -401,6 +401,24 @@ uint64_t Syscall::handle(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
             return sys_window_post_event(arg1, arg2);
         case KernelLog:
             return sys_kernel_log(arg1, arg2);
+        case GpuTest:
+            return sys_gpu_test(arg1, arg2, arg3);
+        case Reboot:
+            return sys_reboot(arg1);
+        case Display:
+            return sys_display(arg1, arg2);
+        case SocketPair:
+            return sys_socketpair(arg1, arg2, arg3, arg4);
+        case SocketSendMsg:
+            return sys_socket_sendmsg(arg1, arg2, arg3);
+        case SocketRecvMsg:
+            return sys_socket_recvmsg(arg1, arg2, arg3);
+        case SurfaceFromBuffer:
+            return sys_surface_from_buffer(arg1, arg2, arg3);
+        case SurfaceWaitIdle:
+            return sys_surface_wait_idle(arg1, arg2);
+        case SurfaceExportBuffer:
+            return sys_surface_export_buffer(arg1);
         case ThreadCreate:
             return sys_thread_create(arg1, arg2, arg3);
         case ThreadClone:
@@ -582,7 +600,9 @@ extern "C" uint64_t syscallHandler(uint64_t syscall_num, uint64_t arg1, uint64_t
     uint64_t result;
     {
         StorageLock::AllowUnlocked unlocked(storageMayRunUnlocked(syscall_num));
+        getPerCPU()->currentSyscall = syscall_num;
         result = Syscall::get().handle(syscall_num, arg1, arg2, arg3, arg4, arg5);
+        getPerCPU()->currentSyscall = ~0ULL;   // this thread may have moved CPUs
     }
     Debug::endSyscallTrace(current);
 

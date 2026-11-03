@@ -1,3 +1,5 @@
+#include <cpu/syscall/unix_socket.hpp>
+#include <graphics/intel_gen9_drm.hpp>
 #include <cpu/syscall/syscall.hpp>
 #include <cpu/cereal/cereal.hpp>
 #include <cpu/process/scheduler.hpp>
@@ -610,6 +612,9 @@ int16_t pollHandle(Process* current, const PollFD& fd) {
         auto* service = reinterpret_cast<ServiceObject*>(entry->object);
         return pollMessageQueue(service ? service->getQueue() : nullptr, *entry, fd.events);
     }
+    if (unixsock::isUnixEntry(entry)) {
+        return unixsock::poll(entry->object, fd.events);
+    }
     if (entry->type == HandleType::Socket) {
         return pollSocketHandle(entry->object, entry->rights, fd.events);
     }
@@ -625,6 +630,9 @@ int16_t pollHandle(Process* current, const PollFD& fd) {
 
     if (node->getType() == FileType::Pipe) {
         return pollPipe(pipeEndpoint(node), fd.events);
+    }
+    if (drm::isDrmNode(node)) {
+        return drm::poll(node, fd.events);   // sync_files and dma-bufs wait for the GPU
     }
 
     if (node->getType() == FileType::CharDevice) {
@@ -910,6 +918,28 @@ uint64_t openPtyMaster(Process* current, uint64_t flags) {
     return handle;
 }
 
+// One open of the DRM render node: a DRM file of its own (handles, GPU
+// address space), destroyed when the last descriptor of it closes.
+uint64_t openRenderNode(Process* current, uint64_t flags) {
+    VNode* node = drm::createFileNode();
+    if (!node) {
+        return syscall_error(drm::available() ? SysErrNoMemory : SysErrNoDevice);
+    }
+    FileDescriptor* fd = new FileDescriptor(node, static_cast<int>(flags), "/dev/dri/renderD128");
+    if (!fd) {
+        node->ops->close(node);
+        delete node;
+        return syscall_error(SysErrNoMemory);
+    }
+    uint64_t handle = current->allocateFD(fd, HandleRightRead | HandleRightWrite | HandleRightDuplicate,
+                                          (flags & kOpenCloseOnExec) != 0);
+    if (handle == static_cast<uint64_t>(-1)) {
+        VFS::get().close(fd);
+        return syscall_error(SysErrNoMemory);
+    }
+    return handle;
+}
+
 // Open the slave end of an existing pty by index (used for /dev/pts/N).
 uint64_t openPtySlave(Process* current, uint32_t index, uint64_t flags) {
     PtyDevice* dev = PtyManager::get().deviceForIndex(index);
@@ -1056,6 +1086,10 @@ uint64_t Syscall::sys_write(uint64_t fileHandle, uint64_t buf, uint64_t count) {
     Process* current = Scheduler::get().getCurrentProcess();
     if (!current) return syscall_error(SysErrInvalid);
     
+    // write() on a socket is send() with no flags, as on Linux.
+    if (HandleEntry* entry = current->getHandle(fileHandle); entry && entry->type == HandleType::Socket) {
+        return sys_send(fileHandle, buf, count, 0);
+    }
     FileDescriptor* fileFd = current->getFD(fileHandle, HandleRightWrite);
     if (!fileFd) return syscall_error(SysErrBadFile);
     PinnedFd pin(fileFd);
@@ -1225,6 +1259,10 @@ uint64_t Syscall::sys_read(uint64_t fileHandle, uint64_t buf, uint64_t count) {
     Process* current = Scheduler::get().getCurrentProcess();
     if (!current) return syscall_error(SysErrInvalid);
     
+    // read() on a socket is recv() with no flags.
+    if (HandleEntry* entry = current->getHandle(fileHandle); entry && entry->type == HandleType::Socket) {
+        return sys_recv(fileHandle, buf, count, 0);
+    }
     FileDescriptor* fileFd = current->getFD(fileHandle, HandleRightRead);
     if (!fileFd) return syscall_error(SysErrBadFile);
     PinnedFd pin(fileFd);
@@ -1310,6 +1348,9 @@ uint64_t Syscall::sys_open(uint64_t path, uint64_t flags, uint64_t mode) {
     // each open gets a fresh, independently-tracked endpoint.
     if (pathEquals(pathname, "/dev/ptmx")) {
         return openPtyMaster(current, flags);
+    }
+    if (pathEquals(pathname, "/dev/dri/renderD128")) {
+        return openRenderNode(current, flags);
     }
     {
         uint32_t ptsIndex = 0;
@@ -1993,7 +2034,8 @@ uint64_t Syscall::sys_fcntl(uint64_t handle, uint64_t command, uint64_t value) {
                 }
             }
             HandleEntry* entry = current->getHandle(handle);
-            if (entry && entry->type == HandleType::Socket && socketIsNonBlocking(entry->object)) {
+            if (unixsock::isUnixEntry(entry) ? unixsock::isNonBlocking(entry->object)
+                                             : (entry && entry->type == HandleType::Socket && socketIsNonBlocking(entry->object))) {
                 flags |= kOpenNonBlock;
             }
             return flags;
@@ -2004,7 +2046,9 @@ uint64_t Syscall::sys_fcntl(uint64_t handle, uint64_t command, uint64_t value) {
             if (PipeEndpoint* ep = pipeEndpointFromHandle(current, handle)) {
                 ep->nonBlock = (value & kOpenNonBlock) != 0;
             }
-            if (HandleEntry* entry = current->getHandle(handle); entry && entry->type == HandleType::Socket) {
+            if (HandleEntry* entry = current->getHandle(handle); unixsock::isUnixEntry(entry)) {
+                unixsock::setNonBlocking(entry->object, (value & kOpenNonBlock) != 0);
+            } else if (entry && entry->type == HandleType::Socket) {
                 socketSetNonBlocking(entry->object, (value & kOpenNonBlock) != 0);
             }
             return 0;
@@ -2041,6 +2085,9 @@ uint64_t Syscall::sys_ioctl(uint64_t handle, uint64_t request, uint64_t arg) {
     }
     auto* fileFd = reinterpret_cast<FileDescriptor*>(entry->object);
     VNode* node = fileFd ? fileFd->getNode() : nullptr;
+    if (drm::isDrmNode(node)) {
+        return drm::ioctl(node, request, arg);   // the render node, dma-bufs, sync_files
+    }
     if (!node || node->getType() != FileType::CharDevice) {
         return syscall_error(SysErrInvalid);
     }

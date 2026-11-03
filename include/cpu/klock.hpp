@@ -45,6 +45,12 @@ void setDepth(uint32_t depth);
 
 bool heldByThisCpu();
 
+// For the lock-up watchdog (read without the lock, so only a snapshot):
+// the owning CPU's index + 1 (0 while free), and the entry site it took the
+// lock from.
+uint32_t debugOwner();
+uint32_t debugOwnerSite();
+
 // Drops the lock for a stretch of code that does not need it (storage I/O, see
 // fs/storage/storage_lock.hpp) and returns the nesting depth to hand back to
 // resume(). Returns 0, and does nothing, if this CPU does not hold the lock.

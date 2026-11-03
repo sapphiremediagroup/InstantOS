@@ -1,8 +1,10 @@
+#include <cpu/watchdog.hpp>
 #include <cpu/idt/interrupt.hpp>
 #include <cpu/idt/isr.hpp>
 #include <debug/diag.hpp>
 #include <cpu/process/scheduler.hpp>
 #include <graphics/console.hpp>
+#include <graphics/intel_gen9.hpp>
 #include <cpu/cpuid.hpp>
 #include <memory/vmm.hpp>
 #include <cpu/cereal/cereal.hpp>
@@ -229,7 +231,8 @@ static void handleException(InterruptFrame* frame) {
         }
         return;
     }
-    // Console::get().drawText("\033[2J");
+    // A kernel exception's report is drawn into the firmware's framebuffer.
+    Debug::takeScreenForReport();
     const char* exception_name = (frame->interrupt < 32) ? exception_names[frame->interrupt] : "Unknown";
     Console::get().drawText(exception_name);
     Console::get().drawText("\n\t- Interrupt: ");
@@ -277,6 +280,11 @@ static void handleException(InterruptFrame* frame) {
 // kernel (e.g. demand paging a user buffer during a syscall) nests on the lock
 // this CPU already holds.
 extern "C" void exceptionHandler(InterruptFrame* frame) {
+    // The watchdog's NMI (cpu/watchdog.hpp): record where this CPU was and go
+    // straight back, taking no lock (this CPU may be the one stuck holding it).
+    if (frame->interrupt == 2 && Watchdog::onNmi(frame)) {
+        return;
+    }
     KernelLock::enter(KernelLock::kSiteException + (frame->interrupt & 0xFF));
     handleException(frame);
     KernelLock::leave();
@@ -312,6 +320,10 @@ extern "C" void irqHandler(InterruptFrame* frame) {
         LAPIC::get().sendEOI();
         return;
     }
+    Watchdog::noteIrq(static_cast<uint8_t>(frame->interrupt));
+    if (frame->interrupt == VECTOR_AP_TIMER) {
+        Watchdog::apTick();   // before any lock: it watches for a hung boot CPU
+    }
     // Served without the lock: the sender holds it while waiting for us.
     if (frame->interrupt == VECTOR_TLB_SHOOTDOWN) {
         TLB::handleIpi();
@@ -320,7 +332,9 @@ extern "C" void irqHandler(InterruptFrame* frame) {
     const uint32_t site = KernelLock::kSiteIrq + (frame->interrupt & 0xFF);
     // Scheduler ticks are frequent and usually change nothing; taking the lock
     // for each would stall every CPU behind whichever one holds it.
+    // Not when the boot CPU's tick duties are overdue: this tick runs them.
     if ((frame->interrupt == VECTOR_AP_TIMER || frame->interrupt == VECTOR_RESCHEDULE) &&
+        !(frame->interrupt == VECTOR_AP_TIMER && timer_duties_overdue()) &&
         Scheduler::get().tickIsNoop(frame)) {
         LAPIC::get().sendEOI();
         return;
@@ -339,8 +353,7 @@ extern "C" void irqHandler(InterruptFrame* frame) {
             }
             KernelLock::enter(site);
         }
-        skippedTicks = 0;
-    } else {
+        skippedTicks = 0;    } else {
         KernelLock::enter(site);
     }
     handleIrq(frame);

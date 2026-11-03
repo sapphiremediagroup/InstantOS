@@ -221,6 +221,9 @@ public:
   bool mmapAddFileRegion(uint64_t start, uint64_t length, uint64_t prot,
                          FileDescriptor* file, uint64_t fileOffset,
                          uint64_t fileLength, bool shared);
+  // Pages already mapped (kSharedFrame) that `object` owns: the region holds
+  // a reference to it until munmap, exit or exec drops the region.
+  bool mmapAddObjectRegion(uint64_t start, uint64_t length, uint64_t prot, struct MappedObject* object);
   void mmapRemoveRange(uint64_t start, uint64_t length);
   bool mmapProtectRange(uint64_t start, uint64_t length, uint64_t prot);
   // Write back the present pages of any writable MAP_SHARED file region that
@@ -260,8 +263,9 @@ public:
   void closeFilesOnExit();
 
   // Copy another process's handle table into ours (fd inheritance for
-  // spawn/fork). skipCloseOnExec excludes FD_CLOEXEC handles.
-  void cloneHandlesFrom(Process *source, bool skipCloseOnExec);
+  // spawn/fork). skipCloseOnExec excludes FD_CLOEXEC handles; filesOnly
+  // keeps just files, pipes and sockets.
+  void cloneHandlesFrom(Process *source, bool skipCloseOnExec, bool filesOnly = false);
 
   // P3.2 exec fd-inheritance: sys_exec keeps the kernel handle table across an
   // image replacement (dropping CLOEXEC), but the new libc reinitializes its

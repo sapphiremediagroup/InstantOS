@@ -596,7 +596,84 @@ enum class SyscallNumber : uint64_t {
     SetUnixTime,
     WindowPostEvent,
     KernelLog,
+    GpuTest,
+    Reboot,
+    Display,
+    SocketPair,
+    SocketSendMsg,
+    SocketRecvMsg,
+    SurfaceFromBuffer,
+    SurfaceWaitIdle,
+    SurfaceExportBuffer,   // 160 (compositor): (surface id) a GPU-buffer surface's dma-buf as a File handle
 };
+
+// SocketSendMsg/SocketRecvMsg (AF_UNIX only; other sockets: -EOPNOTSUPP):
+// one flat buffer plus the handles passed with it (SCM_RIGHTS). mlibc's
+// sendmsg/recvmsg gather and scatter the iovecs and translate the fds.
+struct SocketMessage {
+    uint64_t buffer;
+    uint64_t length;
+    uint64_t handles;       // uint64_t[]: send: the handles to pass; recv: room for them
+    uint32_t handleCount;   // send: how many; recv: capacity in, received out
+    uint32_t flags;         // recv, out: kSocketMsgTrunc, kSocketMsgCtrunc
+};
+
+constexpr uint32_t kSocketMsgTrunc = 0x20;    // MSG_TRUNC: a record was longer than the buffer
+constexpr uint32_t kSocketMsgCtrunc = 0x08;   // MSG_CTRUNC: handles were dropped
+constexpr uint32_t kSocketMaxRights = 253;    // SCM_MAX_FD
+
+// Reboot's argument.
+enum class RebootMode : uint64_t {
+    Restart = 0,
+    PowerOff = 1,
+};
+
+// GpuTest commands: hardware experiments on the Intel Gen9 GPU, run on request
+// by /bin/gpu-test (root only), never at boot.
+enum class GpuTestCommand : uint64_t {
+    Info = 0,       // map the GGTT and report it (firmware ranges, free space)
+    Gtt = 1,        // buffer objects: bind, CPU access both ways, unbind
+    FlipOn = 2,     // show a test pattern from a buffer object on plane A
+    FlipOff = 3,    // back to the firmware's framebuffer
+    Engine = 4,     // the blitter runs commands that store values to memory
+    Hang = 5,       // a blitter hang is detected, reset, and the engine works again
+    Render = 6,     // the render engine runs commands that store values to memory
+    Irq = 7,        // both engines raise MI_USER_INTERRUPT; the caller sleeps until the MSI
+    Ppgtt = 8,      // a 48-bit per-process address space: a batch in it stores, read back unflushed
+    DrmWithoutGpu = 9, // let /dev/dri/renderD128 open with no Intel GPU (QEMU checks; execbuffer: ENODEV)
+    DrmState = 10,     // the request queue, the engines and what the requests took (gpu-test state)
+};
+
+// Display commands (the graphics-compositor only): tear-free presentation on
+// the Intel Gen9 display. The kernel owns two scanout buffers the size of the
+// screen, mapped write-combining into the caller; the compositor draws into
+// the one not shown, then flips to it (the display takes it at the next
+// vertical blank).
+enum class DisplayCommand : uint64_t {
+    Acquire = 0,    // arg: DisplayBuffersInfo*; maps the buffers, fills it in (flags = kDisplayEmulated on
+                    // the way in also accepts the emulation)
+    Flip = 1,       // arg: buffer index; arms the flip and returns at once
+    Wait = 2,       // arg: timeout in ms; sleeps until the last flip is on screen (-ETIMEDOUT)
+    Release = 3,    // the firmware's framebuffer goes back on screen
+    ExportBuffer = 4,   // arg: buffer index; the buffer as an uncached dma-buf (a File handle) to render into on the
+                        // GPU (step 8b); -ENODEV with the emulation
+};
+
+constexpr uint64_t kDisplayMaxBuffers = 2;
+
+struct DisplayBuffersInfo {
+    uint64_t address[kDisplayMaxBuffers];   // where each buffer is mapped in the caller
+    uint32_t count;
+    uint32_t width;
+    uint32_t height;
+    uint32_t pitch;                          // bytes per row (XRGB8888)
+    uint32_t flags;                          // kDisplayEmulated
+    uint32_t reserved;
+};
+
+// Without the Intel display (QEMU) the kernel emulates the buffers: a flip
+// copies the buffer to the framebuffer. Only for testing the compositor.
+constexpr uint32_t kDisplayEmulated = 1;
 
 enum MemoryProtection : uint64_t {
     MemoryProtRead = 1ULL << 0,
@@ -616,6 +693,7 @@ enum SyscallErrno : int {
     SysErrAccess = 13,
     SysErrExists = 17,
     SysErrCrossDevice = 18,
+    SysErrNoDevice = 19,
     SysErrNotDirectory = 20,
     SysErrIsDirectory = 21,
     SysErrInvalid = 22,
@@ -690,9 +768,10 @@ public:
     static bool copyToUser(uint64_t dest, const void* src, size_t size);
     static bool copyStringFromUser(uint64_t src, char* dest, size_t destSize);
     static bool copyUserString(uint64_t ptr, char* dest, size_t destSize);
+    // Joins a relative path to the cwd and normalizes it (out: 512 bytes).
+    static bool makeAbsolutePath(const char* path, char* out);
     
 private:
-    static bool makeAbsolutePath(const char* path, char* out);
     uint64_t sys_exit(uint64_t code);
     uint64_t sys_write(uint64_t fileHandle, uint64_t buf, uint64_t count);
     uint64_t sys_serial_write(uint64_t buf, uint64_t count);
@@ -821,7 +900,8 @@ private:
     uint64_t sys_window_focus(uint64_t windowId);
     uint64_t sys_window_move(uint64_t windowId, uint64_t x, uint64_t y);
     uint64_t sys_window_resize(uint64_t windowId, uint64_t width, uint64_t height);
-    uint64_t sys_window_control(uint64_t windowId, uint64_t action);
+    uint64_t sys_window_control(uint64_t windowId, uint64_t action, uint64_t maxXY, uint64_t maxWidth,
+                                uint64_t maxHeight);
     uint64_t sys_queue_create();
     uint64_t sys_queue_send(uint64_t handle, uint64_t message, uint64_t wait);
     uint64_t sys_queue_receive(uint64_t handle, uint64_t message, uint64_t wait);
@@ -848,6 +928,15 @@ private:
     uint64_t sys_set_unix_time(uint64_t unix_ns);
     uint64_t sys_window_post_event(uint64_t window_id, uint64_t event_ptr);
     uint64_t sys_kernel_log(uint64_t buffer, uint64_t length);
+    uint64_t sys_gpu_test(uint64_t command, uint64_t buffer, uint64_t length);
+    uint64_t sys_reboot(uint64_t mode);
+    uint64_t sys_display(uint64_t command, uint64_t arg);
+    uint64_t sys_socketpair(uint64_t domain, uint64_t type, uint64_t protocol, uint64_t handlesOut);
+    uint64_t sys_socket_sendmsg(uint64_t socket, uint64_t message, uint64_t flags);
+    uint64_t sys_socket_recvmsg(uint64_t socket, uint64_t message, uint64_t flags);
+    uint64_t sys_surface_from_buffer(uint64_t bufferHandle, uint64_t packedSize, uint64_t packedPitchFormat);
+    uint64_t sys_surface_wait_idle(uint64_t surfaceHandle, uint64_t timeoutMs);
+    uint64_t sys_surface_export_buffer(uint64_t surfaceId);
 };
 
 extern "C" void syscallEntry();

@@ -5,6 +5,7 @@
 #include <common/krandom.hpp>
 #include <graphics/console.hpp>
 #include <cpu/cereal/cereal.hpp>
+#include <graphics/intel_gen9_drm.hpp>
 
 namespace {
 DevFS* gActiveDevFS = nullptr;
@@ -81,6 +82,16 @@ int devCharStat(VNode* node, FileStats* stats) {
     return 0;
 }
 
+// /dev/dri/renderD128 as stat sees it: Linux's DRM major, render minor 128
+// (what libdrm checks before it reads /sys/dev/char/226:128).
+int devRenderStat(VNode* node, FileStats* stats) {
+    if (devCharStat(node, stats) != 0) {
+        return -1;
+    }
+    stats->rdev = (226u << 8) | 128u;
+    return 0;
+}
+
 int devStatfs(VNode*, FsStats* stats) {
     if (!stats) return -1;
     // DevFS is a pseudo-filesystem with no storage.
@@ -122,7 +133,44 @@ VNode* devRootLookup(VNode*, const char* name) {
     if (nameEquals(name, "random")) {
         return gActiveDevFS->getRandomNode();
     }
+    if (nameEquals(name, "dri") && drm::available()) {
+        return gActiveDevFS->getDriDirNode();
+    }
     return nullptr;
+}
+
+VNode* devDriLookup(VNode*, const char* name) {
+    if (!gActiveDevFS || !name || !drm::available()) {
+        return nullptr;
+    }
+    return nameEquals(name, "renderD128") ? gActiveDevFS->getRenderNode() : nullptr;
+}
+
+// A directory listing from fixed names; those whose bit is set in dirsMask are directories.
+int fixedReaddir(const char* const* names, uint64_t total, uint64_t dirsMask, FileType other, DirEntry* entries,
+                 uint64_t count, uint64_t* read) {
+    uint64_t produced = 0;
+    for (uint64_t i = 0; i < total && produced < count; i++) {
+        DirEntry& e = entries[produced];
+        memset(&e, 0, sizeof(e));
+        int j = 0;
+        while (names[i][j] && j < 255) {
+            e.name[j] = names[i][j];
+            j++;
+        }
+        e.name[j] = '\0';
+        e.type = (dirsMask & (1ull << i)) ? FileType::Directory : other;
+        produced++;
+    }
+    if (read) {
+        *read = produced;
+    }
+    return 0;
+}
+
+int devDriReaddir(VNode*, DirEntry* entries, uint64_t count, uint64_t* read) {
+    static const char* names[] = { ".", "..", "renderD128" };
+    return fixedReaddir(names, drm::available() ? 3 : 2, 0x3, FileType::CharDevice, entries, count, read);
 }
 
 VNode* devPtsLookup(VNode*, const char* name) {
@@ -140,7 +188,11 @@ VNode* devPtsLookup(VNode*, const char* name) {
 }
 
 int devRootReaddir(VNode*, DirEntry* entries, uint64_t count, uint64_t* read) {
-    static const char* names[] = { ".", "..", "ptmx", "pts", "tty", "console", "null", "zero", "urandom", "random" };
+    static const char* names[] = { ".", "..", "ptmx", "pts", "tty", "console", "null", "zero", "urandom", "random", "dri" };
+    if (drm::available()) {
+        return fixedReaddir(names, 11, (1ull << 0) | (1ull << 1) | (1ull << 3) | (1ull << 10), FileType::CharDevice,
+                            entries, count, read);
+    }
     constexpr uint64_t kCount = 9;
     uint64_t produced = 0;
     for (uint64_t i = 0; i < kCount && produced < count; i++) {
@@ -230,7 +282,8 @@ int64_t devRandomRead(VNode*, void* buffer, uint64_t size, uint64_t) {
 DevFS::DevFS() : FileSystem("devfs"),
                  rootNode(nullptr), ptmxNode(nullptr), ptsDirNode(nullptr), ttyNode(nullptr),
                  consoleNode(nullptr),
-                 nullNode(nullptr), zeroNode(nullptr), urandomNode(nullptr), randomNode(nullptr) {
+                 nullNode(nullptr), zeroNode(nullptr), urandomNode(nullptr), randomNode(nullptr),
+                 driDirNode(nullptr), renderNode(nullptr) {
     memset(&rootOps, 0, sizeof(rootOps));
     memset(&ptmxOps, 0, sizeof(ptmxOps));
     memset(&ptsDirOps, 0, sizeof(ptsDirOps));
@@ -238,6 +291,12 @@ DevFS::DevFS() : FileSystem("devfs"),
     memset(&nullOps, 0, sizeof(nullOps));
     memset(&zeroOps, 0, sizeof(zeroOps));
     memset(&randomOps, 0, sizeof(randomOps));
+    memset(&driDirOps, 0, sizeof(driDirOps));
+    memset(&renderOps, 0, sizeof(renderOps));
+    driDirOps.stat = devDirStat;
+    driDirOps.lookup = devDriLookup;
+    driDirOps.readdir = devDriReaddir;
+    renderOps.stat = devRenderStat;
     for (int i = 0; i < 64; i++) {
         ptsSlaveNodes[i] = nullptr;
     }
@@ -279,6 +338,10 @@ DevFS::DevFS() : FileSystem("devfs"),
     zeroNode = new VNode(this, KindZero, FileType::CharDevice);
     urandomNode = new VNode(this, KindUrandom, FileType::CharDevice);
     randomNode = new VNode(this, KindRandom, FileType::CharDevice);
+    driDirNode = new VNode(this, KindDriDir, FileType::Directory);
+    renderNode = new VNode(this, KindRenderNode, FileType::CharDevice);
+    if (driDirNode) { driDirNode->ops = &driDirOps; driDirNode->refCount = 1; }
+    if (renderNode) { renderNode->ops = &renderOps; renderNode->refCount = 1; }
 
     if (rootNode) { rootNode->ops = &rootOps; rootNode->refCount = 1; }
     if (ptmxNode) { ptmxNode->ops = &ptmxOps; ptmxNode->refCount = 1; }
@@ -306,6 +369,8 @@ DevFS::~DevFS() {
     delete zeroNode;
     delete urandomNode;
     delete randomNode;
+    delete driDirNode;
+    delete renderNode;
     for (int i = 0; i < 64; i++) {
         delete ptsSlaveNodes[i];
     }

@@ -34,6 +34,8 @@ public:
         KindUrandom = 7,
         KindRandom = 8,
         KindConsole = 9,
+        KindDriDir = 10,      // /dev/dri, while the GPU's render node can open
+        KindRenderNode = 11,  // /dev/dri/renderD128 (opened via the sys_open special case)
     };
 
     static constexpr uint64_t kPtsSlaveInodeBase = 0x1000;
@@ -46,6 +48,8 @@ public:
     VNode* getZeroNode() { return zeroNode; }
     VNode* getUrandomNode() { return urandomNode; }
     VNode* getRandomNode() { return randomNode; }
+    VNode* getDriDirNode() { return driDirNode; }
+    VNode* getRenderNode() { return renderNode; }
 
     // Returns a cached marker VNode for /dev/pts/<index>, or nullptr if no such
     // pty exists. The marker's inode encodes the slave index.
@@ -64,6 +68,10 @@ private:
     VNode* urandomNode;
     VNode* randomNode;
     VNode* ptsSlaveNodes[64];
+    VNode* driDirNode;
+    VNode* renderNode;
+    VNodeOps driDirOps;
+    VNodeOps renderOps;  // stat only: char 226:128
     VNodeOps rootOps;
     VNodeOps ptmxOps;
     VNodeOps ptsDirOps;

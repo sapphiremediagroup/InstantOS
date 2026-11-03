@@ -6,6 +6,9 @@
 #include <graphics/console.hpp>
 #include <interrupts/keyboard.hpp>
 #include <ipc/ipc.hpp>
+#include <graphics/intel_gen9_drm.hpp>
+#include <fs/vfs/vfs.hpp>
+#include <time/tsc_timer.hpp>
 
 namespace {
 constexpr uint32_t kSharedHandleRights = HandleRightMap | HandleRightDuplicate;
@@ -257,6 +260,89 @@ uint64_t Syscall::sys_surface_create(uint64_t width, uint64_t height, uint64_t f
     return handleValue;
 }
 
+// A surface whose pixels are a GPU buffer: the dma-buf (an fd from PRIME)
+// with the size, pitch and format of the image in it. -errno on failure.
+uint64_t Syscall::sys_surface_from_buffer(uint64_t bufferHandle, uint64_t packedSize, uint64_t packedPitchFormat) {
+    Process* current = Scheduler::get().getCurrentProcess();
+    if (!current) {
+        return syscall_error(SysErrInvalid);
+    }
+    FileDescriptor* buffer = current->getFD(bufferHandle, HandleRightRead);
+    VNode* node = buffer ? buffer->getNode() : nullptr;
+    const uint64_t bufferSize = drm::dmaBufSize(node);
+    if (bufferSize == 0) {
+        return syscall_error(buffer ? SysErrInvalid : SysErrBadFile);
+    }
+    const uint32_t width = static_cast<uint32_t>(packedSize >> 32);
+    const uint32_t height = static_cast<uint32_t>(packedSize & 0xFFFFFFFFULL);
+    const uint32_t pitch = static_cast<uint32_t>(packedPitchFormat >> 32);
+    const uint32_t format = static_cast<uint32_t>(packedPitchFormat & 0xFFFFFFFFULL);
+    if (width == 0 || height == 0 || width > 16384 || height > 16384 || pitch < width * 4 || (pitch & 3) != 0 ||
+        static_cast<uint64_t>(pitch) * height > bufferSize) {
+        return syscall_error(SysErrInvalid);
+    }
+    SurfaceObject* object = IPCManager::get().createBufferSurface(buffer, width, height, pitch, format);
+    if (!object) {
+        return syscall_error(SysErrNoMemory);
+    }
+    const uint64_t handle = current->allocateHandle(HandleType::Surface, kSurfaceHandleRights, object,
+                                                    retainSurfaceHandle, releaseSurfaceHandle);
+    if (handle == static_cast<uint64_t>(-1)) {
+        object->release();
+        return syscall_error(SysErrNoMemory);
+    }
+    return handle;
+}
+
+// Sleeps until no window shows the surface and the compositor has listed the
+// windows since (so it no longer draws from it): its owner may draw into it
+// again. 0, -ETIMEDOUT, or -EINTR.
+uint64_t Syscall::sys_surface_wait_idle(uint64_t surfaceHandle, uint64_t timeoutMs) {
+    Process* current = Scheduler::get().getCurrentProcess();
+    if (!current) {
+        return syscall_error(SysErrInvalid);
+    }
+    auto* object = reinterpret_cast<SurfaceObject*>(current->getHandleObject(surfaceHandle, HandleType::Surface));
+    if (!object) {
+        return syscall_error(SysErrBadFile);
+    }
+    const uint64_t deadline = time_get_uptime_ms() + timeoutMs;
+    object->retain();
+    uint64_t result = 0;
+    while (object->inUse()) {
+        if (current->hasDeliverableSignal()) {
+            result = syscall_error(SysErrInterrupted);
+            break;
+        }
+        if (timeoutMs == 0 || time_get_uptime_ms() >= deadline) {
+            result = syscall_error(SysErrTimedOut);
+            break;
+        }
+        current->sleepUntil(deadline, true);
+        current->setState(ProcessState::Blocked);
+        Scheduler::get().scheduleFromSyscall();
+        current->clearSleep();
+    }
+    object->release();
+    return result;
+}
+
+// The compositor only (step 8b): the dma-buf behind a GPU-buffer surface, by
+// the id the window list names, as a new File handle of the compositor's, so
+// it can sample the window's pixels on the GPU where they are. -errno.
+uint64_t Syscall::sys_surface_export_buffer(uint64_t surfaceId) {
+    Process* current = Scheduler::get().getCurrentProcess();
+    if (!isCompositorProcess(current)) {
+        return syscall_error(SysErrPermission);
+    }
+    SurfaceObject* object = IPCManager::get().lookupSurface(surfaceId);
+    FileDescriptor* buffer = object ? object->getBuffer() : nullptr;
+    if (!buffer) {
+        return syscall_error(object ? SysErrInvalid : SysErrNoEntry);
+    }
+    return static_cast<uint64_t>(drm::reexportDmaBuf(buffer->getNode()));
+}
+
 uint64_t Syscall::sys_surface_map(uint64_t handle) {
     Process* current = Scheduler::get().getCurrentProcess();
     if (!current) {
@@ -285,6 +371,11 @@ uint64_t Syscall::sys_surface_commit(uint64_t handle, uint64_t x, uint64_t y, ui
     );
     if (!object) {
         return static_cast<uint64_t>(-1);
+    }
+
+    // A GPU buffer is shown once the GPU has finished drawing it.
+    if (FileDescriptor* buffer = object->getBuffer()) {
+        drm::waitDmaBufWritten(buffer->getNode(), 2000);
     }
 
     const uint32_t width = static_cast<uint32_t>(packedWH >> 32);
@@ -429,6 +520,32 @@ uint64_t Syscall::sys_window_attach_surface(uint64_t windowHandle, uint64_t surf
         return static_cast<uint64_t>(-1);
     }
 
+    // Frame pacing (Vulkan's FIFO, EGL's swap interval 1): a new GPU frame
+    // waits until the compositor has listed the window with its current one
+    // (it draws what it lists, and lists once a pass, its passes paced by the
+    // display's flips), so no frame is replaced unseen and a program draws
+    // no faster than the screen. At most kAttachPaceMs: a compositor that
+    // stopped listing slows a program down, it does not stop it.
+    constexpr uint64_t kAttachPaceMs = 100;
+    const uint64_t deadline = time_get_uptime_ms() + kAttachPaceMs;
+    for (;;) {
+        SurfaceObject* onScreen = window->getSurface();
+        if (!onScreen || onScreen == surface || !onScreen->getBuffer() || !surface->getBuffer() ||
+            !onScreen->isUnshown() || current->hasDeliverableSignal() || time_get_uptime_ms() >= deadline) {
+            break;
+        }
+        current->sleepUntil(deadline, true);
+        current->setState(ProcessState::Blocked);
+        Scheduler::get().scheduleFromSyscall();
+        current->clearSleep();
+        // Another thread may have closed either handle meanwhile.
+        window = reinterpret_cast<WindowObject*>(current->getHandleObject(windowHandle, HandleType::Window, HandleRightWrite));
+        surface = reinterpret_cast<SurfaceObject*>(current->getHandleObject(surfaceHandle, HandleType::Surface, HandleRightRead));
+        if (!window || !surface) {
+            return static_cast<uint64_t>(-1);
+        }
+    }
+
     window->attachSurface(surface);
     return 0;
 }
@@ -491,16 +608,30 @@ uint64_t Syscall::sys_window_resize(uint64_t windowId, uint64_t width, uint64_t 
         : static_cast<uint64_t>(-1);
 }
 
-uint64_t Syscall::sys_window_control(uint64_t windowId, uint64_t action) {
+// Maximize fills `maxXY` (x | y << 32), maxWidth x maxHeight with the
+// window's content: the compositor knows its frame and taskbar. Without them
+// (0 x 0) the content goes 16 px in from the screen's edges.
+uint64_t Syscall::sys_window_control(uint64_t windowId, uint64_t action, uint64_t maxXY, uint64_t maxWidth,
+                                     uint64_t maxHeight) {
     Process* current = Scheduler::get().getCurrentProcess();
     if (!isCompositorProcess(current)) {
         return static_cast<uint64_t>(-1);
     }
 
-    iFramebuffer* framebuffer = Console::get().getFramebuffer();
-    const int32_t maxWidth = framebuffer ? static_cast<int32_t>(framebuffer->getWidth()) : 1024;
-    const int32_t maxHeight = framebuffer ? static_cast<int32_t>(framebuffer->getHeight()) : 768;
-    return IPCManager::get().controlWindow(windowId, static_cast<WindowControlAction>(action), maxWidth, maxHeight)
+    int32_t x = static_cast<int32_t>(static_cast<uint32_t>(maxXY));
+    int32_t y = static_cast<int32_t>(static_cast<uint32_t>(maxXY >> 32));
+    int32_t width = static_cast<int32_t>(maxWidth);
+    int32_t height = static_cast<int32_t>(maxHeight);
+    if (width <= 0 || height <= 0) {
+        iFramebuffer* framebuffer = Console::get().getFramebuffer();
+        const int32_t screenWidth = framebuffer ? static_cast<int32_t>(framebuffer->getWidth()) : 1024;
+        const int32_t screenHeight = framebuffer ? static_cast<int32_t>(framebuffer->getHeight()) : 768;
+        x = 16;
+        y = 16;
+        width = screenWidth > 32 ? screenWidth - 32 : screenWidth;
+        height = screenHeight > 32 ? screenHeight - 32 : screenHeight;
+    }
+    return IPCManager::get().controlWindow(windowId, static_cast<WindowControlAction>(action), x, y, width, height)
         ? 0
         : static_cast<uint64_t>(-1);
 }

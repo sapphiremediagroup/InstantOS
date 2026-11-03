@@ -40,6 +40,9 @@ public:
     Section& operator=(const Section&) = delete;
 
 private:
+    // Takes the lock; may sleep when the BKL was given up (bklDepth != 0).
+    static void acquire(uint32_t& bklDepth);
+
     uint32_t savedBklDepth;
 };
 

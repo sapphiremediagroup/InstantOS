@@ -90,6 +90,8 @@ public:
         const bool interruptedUser = frame && frame->cs == 0x23;
         const bool runningIdle = current && current->getPriority() == ProcessPriority::Idle;
         if (frame && (interruptedUser || runningIdle)) {
+            // The boot CPU's tick duties, if it is stuck (tsc_timer.hpp).
+            timer_run_overdue_duties();
             Scheduler::get().schedule(frame);
         }
     }

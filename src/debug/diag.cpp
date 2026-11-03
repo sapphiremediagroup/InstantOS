@@ -6,6 +6,7 @@
 #include <cpu/syscall/syscall.hpp>
 #include <fs/vfs/vfs.hpp>
 #include <graphics/console.hpp>
+#include <graphics/intel_gen9.hpp>
 #include <memory/heap.hpp>
 
 namespace {
@@ -172,7 +173,13 @@ void initializeKernelSymbols() {
     loadKernelMapFromPath("/bin/kernel.map");
 }
 
+void takeScreenForReport() {
+    intel_gen9::IntelGen9Driver::get().showFirmwareSurfaceUnlocked();
+    Console::get().setFramebufferOutputEnabled(true);
+}
+
 void panic(const char* reason) {
+    takeScreenForReport();
     Console::get().drawText("\033[2J");
     Console::get().drawText("KERNEL PANIC\n");
     if (reason) {
@@ -188,6 +195,7 @@ void panic(const char* reason) {
 }
 
 void panicf(const char* reason, const char* detail) {
+    takeScreenForReport();
     Console::get().drawText("\033[2J");
     Console::get().drawText("KERNEL PANIC\n");
     if (reason) {

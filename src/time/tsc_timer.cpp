@@ -4,10 +4,12 @@
 #include <cpu/apic/irqs.hpp>
 #include <cpu/apic/lapic.hpp>
 #include <cpu/cereal/cereal.hpp>
+#include <graphics/console.hpp>
 #include <drivers/usb/ohci.hpp>
 #include <interrupts/timer.hpp>
 #include <interrupts/keyboard.hpp>
 #include <drivers/net/net_device.hpp>
+#include <graphics/intel_gen9.hpp>
 #include <time/rtc.hpp>
 
 namespace {
@@ -175,6 +177,50 @@ bool cpu_has_tsc_deadline() {
     return (ecx & (1U << 24)) != 0;
 }
 
+// Haswell through Kaby Lake have an erratum (Skylake SKL142 and kin) that can
+// leave the TSC-deadline timer silent until the microcode fixes it: on an
+// i3-6100 with the firmware's microcode the boot CPU's tick stopped seconds
+// after boot, idling in hlt. Linux's table (apic_check_deadline_errata) of the
+// first good microcode revision per model.
+bool tsc_deadline_has_errata(uint32_t* modelOut, uint32_t* revisionOut) {
+    uint32_t eax = 0, ebx = 0, ecx = 0, edx = 0;
+    cpuid(&eax, &ebx, &ecx, &edx);
+    if (ebx != 0x756E6547U) {   // "Genu"ineIntel
+        return false;
+    }
+    eax = 1; ebx = ecx = edx = 0;
+    cpuid(&eax, &ebx, &ecx, &edx);
+    const uint32_t family = (eax >> 8) & 0xF;
+    const uint32_t model = ((eax >> 4) & 0xF) | (((eax >> 16) & 0xF) << 4);
+    if (family != 6) {
+        return false;
+    }
+    struct Fixed { uint32_t model; uint32_t revision; };
+    constexpr Fixed kFixed[] = {
+        {0x3C, 0x22}, {0x45, 0x20}, {0x46, 0x17},   // Haswell, -L, -G
+        {0x3D, 0x25}, {0x47, 0x17},                 // Broadwell, -G
+        {0x4E, 0xB2}, {0x5E, 0xB2},                 // Skylake-L, Skylake
+        {0x8E, 0x52}, {0x9E, 0x52},                 // Kaby Lake-L, Kaby Lake
+    };
+    uint32_t needed = 0;
+    for (const Fixed& entry : kFixed) {
+        if (entry.model == model) {
+            needed = entry.revision;
+        }
+    }
+    if (needed == 0) {
+        return false;
+    }
+    // The revision is in MSR 8Bh's high half after it is zeroed and CPUID 1 runs.
+    wrmsr(0x8B, 0);
+    eax = 1; ebx = ecx = edx = 0;
+    cpuid(&eax, &ebx, &ecx, &edx);
+    const uint32_t revision = static_cast<uint32_t>(rdmsr(0x8B) >> 32);
+    if (modelOut) *modelOut = model;
+    if (revisionOut) *revisionOut = revision;
+    return revision < needed;
+}
+
 uint64_t detect_tsc_frequency() {
     const uint64_t cpuidFrequency = cpuid_tsc_frequency_candidate();
     const uint64_t calibratedFrequency = lapic_calibrate_tsc_frequency();
@@ -254,13 +300,76 @@ void timer_account_tick() {
     }
 }
 
-void timer_interrupt_handler() {
+namespace {
+
+volatile uint64_t s_dutiesMs = 0;        // uptime when the tick's duties last ran
+volatile uint64_t s_failovers = 0;
+// The current stand-in: when the boot CPU's tick went missing and how many
+// times APs ran its duties since. A long one is logged when the tick is back.
+volatile uint64_t s_outageSinceMs = 0;
+volatile uint64_t s_outageFailovers = 0;
+constexpr uint64_t kLoggedOutageMs = 250;
+
+void run_tick_duties(uint64_t nowMs) {
     USBInput::get().poll();
     Keyboard::get().servicePendingInput();
+    Scheduler::get().wakeExpiredSleepers(nowMs);
+    s_dutiesMs = nowMs;
+}
 
-    Scheduler::get().wakeExpiredSleepers(uptime_ms);
+} // namespace
 
+void timer_interrupt_handler() {
+    const uint64_t since = s_outageSinceMs;
+    if (since != 0) {
+        const uint64_t now = time_get_uptime_ms();
+        if (now > since && now - since >= kLoggedOutageMs) {
+            Console::get().log("[timer] the boot CPU's tick was out for {} ms; other CPUs ran its duties {} times",
+                               now - since, (uint64_t)s_outageFailovers);
+        }
+        s_outageSinceMs = 0;
+        s_outageFailovers = 0;
+    }
+    run_tick_duties(uptime_ms);
     LAPIC::get().sendEOI();
+}
+
+namespace {
+
+// A GPU request that hangs while nobody waits is caught here (intel_gen9).
+void gpu_timer_tick() {
+    intel_gen9::IntelGen9Driver& gpu = intel_gen9::IntelGen9Driver::get();
+    if (gpu.isInitialized()) {
+        gpu.timerTick();
+    }
+}
+
+} // namespace
+
+bool timer_duties_overdue() {
+    const uint64_t last = s_dutiesMs;
+    const uint64_t now = time_get_uptime_ms();
+    // The CPUs' clocks may differ by a little: never overdue from the past.
+    return last != 0 && now > last && now - last > kTickDutiesOverdueMs;
+}
+
+void timer_run_overdue_duties() {
+    // Checked again under the lock: another AP may just have run them.
+    if (!timer_duties_overdue()) {
+        return;
+    }
+    if (s_outageSinceMs == 0) {
+        s_outageSinceMs = s_dutiesMs;
+    }
+    s_outageFailovers = s_outageFailovers + 1;
+    s_failovers = s_failovers + 1;
+    run_tick_duties(time_get_uptime_ms());
+    netTimerTick();
+    gpu_timer_tick();
+}
+
+uint64_t timer_failover_count() {
+    return s_failovers;
 }
 
 // With the PIT driving the tick, counting its interrupts loses every one that
@@ -282,6 +391,10 @@ bool tsc_enable_clocksource() {
     const uint64_t elapsedMs = timer_tick_hz ? (uptime_ticks * 1000ULL) / timer_tick_hz : uptime_ms;
     boot_tsc = rdtsc() - elapsedMs * cycles_per_ms;
     return true;
+}
+
+bool time_tick_is_tsc_deadline() {
+    return timerBackend == TimerBackend::TscDeadline;
 }
 
 uint64_t time_get_uptime_ticks() {
@@ -324,6 +437,7 @@ void Timer::Run(InterruptFrame* frame) {
     if (frame && (interruptedUser || runningIdle)) {
         // Before scheduling, so a process woken by a packet can run now.
         netTimerTick();
+        gpu_timer_tick();
         Scheduler::get().schedule(frame);
     }
 }

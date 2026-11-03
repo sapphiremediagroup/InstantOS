@@ -134,10 +134,30 @@ private:
     uint32_t dataStart;
     uint32_t clusterSize;
     uint32_t rootDirCluster;
-    
+
+    // Every disk command costs a seek on a hard disk (about 10 ms) and runs
+    // with interrupts off, so the driver keeps them few: a write-through
+    // cache of FAT sectors (each FAT entry was a sector read of its own), and
+    // the search for a free cluster resumes where the last one ended instead
+    // of at cluster 2.
+    static constexpr uint32_t kFatCacheSlots = 8;
+    struct FatCacheSlot {
+        uint32_t sector;
+        uint32_t lastUse;
+        uint8_t* data;
+        bool valid;
+    };
+    FatCacheSlot fatCache[kFatCacheSlots]{};
+    uint32_t fatCacheClock = 0;
+    uint32_t nextFreeHint = 2;
+
+    uint8_t* fatSectorFor(uint32_t sector);
+    uint32_t clusterCount() const;
     uint64_t clusterToSector(uint32_t cluster);
     bool readSector(uint64_t sector, void* buffer);
     bool writeSector(uint64_t sector, const void* buffer);
+    bool readSectors(uint64_t sector, uint32_t count, void* buffer);
+    bool writeSectors(uint64_t sector, uint32_t count, const void* buffer);
     bool readFATEntry(uint32_t cluster, uint32_t* value);
     bool writeFATEntry(uint32_t cluster, uint32_t value);
     

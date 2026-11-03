@@ -3,6 +3,7 @@
 #include <cpu/acpi/pci.hpp>
 #include <graphics/console.hpp>
 #include <memory/vmm.hpp>
+#include <common/ports.hpp>
 
 namespace intel_gen9 {
 
@@ -18,116 +19,7 @@ constexpr uint16_t PCI_SUBCLASS_REG = 0x0A;  // subclass.
 constexpr uint16_t PCI_COMMAND_MEMORY = 1 << 1;
 constexpr uint16_t PCI_COMMAND_BUS_MASTER = 1 << 2;
 
-// The full Skylake (Gen9) VGA device-id table, derived from the upstream
-// i915_pciids.h INTEL_SKL_*_IDS lists. HD Graphics 530 corresponds to the GT2
-// desktop part 0x1912 and the GT2 halo/mobile part 0x191B.
-constexpr Gen9DeviceInfo kGen9Devices[] = {
-    // GT1
-    {0x1906, Gen9Gt::Gt1,   false, "Skylake GT1 (ULT)"},
-    {0x190E, Gen9Gt::Gt1,   false, "Skylake GT1 (ULX)"},
-    {0x1902, Gen9Gt::Gt1,   false, "Skylake GT1 (Desktop)"},
-    {0x190A, Gen9Gt::Gt1,   false, "Skylake GT1 (Server)"},
-    {0x190B, Gen9Gt::Gt1,   false, "Skylake GT1 (Halo)"},
-    // GT1.5
-    {0x1913, Gen9Gt::Gt1_5, false, "Skylake GT1.5 (ULT)"},
-    {0x1915, Gen9Gt::Gt1_5, false, "Skylake GT1.5 (ULX)"},
-    {0x1917, Gen9Gt::Gt1_5, false, "Skylake GT1.5 (Desktop)"},
-    // GT2 - HD Graphics 530 / 520 family
-    {0x1916, Gen9Gt::Gt2,   false, "HD Graphics 520 (Skylake GT2 ULT)"},
-    {0x1921, Gen9Gt::Gt2,   false, "Skylake GT2F (ULT)"},
-    {0x191E, Gen9Gt::Gt2,   false, "HD Graphics 515 (Skylake GT2 ULX)"},
-    {0x1912, Gen9Gt::Gt2,   true,  "HD Graphics 530 (Skylake GT2 Desktop)"},
-    {0x191A, Gen9Gt::Gt2,   false, "Skylake GT2 (Server)"},
-    {0x191B, Gen9Gt::Gt2,   true,  "HD Graphics 530 (Skylake GT2 Mobile/Halo)"},
-    {0x191D, Gen9Gt::Gt2,   false, "HD Graphics P530 (Skylake GT2 Workstation)"},
-    // GT3 / GT3e - Iris 540/550
-    {0x1923, Gen9Gt::Gt3,   false, "HD Graphics 535 (Skylake GT3 ULT)"},
-    {0x1926, Gen9Gt::Gt3e,  false, "Iris Graphics 540 (Skylake GT3e ULT)"},
-    {0x1927, Gen9Gt::Gt3e,  false, "Iris Graphics 550 (Skylake GT3e ULT)"},
-    {0x192A, Gen9Gt::Gt3,   false, "Skylake GT3 (Server)"},
-    {0x192B, Gen9Gt::Gt3e,  false, "Iris Graphics (Skylake GT3e Halo)"},
-    {0x192D, Gen9Gt::Gt3e,  false, "Skylake GT3e (Server)"},
-    // GT4 / GT4e - Iris Pro 580
-    {0x1932, Gen9Gt::Gt4,   false, "Iris Pro 580 (Skylake GT4 Desktop)"},
-    {0x193A, Gen9Gt::Gt4e,  false, "Iris Pro P580 (Skylake GT4e Server)"},
-    {0x193B, Gen9Gt::Gt4e,  false, "Iris Pro 580 (Skylake GT4e Halo)"},
-    {0x193D, Gen9Gt::Gt4e,  false, "Iris Pro P580 (Skylake GT4e Workstation)"},
-};
-
-constexpr size_t kGen9DeviceCount = sizeof(kGen9Devices) / sizeof(kGen9Devices[0]);
-
 } // namespace
-
-const Gen9DeviceInfo* lookupDevice(uint16_t vendorId, uint16_t deviceId) {
-    if (vendorId != INTEL_VENDOR_ID) {
-        return nullptr;
-    }
-    for (size_t i = 0; i < kGen9DeviceCount; ++i) {
-        if (kGen9Devices[i].deviceId == deviceId) {
-            return &kGen9Devices[i];
-        }
-    }
-    return nullptr;
-}
-
-bool isHd530(uint16_t deviceId) {
-    const Gen9DeviceInfo* dev = lookupDevice(INTEL_VENDOR_ID, deviceId);
-    return dev != nullptr && dev->isHd530;
-}
-
-uint64_t IntelGen9Driver::decodeMemoryBar(uint32_t barLow, uint32_t barHigh) {
-    // Disabled / unimplemented BAR.
-    if (barLow == 0 || barLow == 0xFFFFFFFFu) {
-        return 0;
-    }
-    // I/O space BAR (bit 0 set) is not a memory window.
-    if (barLow & 0x1) {
-        return 0;
-    }
-    uint64_t base = static_cast<uint64_t>(barLow & ~0xFu);
-    const uint32_t type = (barLow >> 1) & 0x3;
-    if (type == 0x2) {
-        // 64-bit BAR: high dword carries the upper address bits.
-        base |= static_cast<uint64_t>(barHigh) << 32;
-    }
-    return base;
-}
-
-DisplayMode IntelGen9Driver::interpretPlane(uint32_t planeCtl, uint32_t planeStride,
-                                            uint32_t pipeSrcsz, uint32_t planeSurf,
-                                            uint32_t fallbackW, uint32_t fallbackH,
-                                            uint32_t fallbackStride) {
-    DisplayMode m = {};
-    m.bpp = 32;
-    m.surfaceGtt = static_cast<uint64_t>(planeSurf & ~0xFFFu);
-
-    const bool enabled = (planeCtl & PLANE_CTL_ENABLE) != 0;
-    const uint32_t tiled = planeCtl & PLANE_CTL_TILED_MASK;
-    m.tiledLinear = (tiled == PLANE_CTL_TILED_LINEAR);
-
-    // PIPE_SRCSZ encodes (width-1)<<16 | (height-1).
-    const uint32_t srcW = ((pipeSrcsz >> 16) & 0x1FFF) + 1;
-    const uint32_t srcH = (pipeSrcsz & 0x1FFF) + 1;
-
-    if (enabled && srcW > 1 && srcH > 1 && srcW <= 8192 && srcH <= 8192) {
-        m.width = srcW;
-        m.height = srcH;
-        // Stride is in 64-byte units on Gen9.
-        const uint32_t strideBytes = (planeStride & 0x3FF) * PLANE_STRIDE_UNIT;
-        m.stride = (strideBytes >= srcW * 4) ? strideBytes : srcW * 4;
-        m.valid = m.tiledLinear; // only the linear case is safe to scan out as-is.
-    }
-
-    if (!m.valid) {
-        // Fall back to the firmware/GOP geometry we were handed.
-        m.width = fallbackW;
-        m.height = fallbackH;
-        m.stride = (fallbackStride != 0) ? fallbackStride : fallbackW * 4;
-        m.tiledLinear = true;
-        m.valid = (fallbackW > 0 && fallbackH > 0);
-    }
-    return m;
-}
 
 IntelGen9Driver& IntelGen9Driver::get() {
     static IntelGen9Driver instance;
@@ -219,6 +111,22 @@ bool IntelGen9Driver::mapBars() {
     const uint64_t pages = MMIO_REG_SIZE / PAGE_SIZE;
     VMM::MapRange(gttmmadr, gttmmadr, pages, flags);
     mmio = reinterpret_cast<volatile uint8_t*>(gttmmadr);
+
+    // The GTT (upper half of BAR0) and the CPU-usable part of the aperture,
+    // write-combining as i915 maps them. Mapped now, while there is only the
+    // kernel's address space, so every process made later has them; nothing
+    // is written to the GPU until initializeGtt().
+    const uint64_t wc = Present | ReadWrite | NoExecute | WriteCombine;
+    ggc = decodeGgc(readConfig16(PCI_GGC));
+    if (ggc.gsmBytes != 0) {
+        const uint64_t gsmPhys = gttmmadr + GSM_OFFSET_IN_BAR0;
+        VMM::MapRange(gsmPhys, gsmPhys, ggc.gsmBytes / PAGE_SIZE, wc);
+        gsm = reinterpret_cast<volatile uint64_t*>(gsmPhys);
+        gttEntries = static_cast<uint32_t>(ggc.gsmBytes / sizeof(uint64_t));
+    }
+    if (gmadr != 0) {
+        VMM::MapRange(gmadr, gmadr, APERTURE_USABLE_BYTES / PAGE_SIZE, wc);
+    }
     return true;
 }
 
@@ -250,6 +158,73 @@ bool IntelGen9Driver::recoverDisplayMode(iFramebuffer& fallback) {
         return false;
     }
     return true;
+}
+
+namespace {
+
+void logValue(const char* name, uint64_t value) {
+    Console::get().drawText(" ");
+    Console::get().drawText(name);
+    Console::get().drawText("=");
+    Console::get().drawHex(value);
+}
+
+// Register offsets read by logDiagnostics (Skylake PRM / i915_reg.h).
+constexpr uint16_t PCI_CAPABILITIES = 0x34;
+constexpr uint8_t PCI_CAP_MSI = 0x05;
+constexpr uint32_t REG_PIPECONF[3] = { 0x70008, 0x71008, 0x72008 };
+constexpr uint32_t REG_GT_FIFO_FREE = 0x120008;
+constexpr uint32_t REG_FUSE2 = 0x9120;
+// The ring registers are intel_gen9_logic.hpp's.
+constexpr uint32_t ENGINE_BASE[2] = { RENDER_RING_BASE, BLT_RING_BASE };
+constexpr const char* ENGINE_NAME[2] = { "rcs", "bcs" };
+constexpr uint32_t MSR_PAT = 0x277;
+
+} // namespace
+
+void IntelGen9Driver::logDiagnostics() {
+    Console::get().drawText("[i915] pci");
+    const uint16_t ggc = readConfig16(PCI_GGC);
+    logValue("GGC", ggc);
+    logValue("BDSM", readConfig32(PCI_BDSM));
+    bool msi = false;
+    uint8_t cap = static_cast<uint8_t>(readConfig16(PCI_CAPABILITIES) & 0xFC);
+    for (int guard = 0; cap != 0 && guard < 32; ++guard) {
+        const uint16_t header = readConfig16(cap);
+        if ((header & 0xFF) == PCI_CAP_MSI) {
+            msi = true;
+        }
+        cap = static_cast<uint8_t>((header >> 8) & 0xFC);
+    }
+    Console::get().drawText(msi ? " msi=yes\n" : " msi=no\n");
+
+    Console::get().drawText("[i915] display");
+    static const char* const kPipeNames[3] = { "PIPEACONF", "PIPEBCONF", "PIPECCONF" };
+    for (int pipe = 0; pipe < 3; ++pipe) {
+        logValue(kPipeNames[pipe], readReg(REG_PIPECONF[pipe]));
+    }
+    logValue("PLANE_CTL_A", readReg(REG_PLANE_CTL_A));
+    logValue("PLANE_SURF_A", readReg(REG_PLANE_SURF_A));
+    Console::get().drawText("\n[i915] gt");
+    logValue("FORCEWAKE_ACK", readReg(FORCEWAKE_ACK_RENDER_GEN9));
+    logValue("GT_FIFO_FREE", readReg(REG_GT_FIFO_FREE));
+    logValue("FUSE2", readReg(REG_FUSE2));
+    Console::get().drawText("\n");
+    for (int engine = 0; engine < 2; ++engine) {
+        const uint32_t base = ENGINE_BASE[engine];
+        Console::get().drawText("[i915] ");
+        Console::get().drawText(ENGINE_NAME[engine]);
+        logValue("HEAD", readReg(base + RING_HEAD));
+        logValue("TAIL", readReg(base + RING_TAIL));
+        logValue("START", readReg(base + RING_START));
+        logValue("CTL", readReg(base + RING_CTL));
+        logValue("MODE", readReg(base + RING_MODE_GEN7));
+        logValue("EXECLIST_STATUS", readReg(base + RING_EXECLIST_STATUS_LO));
+        Console::get().drawText("\n");
+    }
+    Console::get().drawText("[i915] cpu");
+    logValue("PAT", rdmsr(MSR_PAT));
+    Console::get().drawText("\n");
 }
 
 bool IntelGen9Driver::probe() {
@@ -287,6 +262,7 @@ bool IntelGen9Driver::initialize(iFramebuffer& fallback) {
     Console::get().drawText(" GMADR=");
     Console::get().drawHex(gmadr);
     Console::get().drawText("\n");
+    logDiagnostics();
 
     if (!recoverDisplayMode(fallback)) {
         Console::get().drawText("[i915] display: could not recover firmware mode\n");

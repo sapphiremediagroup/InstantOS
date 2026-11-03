@@ -17,6 +17,13 @@ enum PageFlags : uint64_t {
     NoExecute  = 1ULL << 63,
 };
 
+// Write-combining, for 4 KiB leaf mappings only (MapPage/MapRange): the PAT
+// bit (bit 7, which is LargePage only in a directory entry) plus PWT select PAT
+// entry 5, which CPU::initialize programs as WC on every CPU. For frame
+// buffers and GPU memory the CPU only writes: writes are merged into bursts
+// instead of going out one by one as with CacheDisab.
+static constexpr uint64_t WriteCombine = LargePage | WriteThru;
+
 static constexpr uint64_t ADDR_MASK = 0x000FFFFFFFFFF000ULL;
 
 // OS-available PTE bit (AVL) marking a copy-on-write leaf page: the page is
@@ -61,6 +68,7 @@ public:
 
     static uint64_t VirtualToPhysical(uint64_t virtualAddr);
     static uint64_t VirtualToPhysicalIn(PageTable* pml4, uint64_t virtualAddr);
+    static uint64_t LeafEntryIn(PageTable* pml4, uint64_t virtualAddr);   // 4 KiB PTE or 0
     static bool     IsMapped(uint64_t virtualAddr);
     static bool     IsUserMapped(uint64_t virtualAddr);
 

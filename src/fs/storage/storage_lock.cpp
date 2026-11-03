@@ -4,7 +4,10 @@
 #include <cpu/klock.hpp>
 #include <cpu/percpu.hpp>
 #include <cpu/process/process.hpp>
+#include <cpu/process/scheduler.hpp>
+#include <cpu/tlb.hpp>
 #include <fs/vfs/vfs.hpp>
+#include <time/tsc_timer.hpp>
 
 namespace {
 
@@ -117,17 +120,50 @@ bool heldByThisCpu() {
 }
 
 Section::Section() : savedBklDepth(0) {
-    const uint32_t me = currentCpuIndex() + 1;
-    if (__atomic_load_n(&s_owner, __ATOMIC_RELAXED) == me) {
+    if (__atomic_load_n(&s_owner, __ATOMIC_RELAXED) == currentCpuIndex() + 1) {
         ++s_depth;
         return;
     }
     if (mayDropBkl()) {
         savedBklDepth = KernelLock::suspend();
     }
-    s_lock.lock();
-    __atomic_store_n(&s_owner, me, __ATOMIC_RELAXED);
+    acquire(savedBklDepth);
+    // Read only now: a contender that slept may have woken on another CPU.
+    __atomic_store_n(&s_owner, currentCpuIndex() + 1, __ATOMIC_RELAXED);
     s_depth = 1;
+}
+
+// The holder polls its disk with interrupts off; a slow command (a drive
+// spinning up) takes seconds. A contender that spun for all that time froze
+// its CPU too, so after kSpinMs a syscall that gave up the BKL for this
+// Section sleeps between tries instead (holding nothing, it may: the BKL is
+// taken back for the sleep and handed on by the switch, as for any blocking
+// call). Any other contender (it holds the BKL, or is a nested entry such as
+// a page fault) keeps spinning as before.
+void Section::acquire(uint32_t& bklDepth) {
+    if (bklDepth == 0) {
+        s_lock.lock();
+        return;
+    }
+    constexpr uint64_t kSpinMs = 2;
+    const uint64_t spinUntil = time_get_uptime_ms() + kSpinMs;
+    for (;;) {
+        if (s_lock.tryLock()) {
+            return;
+        }
+        Process* self = getPerCPU()->currentProcess;
+        if (!self || time_get_uptime_ms() < spinUntil) {
+            TLB::pollPending();
+            asm volatile("pause");
+            continue;
+        }
+        KernelLock::resume(bklDepth);
+        self->sleepUntil(time_get_uptime_ms() + 1);
+        self->setState(ProcessState::Blocked);
+        Scheduler::get().scheduleFromSyscall();
+        self->clearSleep();
+        bklDepth = KernelLock::suspend();
+    }
 }
 
 Section::~Section() {

@@ -44,7 +44,8 @@ TLS_DIR="$BUILD_DIR/net-suite/tls"
 cat "$BUILD_DIR/cacert/cacert.pem" "$TLS_DIR/ca.pem" > "$OUT_DIR/ca-certificates.crt"
 
 "$CC" --target=x86_64-unknown-elf -ffreestanding -fPIE -fno-stack-protector -nostdinc -O1 \
-  -DHTTPS_PORT="$HTTPS_PORT" -c "$NS_DIR/driver.c" -o "$OUT_DIR/driver.o"
+  -DHTTPS_PORT="$HTTPS_PORT" ${NS_COMPOSITOR_BACKEND:+-DCOMPOSITOR_BACKEND=\"$NS_COMPOSITOR_BACKEND\"} \
+  -c "$NS_DIR/driver.c" -o "$OUT_DIR/driver.o"
 "$LD" --gc-sections --build-id=none --hash-style=sysv -z max-page-size=0x1000 \
   -pie -e _start --dynamic-linker /lib/ld-instantos.so -o "$OUT_DIR/driver" "$OUT_DIR/driver.o"
 

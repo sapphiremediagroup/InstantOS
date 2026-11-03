@@ -62,6 +62,10 @@ class MessageQueueObject;
 class SurfaceObject {
 public:
     SurfaceObject(uint64_t idValue, uint32_t widthValue, uint32_t heightValue, uint32_t formatValue, SharedMemoryObject* backingObject);
+    // A surface whose pixels are a GPU buffer (a dma-buf, referenced), with
+    // its own pitch.
+    SurfaceObject(uint64_t idValue, uint32_t widthValue, uint32_t heightValue, uint32_t formatValue, uint32_t pitchValue,
+                  FileDescriptor* bufferValue);
     ~SurfaceObject();
 
     void retain();
@@ -71,8 +75,24 @@ public:
     uint32_t getWidth() const { return width; }
     uint32_t getHeight() const { return height; }
     uint32_t getFormat() const { return format; }
-    uint32_t getPitch() const { return width * 4; }
-    uint64_t getSize() const { return static_cast<uint64_t>(width) * static_cast<uint64_t>(height) * 4ULL; }
+    uint32_t getPitch() const { return pitch; }
+    uint64_t getSize() const { return static_cast<uint64_t>(pitch) * static_cast<uint64_t>(height); }
+    FileDescriptor* getBuffer() const { return buffer; }
+
+    // In use: a window shows it, or showed it and the compositor has not
+    // listed the windows since (it may still be drawing from it).
+    void attached();
+    void detached();
+    void listed() { releasePending = false; }
+    bool inUse() const { return attachCount != 0 || releasePending; }
+    bool isAttached() const { return attachCount != 0; }
+
+    // Frame pacing: a GPU-buffer surface attached to a window is unshown
+    // until the compositor lists the windows while it is attached (it draws
+    // what that list names). Attaching another buffer surface to the window
+    // waits for that (sys_window_attach_surface): FIFO, one frame queued.
+    bool isUnshown() const { return unshown; }
+    void markShown() { unshown = false; }
 
     uint64_t mapInto(Process* process);
     SharedMemoryObject* getBacking() const { return backing; }
@@ -90,6 +110,13 @@ private:
     uint32_t height;
     uint32_t format;
     SharedMemoryObject* backing;
+    FileDescriptor* buffer;      // a dma-buf instead of `backing`
+    uint32_t pitch;
+    uint32_t mappedPid;          // buffer surfaces: where the compositor has it
+    uint64_t mappedAddress;
+    uint32_t attachCount;
+    bool releasePending;
+    bool unshown = false;
     uint32_t refCount;
     bool committed;
     uint32_t dirtyX;
@@ -115,6 +142,7 @@ public:
     int32_t getWidth() const { return width; }
     int32_t getHeight() const { return height; }
     uint64_t getSurfaceID() const { return surface ? surface->getID() : 0; }
+    SurfaceObject* getSurface() const { return surface; }
     uint32_t getZOrder() const { return zOrder; }
     MessageQueueObject* getEventQueue() const { return queue; }
     const char* getTitle() const { return title; }
@@ -127,7 +155,8 @@ public:
     // Shown again after a minimize, as it was (maximized stays maximized).
     void unminimize() { state &= ~WindowStateMinimized; }
     void setZOrder(uint32_t order) { zOrder = order; }
-    void control(WindowControlAction action, int32_t maxWidth, int32_t maxHeight);
+    // Maximize puts the window's content at (maxX, maxY), maxWidth x maxHeight.
+    void control(WindowControlAction action, int32_t maxX, int32_t maxY, int32_t maxWidth, int32_t maxHeight);
     bool enqueueWindowEvent(WindowEventAction action);
 
     void snapshot(WindowInfo* out) const;
@@ -212,6 +241,8 @@ public:
 
     SharedMemoryObject* createSharedMemory(uint64_t size);
     SurfaceObject* createSurface(uint32_t width, uint32_t height, uint32_t format);
+    SurfaceObject* createBufferSurface(FileDescriptor* buffer, uint32_t width, uint32_t height, uint32_t pitch,
+                                       uint32_t format);
     WindowObject* createWindow(Process* owner, uint32_t flags, int32_t width, int32_t height);
     MessageQueueObject* createQueue();
     SurfaceObject* lookupSurface(uint64_t id);
@@ -221,7 +252,8 @@ public:
     bool focusWindow(uint64_t id);
     bool moveWindow(uint64_t id, int32_t x, int32_t y);
     bool resizeWindow(uint64_t id, int32_t width, int32_t height);
-    bool controlWindow(uint64_t id, WindowControlAction action, int32_t maxWidth, int32_t maxHeight);
+    bool controlWindow(uint64_t id, WindowControlAction action, int32_t maxX, int32_t maxY, int32_t maxWidth,
+                       int32_t maxHeight);
     bool postEventToFocusedWindow(const Event& event);
     bool postKeyEventToFocusedWindow(const Event& event);
     // Queues an input event on one window (the compositor routes the pointer).
@@ -246,6 +278,9 @@ public:
     // the compositor next lists the windows, when no window can show it any
     // more, and then unmapped from it and released.
     void retireSurfaceBacking(SharedMemoryObject* backing);
+    // The same for a buffer surface: its mapping in the compositor goes then,
+    // and the dma-buf reference with it.
+    void retireSurfaceBuffer(FileDescriptor* buffer, uint32_t pid, uint64_t address, uint64_t length);
     void releaseRetiredSurfaces(Process* compositor);
     void forgetWindow(WindowObject* object);
     void forgetQueue(MessageQueueObject* queue);
@@ -271,6 +306,14 @@ private:
     SurfaceObject* surfaces[MaxSurfaces];
     SharedMemoryObject* retiredSurfaces[MaxSurfaces];
     size_t retiredSurfaceCount;
+    struct RetiredBuffer {
+        FileDescriptor* buffer;
+        uint32_t pid;
+        uint64_t address;
+        uint64_t length;
+    };
+    RetiredBuffer retiredBuffers[MaxSurfaces];
+    size_t retiredBufferCount;
     WindowObject* windows[MaxWindows];
     MessageQueueObject* queues[MaxQueues];
     ServiceEntry services[MaxServices];

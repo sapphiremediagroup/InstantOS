@@ -150,6 +150,20 @@ struct FISRegH2D {
     uint8_t rsv1[4];
 } __attribute__((packed));
 
+// The disk command in flight, for the lock-up watchdog (cpu/watchdog.hpp),
+// which reads it from another CPU without a lock (a snapshot only).
+struct AHCIDebugState {
+    volatile uint64_t commands;     // issued since boot
+    volatile uint64_t timeouts;
+    volatile uint64_t lba;
+    volatile uint64_t startMs;      // when the command in flight was issued; 0 when none
+    volatile uint32_t count;
+    volatile uint32_t cmd;
+    volatile int32_t portNum;
+    HBAPort* volatile regs;         // its port's registers, read live
+};
+extern AHCIDebugState g_ahciDebug;
+
 class AHCIPort {
 public:
     AHCIPort(HBAPort* port, int portNum);
@@ -159,6 +173,10 @@ public:
     bool write(uint64_t sector, uint32_t count, const void* buffer);
     bool identify(uint16_t* buffer);
     bool flush();   // ATA FLUSH CACHE EXT (non-data durability barrier)
+    // FLUSH CACHE EXT on every port that came up, so what the drives hold in
+    // their write caches is on the disk (before a reboot or power-off). The
+    // caller holds the storage lock. False if any flush failed.
+    static bool flushAll();
 
     int getType();
     bool isActive() { return active; }
@@ -173,8 +191,13 @@ private:
     void* fisBuffer;
     HBACmdTbl* commandTables[32];
 
+    static constexpr int kMaxActivePorts = 32;
+    static AHCIPort* activePorts[kMaxActivePorts];
+    static int activePortCount;
+
     void startCmd();
     void stopCmd();
+    bool waitForCompletion(int slot, uint8_t cmd, uint64_t lba, uint32_t count);
     void recoverFromError();
     int findCmdSlot();
     bool executeCommand(uint8_t cmd, uint64_t lba, uint32_t count, void* buffer, bool write);

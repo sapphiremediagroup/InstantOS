@@ -4,11 +4,16 @@
 #include <memory/pmm.hpp>
 #include <memory/vmm.hpp>
 #include <cpu/tlb.hpp>
+#include <time/tsc_timer.hpp>
 #include <graphics/console.hpp>
 #include <stddef.h>
 
+AHCIDebugState g_ahciDebug = {};
+
 namespace {
 constexpr uint64_t kDmaPageFlags = PageFlags::Present | PageFlags::ReadWrite | PageFlags::NoExecute;
+constexpr uint64_t kCommandTimeoutMs = 5000;
+constexpr uint64_t kSlowCommandMs = 500;      // logged when a command takes this long
 
 uint64_t alignDown(uint64_t value, uint64_t alignment) {
     return value & ~(alignment - 1);
@@ -37,9 +42,14 @@ void mapIdentityRange(uint64_t phys, size_t size, uint64_t flags) {
     }
 }
 
+// The device address of a kernel buffer. Looked up in the kernel's page tables,
+// not the current process's: the DMA buffers are identity-mapped at low
+// addresses, which a user image or mmap can shadow in its own address space
+// (the controller was then handed the process's page, so reads landed there and
+// the bounce buffer kept stale data).
 uint64_t dmaAddress(const void* ptr) {
     uint64_t virt = reinterpret_cast<uint64_t>(ptr);
-    uint64_t phys = VMM::VirtualToPhysicalIn(VMM::GetAddressSpace(), virt);
+    uint64_t phys = VMM::VirtualToPhysicalIn(VMM::GetKernelAddressSpace(), virt);
     return phys ? phys : virt;
 }
 }
@@ -331,8 +341,22 @@ bool AHCIPort::initialize() {
     }
 
     active = true;
+    if (activePortCount < kMaxActivePorts) {
+        activePorts[activePortCount++] = this;
+    }
     Console::get().log("[AHCI Port {}] Port is now active", portNum);
     return true;
+}
+
+AHCIPort* AHCIPort::activePorts[AHCIPort::kMaxActivePorts] = {};
+int AHCIPort::activePortCount = 0;
+
+bool AHCIPort::flushAll() {
+    bool ok = true;
+    for (int i = 0; i < activePortCount; ++i) {
+        ok = activePorts[i]->flush() && ok;
+    }
+    return ok;
 }
 
 bool AHCIPort::executeCommand(uint8_t cmd, uint64_t lba, uint32_t count, void* buffer, bool isWrite) {
@@ -402,16 +426,8 @@ bool AHCIPort::executeCommand(uint8_t cmd, uint64_t lba, uint32_t count, void* b
     if (spin == 1000000) return false;
 
     port->ci = 1 << slot;
-
-    while (true) {
-        // Storage runs without the big kernel lock (StorageLock), so a TLB
-        // shootdown sender may be waiting for this CPU.
-        TLB::pollPending();
-        if ((port->ci & (1 << slot)) == 0) break;
-        if (port->is & HBA_PxIS_TFES) {
-            recoverFromError();
-            return false;
-        }
+    if (!waitForCompletion(slot, cmd, lba, count)) {
+        return false;
     }
 
     if (port->is & HBA_PxIS_TFES) {
@@ -420,6 +436,52 @@ bool AHCIPort::executeCommand(uint8_t cmd, uint64_t lba, uint32_t count, void* b
     }
 
     return true;
+}
+
+// Waits for the command in `slot` to finish. Kernel code runs with interrupts
+// off, so a command the drive never completes must not be waited for
+// forever: on the boot CPU that stops the clock tick, and with it the whole
+// system. Returns false on a task-file error or after kCommandTimeoutMs.
+bool AHCIPort::waitForCompletion(int slot, uint8_t cmd, uint64_t lba, uint32_t count) {
+    const uint64_t start = time_get_uptime_ms();
+    const uint64_t deadline = start + kCommandTimeoutMs;
+    g_ahciDebug.cmd = cmd;
+    g_ahciDebug.lba = lba;
+    g_ahciDebug.count = count;
+    g_ahciDebug.portNum = portNum;
+    g_ahciDebug.regs = port;
+    g_ahciDebug.startMs = start ? start : 1;
+    g_ahciDebug.commands = g_ahciDebug.commands + 1;
+    while (true) {
+        // Storage runs without the big kernel lock (StorageLock), so a TLB
+        // shootdown sender may be waiting for this CPU.
+        TLB::pollPending();
+        if ((port->ci & (1u << slot)) == 0) {
+            g_ahciDebug.startMs = 0;
+            // A slow command (a drive spinning up, read retries) holds this
+            // CPU with interrupts off all along: say which one it was.
+            const uint64_t tookMs = time_get_uptime_ms() - start;
+            if (tookMs >= kSlowCommandMs) {
+                Console::get().log("[AHCI Port {}] command {} lba={} count={} took {} ms",
+                                   portNum, (uint64_t)cmd, lba, (uint64_t)count, tookMs);
+            }
+            return true;
+        }
+        if (port->is & HBA_PxIS_TFES) {
+            g_ahciDebug.startMs = 0;
+            recoverFromError();
+            return false;
+        }
+        if (time_get_uptime_ms() > deadline) {
+            g_ahciDebug.startMs = 0;
+            g_ahciDebug.timeouts = g_ahciDebug.timeouts + 1;
+            Console::get().log("[AHCI Port {}] command {} lba={} count={} timed out: ci={} tfd={} is={} serr={} ssts={}",
+                               portNum, (uint64_t)cmd, lba, (uint64_t)count, (uint64_t)port->ci, (uint64_t)port->tfd,
+                               (uint64_t)port->is, (uint64_t)port->serr, (uint64_t)port->ssts);
+            recoverFromError();
+            return false;
+        }
+    }
 }
 
 void AHCIPort::recoverFromError() {
@@ -476,16 +538,8 @@ bool AHCIPort::flush() {
     if (spin == 1000000) return false;
 
     port->ci = 1 << slot;
-
-    while (true) {
-        // Storage runs without the big kernel lock (StorageLock), so a TLB
-        // shootdown sender may be waiting for this CPU.
-        TLB::pollPending();
-        if ((port->ci & (1 << slot)) == 0) break;
-        if (port->is & HBA_PxIS_TFES) {
-            recoverFromError();
-            return false;
-        }
+    if (!waitForCompletion(slot, ATA_CMD_FLUSH_EX, 0, 0)) {
+        return false;
     }
     if (port->is & HBA_PxIS_TFES) {
         recoverFromError();

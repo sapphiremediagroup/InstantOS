@@ -48,7 +48,13 @@ __attribute__((force_align_arg_pointer)) void _start(void){
     }
     sw((cfg.flags&1) ? "[nstest] network up\n" : "[nstest] FAIL no address\n");
 
+    // NS_COMPOSITOR_BACKEND (run-netsurf-suite.sh) picks the compositor's
+    // backend, e.g. gl: the GPU renderer, read back under QEMU.
+#ifdef COMPOSITOR_BACKEND
+    const char* av[]={"/bin/graphics-compositor","--backend=" COMPOSITOR_BACKEND,0};
+#else
     const char* av[]={"/bin/graphics-compositor",0};
+#endif
     const char* ev[]={"HOME=/","PATH=/bin",0};
     i64 pid=SC3(N_SPAWN,"/bin/graphics-compositor",av,ev);
     if(pid<=0){ sw("[nstest] FAIL cannot start the compositor\n"); }

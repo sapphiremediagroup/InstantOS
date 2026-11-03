@@ -19,6 +19,9 @@ struct SyscallTrace {
 
 void initializeKernelSymbols();
 
+// A fatal report is about to be drawn: the firmware's framebuffer goes on
+// screen (over the compositor's scanout buffers) and the console draws again.
+void takeScreenForReport();
 void panic(const char* reason);
 void panicf(const char* reason, const char* detail);
 void assertFail(const char* expr, const char* file, int line, const char* func);

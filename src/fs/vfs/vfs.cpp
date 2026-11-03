@@ -123,6 +123,81 @@ FileDescriptor::~FileDescriptor() {
 }
 
 namespace {
+// What "/" is when no filesystem is mounted there (the ISO without a disk):
+// a read-only directory listing the first component of each mount point, so
+// /bin, /dev, /tmp ... show up under it. Paths below a mount never get here
+// (findMount matches the mount first), so its lookup finds nothing.
+class MountRootFS : public FileSystem {
+public:
+    MountRootFS() : FileSystem("mountroot"), root(this, 1, FileType::Directory) {
+        ops.stat = rootStat;
+        ops.readdir = rootReaddir;
+        ops.lookup = rootLookup;
+        root.ops = &ops;
+    }
+    int mount(const char*) override { return 0; }
+    int unmount() override { return -1; }
+    VNode* getRoot() override { return &root; }
+
+private:
+    static int rootStat(VNode*, FileStats* stats) {
+        *stats = {};
+        stats->type = FileType::Directory;
+        stats->mode = 0040555;
+        stats->inode = 1;
+        stats->links = 2;
+        return 0;
+    }
+
+    static VNode* rootLookup(VNode*, const char*) {
+        return nullptr;
+    }
+
+    static void addEntry(DirEntry* entries, uint64_t count, uint64_t* used, const char* name, int length) {
+        if (length <= 0 || length > 255) {
+            return;
+        }
+        for (uint64_t i = 0; i < *used; ++i) {
+            int j = 0;
+            while (j < length && entries[i].name[j] == name[j]) j++;
+            if (j == length && entries[i].name[j] == '\0') {
+                return;   // two mounts under the same top-level name
+            }
+        }
+        if (*used >= count) {
+            return;
+        }
+        DirEntry& entry = entries[(*used)++];
+        for (int j = 0; j < length; ++j) entry.name[j] = name[j];
+        entry.name[length] = '\0';
+        entry.inode = *used + 1;
+        entry.type = FileType::Directory;
+    }
+
+    static int rootReaddir(VNode*, DirEntry* entries, uint64_t count, uint64_t* read) {
+        uint64_t used = 0;
+        addEntry(entries, count, &used, ".", 1);
+        addEntry(entries, count, &used, "..", 2);
+        VFS::get().forEachMount([&](const char* path, const char*) {
+            const char* name = path[0] == '/' ? path + 1 : path;
+            int length = 0;
+            while (name[length] && name[length] != '/') length++;
+            addEntry(entries, count, &used, name, length);
+        });
+        *read = used;
+        return 0;
+    }
+
+    VNodeOps ops = {};
+    VNode root;
+};
+
+// Function-local: the kernel does not run global constructors.
+MountRootFS& mountRoot() {
+    static MountRootFS fs;
+    return fs;
+}
+
 // Mounts fs; a block-backed one is mounted under the storage lock and gets its
 // VNode ops wrapped so that every later operation takes the lock too.
 int mountFileSystem(FileSystem* fs, const char* path) {
@@ -268,7 +343,7 @@ FileSystem* VFS::findMount(const char* path, char* relativePath) {
         i++;
     }
     relativePath[i] = '\0';
-    return rootFS;
+    return rootFS ? rootFS : &mountRoot();
 }
 
 VNode* VFS::resolvePath(const char* path, char* lastComponent, bool followFinal, int symlinkDepth) {

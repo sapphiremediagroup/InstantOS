@@ -146,13 +146,6 @@ bool mbrFindPartition(BlockDevice* device, uint64_t* startByte, uint64_t* length
 
 namespace {
 
-// "Linux filesystem data" partition type GUID (0FC63DAF-8483-4772-8E79-
-// 3D69D8477DE4) in on-disk mixed-endian byte order.
-const uint8_t kGptLinuxFsGuid[16] = {
-    0xAF, 0x3D, 0xC6, 0x0F, 0x83, 0x84, 0x72, 0x47,
-    0x8E, 0x79, 0x3D, 0x69, 0xD8, 0x47, 0x7D, 0xE4
-};
-
 bool gptSignatureOk(const uint8_t* block) {
     // "EFI PART"
     return block[0] == 'E' && block[1] == 'F' && block[2] == 'I' && block[3] == ' ' &&
@@ -188,6 +181,80 @@ bool guidEqual(const uint8_t* a, const uint8_t* b) {
 
 }  // namespace
 
+// GUIDs as GPT stores them (the first three fields little-endian).
+// Windows "basic data": ebd0a0a2-b9e5-4433-87c0-68b6b72699c7.
+static const uint8_t kGptBasicDataGuid[16] = {
+    0xA2, 0xA0, 0xD0, 0xEB, 0xE5, 0xB9, 0x33, 0x44,
+    0x87, 0xC0, 0x68, 0xB6, 0xB7, 0x26, 0x99, 0xC7
+};
+
+static const char kInstantOSLabel[11] = { 'I', 'N', 'S', 'T', 'A', 'N', 'T', 'O', 'S', ' ', ' ' };
+
+static bool isInstantOSLabel(const uint8_t* label) {
+    for (int i = 0; i < 11; i++) {
+        if (label[i] != (uint8_t)kInstantOSLabel[i]) return false;
+    }
+    return true;
+}
+
+static uint16_t rd16le(const uint8_t* p, int off) {
+    return (uint16_t)(p[off] | (p[off + 1] << 8));
+}
+
+// Whether the FAT32 volume at `startByte` is labelled INSTANTOS. The label is
+// in two places: the boot sector's extended BPB, and a volume-label entry in
+// the root directory. Windows' format writes "NO NAME" in the first and the
+// real label only in the second, so both are checked.
+static bool fat32LabelIsInstantOS(BlockDevice* device, uint64_t startByte) {
+    uint8_t boot[512];
+    if (!device->read(startByte, boot, 512) || boot[510] != 0x55 || boot[511] != 0xAA) {
+        return false;
+    }
+    static const char kFat32[8] = { 'F', 'A', 'T', '3', '2', ' ', ' ', ' ' };
+    for (int i = 0; i < 8; i++) {
+        if (boot[0x52 + i] != (uint8_t)kFat32[i]) return false;
+    }
+    if (isInstantOSLabel(boot + 0x47)) {
+        return true;
+    }
+
+    // The first cluster of the root directory.
+    const uint32_t bytesPerSector = rd16le(boot, 0x0B);
+    const uint32_t sectorsPerCluster = boot[0x0D];
+    const uint32_t reserved = rd16le(boot, 0x0E);
+    const uint32_t fats = boot[0x10];
+    const uint32_t fatSize = rd32le(boot, 0x24);
+    const uint32_t rootCluster = rd32le(boot, 0x2C);
+    if (bytesPerSector != 512 || sectorsPerCluster == 0 || rootCluster < 2 || fats == 0) {
+        return false;
+    }
+    const uint64_t dataStart = (uint64_t)reserved + (uint64_t)fats * fatSize;
+    const uint64_t rootStart = startByte + (dataStart + (uint64_t)(rootCluster - 2) * sectorsPerCluster) * 512;
+    uint8_t sector[512];
+    for (uint32_t s = 0; s < sectorsPerCluster; s++) {
+        if (!device->read(rootStart + (uint64_t)s * 512, sector, 512)) {
+            return false;
+        }
+        for (int e = 0; e < 512; e += 32) {
+            const uint8_t* entry = sector + e;
+            if (entry[0] == 0x00) {
+                return false;   // end of the directory
+            }
+            const uint8_t attr = entry[11];
+            if (entry[0] != 0xE5 && attr != 0x0F && (attr & 0x08) != 0) {
+                return isInstantOSLabel(entry);
+            }
+        }
+    }
+    return false;
+}
+
+// 9566fa50-7665-4f44-962e-113fd99cdc87.
+const uint8_t kGptInstantOSDataGuid[16] = {
+    0x50, 0xFA, 0x66, 0x95, 0x65, 0x76, 0x44, 0x4F,
+    0x96, 0x2E, 0x11, 0x3F, 0xD9, 0x9C, 0xDC, 0x87
+};
+
 bool gptIsPresent(BlockDevice* device) {
     if (!device) return false;
     uint8_t block[512];
@@ -197,16 +264,15 @@ bool gptIsPresent(BlockDevice* device) {
     return gptSignatureOk(block);
 }
 
-bool gptFindPartition(BlockDevice* device, uint64_t* startByte, uint64_t* lengthByte, bool* isLinux) {
-    if (!device) return false;
+GptSearch gptFindInstantOSPartition(BlockDevice* device, uint64_t* startByte, uint64_t* lengthByte) {
+    if (!device) return GptSearch::NoGpt;
 
     uint8_t hdr[512];
     if (!device->read((uint64_t)GPT_HEADER_LBA * 512, hdr, 512)) {
-        return false;
+        return GptSearch::NoGpt;
     }
     if (!gptSignatureOk(hdr)) {
-        Console::get().drawText("[GPT] No GPT header (EFI PART)\n");
-        return false;
+        return GptSearch::NoGpt;
     }
 
     const uint64_t entryLba = rd64le(hdr, 0x48);
@@ -214,17 +280,11 @@ bool gptFindPartition(BlockDevice* device, uint64_t* startByte, uint64_t* length
     const uint32_t entrySize = rd32le(hdr, 0x54);
     if (entrySize < 128 || entrySize > 512 || entryLba == 0) {
         Console::get().drawText("[GPT] Invalid entry geometry\n");
-        return false;
+        return GptSearch::NotInstantOS;
     }
     if (numEntries > 256) {   // cap the scan against corrupt/huge values
         numEntries = 256;
     }
-
-    // Single pass: remember the first Linux-typed partition (preferred) and the
-    // first used partition (fallback).
-    bool haveLinux = false, haveAny = false;
-    uint64_t linuxStart = 0, linuxLen = 0;
-    uint64_t anyStart = 0, anyLen = 0;
 
     uint8_t entry[512];
     for (uint32_t i = 0; i < numEntries; i++) {
@@ -232,42 +292,21 @@ bool gptFindPartition(BlockDevice* device, uint64_t* startByte, uint64_t* length
         if (!device->read(off, entry, entrySize)) {
             break;
         }
-        if (guidIsZero(entry)) {
-            continue;   // unused slot
+        const bool ours = guidEqual(entry, kGptInstantOSDataGuid);
+        if (!ours && !guidEqual(entry, kGptBasicDataGuid)) {
+            continue;
         }
         const uint64_t firstLba = rd64le(entry, 0x20);
         const uint64_t lastLba = rd64le(entry, 0x28);
         if (lastLba < firstLba) {
             continue;
         }
-        const uint64_t s = firstLba * 512;
-        const uint64_t len = (lastLba - firstLba + 1) * 512;
-
-        if (!haveAny) {
-            anyStart = s;
-            anyLen = len;
-            haveAny = true;
+        if (!ours && !fat32LabelIsInstantOS(device, firstLba * 512)) {
+            continue;
         }
-        if (!haveLinux && guidEqual(entry, kGptLinuxFsGuid)) {
-            linuxStart = s;
-            linuxLen = len;
-            haveLinux = true;
-        }
+        if (startByte) *startByte = firstLba * 512;
+        if (lengthByte) *lengthByte = (lastLba - firstLba + 1) * 512;
+        return GptSearch::Found;
     }
-
-    if (haveLinux) {
-        if (startByte) *startByte = linuxStart;
-        if (lengthByte) *lengthByte = linuxLen;
-        if (isLinux) *isLinux = true;
-        return true;
-    }
-    if (haveAny) {
-        if (startByte) *startByte = anyStart;
-        if (lengthByte) *lengthByte = anyLen;
-        if (isLinux) *isLinux = false;
-        return true;
-    }
-
-    Console::get().drawText("[GPT] No used partition found\n");
-    return false;
+    return GptSearch::NotInstantOS;
 }
