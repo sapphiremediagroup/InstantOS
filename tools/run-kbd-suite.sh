@@ -28,6 +28,21 @@ HTTP_PORT="${HTTP_PORT:-18380}"
 QEMU_SMP="${QEMU_SMP:-2}"
 export PATH="/usr/lib/llvm-20/bin:$PATH"
 
+# QEMU_WIN=1: Windows' QEMU with WHPX; the Python helpers then run on Windows'
+# Python too (WSL in NAT mode cannot reach Windows' 127.0.0.1, where QMP is).
+PY=(python3)
+WIN_ARGS=()
+p() { printf '%s' "$1"; }
+if [ "${QEMU_WIN:-0}" = 1 ]; then
+  . "$ROOT/tools/lib/qemu-win.sh"
+  PY=(python.exe)
+  p() { winpath "$1"; }
+  QEMU="$(winpath "$QEMU_WIN_DIR/qemu-system-x86_64.exe")"
+  WIN_ARGS=(--win $([ "${QEMU_SHOW:-0}" = 1 ] && echo --show) --ovmf-code "$(winpath "$QEMU_WIN_DIR/share/edk2-x86_64-code.fd")"
+            --ovmf-vars "$(winpath "$QEMU_WIN_DIR/share/edk2-i386-vars.fd")")
+  TRACE=()
+  echo "kbdsuite: Windows' QEMU has no hid_kbd_set_leds trace; the lock lights are not checked"
+else
 if [ -z "${QEMU:-}" ]; then
   QEMU=qemu-system-x86_64
   [ -x "$HOME/qemu-rtl/bin/qemu-system-x86_64" ] && QEMU="$HOME/qemu-rtl/bin/qemu-system-x86_64"
@@ -37,6 +52,7 @@ if "$QEMU" -trace help 2>/dev/null | grep -q '^hid_kbd_set_leds$'; then
   TRACE=(--trace)
 else
   echo "kbdsuite: $QEMU has no hid_kbd_set_leds trace; the lock lights are not checked"
+fi
 fi
 
 if [ "${SKIP_CMAKE:-0}" != "1" ]; then
@@ -60,16 +76,23 @@ if ss -ltn 2>/dev/null | grep -qE ":$HTTP_PORT\b"; then
   echo "kbdsuite: port $HTTP_PORT is already in use on this host" >&2; exit 2
 fi
 REQUEST_LOG="$OUT_DIR/requests.log"; : > "$REQUEST_LOG"
-python3 "$ROOT/tools/net-suite/host_server.py" --tcp-echo 18307 --udp-echo 18308 --http "$HTTP_PORT" \
-  --request-log "$REQUEST_LOG" > "$OUT_DIR/host_server.log" 2>&1 &
+rm -f "$OUT_DIR/host.pid"
+"${PY[@]}" "$(p "$ROOT/tools/net-suite/host_server.py")" --tcp-echo 18307 --udp-echo 18308 --http "$HTTP_PORT" \
+  --request-log "$(p "$REQUEST_LOG")" --pidfile "$(p "$OUT_DIR/host.pid")" > "$OUT_DIR/host_server.log" 2>&1 &
 host_pid=$!
-trap 'kill $host_pid 2>/dev/null || true' EXIT
+stop_host() {
+  kill $host_pid 2>/dev/null || true
+  if [ "${QEMU_WIN:-0}" = 1 ] && [ -f "$OUT_DIR/host.pid" ]; then
+    taskkill.exe /PID "$(tr -dc 0-9 < "$OUT_DIR/host.pid")" /F >/dev/null 2>&1 || true
+  fi
+}
+trap stop_host EXIT
 for _ in $(seq 1 50); do grep -q ready "$OUT_DIR/host_server.log" 2>/dev/null && break; sleep 0.1; done
 
 status=0
-python3 "$ROOT/tools/kbd-suite/drive.py" --modes "$KBD_MODES" --parts "$KBD_PARTS" \
-  --probe-iso "$OUT_DIR/probe/os-testsuite.iso" --system-iso "$BUILD_DIR/iboot.iso" \
-  --request-log "$REQUEST_LOG" --http-port "$HTTP_PORT" --out "$OUT_DIR" \
-  --qemu "$QEMU" --smp "$QEMU_SMP" "${TRACE[@]}" | tee "$OUT_DIR/drive.log" || status=$?
+"${PY[@]}" "$(p "$ROOT/tools/kbd-suite/drive.py")" --modes "$KBD_MODES" --parts "$KBD_PARTS" \
+  --probe-iso "$(p "$OUT_DIR/probe/os-testsuite.iso")" --system-iso "$(p "$BUILD_DIR/iboot.iso")" \
+  --request-log "$(p "$REQUEST_LOG")" --http-port "$HTTP_PORT" --out "$(p "$OUT_DIR")" \
+  --qemu "$QEMU" --smp "$QEMU_SMP" "${TRACE[@]}" "${WIN_ARGS[@]}" | tee "$OUT_DIR/drive.log" || status=$?
 echo "kbdsuite: modes=\"$KBD_MODES\" status=$status out=$OUT_DIR"
 exit "$status"

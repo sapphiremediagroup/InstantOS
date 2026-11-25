@@ -39,6 +39,7 @@ public:
     };
 
     static constexpr uint64_t kPtsSlaveInodeBase = 0x1000;
+    static constexpr uint64_t kPartitionInodeBase = 0x2000;   // /dev/diskNpM (DiskRegistry)
 
     VNode* getPtmxNode() { return ptmxNode; }
     VNode* getPtsDirNode() { return ptsDirNode; }

@@ -249,6 +249,26 @@ static bool fat32LabelIsInstantOS(BlockDevice* device, uint64_t startByte) {
     return false;
 }
 
+// Whether the ext4 volume at `startByte` is labelled "InstantOS", as
+// instant-install's mke2fs -L makes it. Windows tools that give the installed
+// partition a drive letter retype it to basic data.
+static bool ext4LabelIsInstantOS(BlockDevice* device, uint64_t startByte) {
+    uint8_t super[512];   // the superblock's first half: magic at 56, label at 120
+    if (!device->read(startByte + 1024, super, 512) || rd16le(super, 56) != 0xEF53) {
+        return false;
+    }
+    static const char kLabel[16] = { 'I', 'n', 's', 't', 'a', 'n', 't', 'O', 'S' };   // NUL padded
+    for (int i = 0; i < 16; i++) {
+        if (super[120 + i] != (uint8_t)kLabel[i]) return false;
+    }
+    return true;
+}
+
+// Whether a Windows basic-data partition holds a volume of ours.
+static bool volumeIsInstantOS(BlockDevice* device, uint64_t startByte) {
+    return fat32LabelIsInstantOS(device, startByte) || ext4LabelIsInstantOS(device, startByte);
+}
+
 // 9566fa50-7665-4f44-962e-113fd99cdc87.
 const uint8_t kGptInstantOSDataGuid[16] = {
     0x50, 0xFA, 0x66, 0x95, 0x65, 0x76, 0x44, 0x4F,
@@ -301,7 +321,7 @@ GptSearch gptFindInstantOSPartition(BlockDevice* device, uint64_t* startByte, ui
         if (lastLba < firstLba) {
             continue;
         }
-        if (!ours && !fat32LabelIsInstantOS(device, firstLba * 512)) {
+        if (!ours && !volumeIsInstantOS(device, firstLba * 512)) {
             continue;
         }
         if (startByte) *startByte = firstLba * 512;
@@ -309,4 +329,82 @@ GptSearch gptFindInstantOSPartition(BlockDevice* device, uint64_t* startByte, ui
         return GptSearch::Found;
     }
     return GptSearch::NotInstantOS;
+}
+
+namespace {
+int hexValue(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+}  // namespace
+
+bool gptParseGuid(const char* text, uint8_t out[16]) {
+    if (!text) return false;
+    // The text's bytes in order (dashes at 8, 13, 18, 23), then the first
+    // three fields byte-swapped into GPT's mixed-endian layout.
+    uint8_t bytes[16];
+    int n = 0;
+    for (int i = 0; i < 36; ++i) {
+        if (i == 8 || i == 13 || i == 18 || i == 23) {
+            if (text[i] != '-') return false;
+            continue;
+        }
+        const int high = hexValue(text[i]);
+        const int low = hexValue(text[i + 1]);
+        if (high < 0 || low < 0) return false;
+        bytes[n++] = (uint8_t)((high << 4) | low);
+        ++i;
+    }
+    if (text[36] != 0 || n != 16) return false;
+    const int order[16] = {3, 2, 1, 0, 5, 4, 7, 6, 8, 9, 10, 11, 12, 13, 14, 15};
+    for (int i = 0; i < 16; ++i) {
+        out[i] = bytes[order[i]];
+    }
+    return true;
+}
+
+GptSearch gptFindPartitionByGuid(BlockDevice* device, const uint8_t guid[16], uint64_t* startByte,
+                                 uint64_t* lengthByte) {
+    if (!device || !guid) return GptSearch::NoGpt;
+    uint8_t hdr[512];
+    if (!device->read((uint64_t)GPT_HEADER_LBA * 512, hdr, 512) || !gptSignatureOk(hdr)) {
+        return GptSearch::NoGpt;
+    }
+    const uint64_t entryLba = rd64le(hdr, 0x48);
+    uint32_t numEntries = rd32le(hdr, 0x50);
+    const uint32_t entrySize = rd32le(hdr, 0x54);
+    if (entrySize < 128 || entrySize > 512 || entryLba == 0) {
+        return GptSearch::NotFound;
+    }
+    if (numEntries > 256) {
+        numEntries = 256;
+    }
+    uint8_t entry[512];
+    for (uint32_t i = 0; i < numEntries; i++) {
+        if (!device->read(entryLba * 512 + (uint64_t)i * entrySize, entry, entrySize)) {
+            break;
+        }
+        if (!guidEqual(entry + 0x10, guid)) {
+            continue;
+        }
+        const uint64_t firstLba = rd64le(entry, 0x20);
+        const uint64_t lastLba = rd64le(entry, 0x28);
+        const bool ours = guidEqual(entry, kGptInstantOSDataGuid) ||
+            (guidEqual(entry, kGptBasicDataGuid) && volumeIsInstantOS(device, firstLba * 512));
+        if (!ours || lastLba < firstLba) {
+            return GptSearch::NotInstantOS;
+        }
+        if (startByte) *startByte = firstLba * 512;
+        if (lengthByte) *lengthByte = (lastLba - firstLba + 1) * 512;
+        return GptSearch::Found;
+    }
+    return GptSearch::NotFound;
+}
+
+bool gptEntryIsInstantOS(BlockDevice* device, const uint8_t* entry) {
+    if (!device || !entry) return false;
+    if (guidEqual(entry, kGptInstantOSDataGuid)) return true;
+    return guidEqual(entry, kGptBasicDataGuid) && volumeIsInstantOS(device, rd64le(entry, 0x20) * 512);
 }

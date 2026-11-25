@@ -4,7 +4,7 @@
 # fails ("config.sub ...-instantos failed") under the Canadian cross. Overlay
 # GCC's own (already instantos-patched) config.sub + config.guess onto each.
 set -euo pipefail
-GCC_SRC="${GCC_SRC:-/home/sky/gcc-port/gcc-13.3.0}"
+GCC_SRC="${GCC_SRC:-${GCC_PORT_DIR:-$HOME/gcc-port}/gcc-13.3.0}"
 
 grep -q 'instantos' "$GCC_SRC/config.sub" || { echo "gcc config.sub lacks instantos; run apply-gcc-instantos-port.sh first" >&2; exit 2; }
 

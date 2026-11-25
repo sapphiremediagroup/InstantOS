@@ -2,6 +2,7 @@
 #include <memory/heap.hpp>
 #include <common/string.hpp>
 #include <time/time.hpp>
+#include <time/tsc_timer.hpp>
 
 // Phase 1 ext2/3/4 read path. See include/fs/ext4/ext4.hpp for the on-disk
 // layout. This translation unit intentionally depends only on the heap and the
@@ -36,6 +37,7 @@ Ext4FS::Ext4FS(BlockDevice* device)
       hasMetadataCsum(false), writable(false), mounted(false),
       jWriteEnabled(false), jActive(false), jSkipCheckpoint(false), jOverflow(false),
       jCount(0), jFirst(0), jMaxlen(0), jSeqNext(0), jSbPhys(0) {
+    memset(jHash, 0, sizeof(jHash));
     ops.open = nodeOpen;
     ops.close = nodeClose;
     ops.read = nodeRead;
@@ -61,7 +63,32 @@ Ext4FS::Ext4FS(BlockDevice* device)
     ops.fsync = nodeFsync;
 }
 
+namespace {
+constexpr uint32_t kMaxMounted = 4;
+Ext4FS* g_mounted[kMaxMounted];
+uint32_t g_mountedCount = 0;
+
+void forgetMounted(Ext4FS* fs) {
+    for (uint32_t i = 0; i < g_mountedCount; ++i) {
+        if (g_mounted[i] == fs) {
+            g_mounted[i] = g_mounted[--g_mountedCount];
+            return;
+        }
+    }
+}
+}  // namespace
+
+uint32_t Ext4FS::mountedCount() { return g_mountedCount; }
+Ext4FS* Ext4FS::mountedVolume(uint32_t index) {
+    return index < g_mountedCount ? g_mounted[index] : nullptr;
+}
+
 Ext4FS::~Ext4FS() {
+    if (mounted) {
+        sync(false);
+    }
+    jTxnReset();
+    forgetMounted(this);
     if (rootNode) {
         Ext4Node* n = static_cast<Ext4Node*>(rootNode->getData());
         if (n) {
@@ -69,15 +96,40 @@ Ext4FS::~Ext4FS() {
         }
         delete rootNode;
     }
+    if (runBuf) kfree(runBuf);
     freeBlockCache();
 }
 
 int Ext4FS::unmount() {
-    return 0;
+    return sync(false);
+}
+
+int Ext4FS::sync(bool onlyDue) {
+    if (!jActive) {
+        return 0;
+    }
+    if (jCount == 0) {
+        jActive = false;
+        return 0;
+    }
+    if (onlyDue && !jCommitDue()) {
+        return 0;
+    }
+    return jCommitRunning();
 }
 
 VNode* Ext4FS::getRoot() {
     return rootNode;
+}
+
+void Ext4FS::releaseNode(VNode* node) {
+    if (!node || node == rootNode) {
+        return;
+    }
+    if (node->getData()) {
+        kfree(node->getData());
+    }
+    delete node;
 }
 
 // ---------------------------------------------------------------------------
@@ -542,13 +594,23 @@ int Ext4FS::mount(const char* path) {
         return -1;
     }
 
+    if (writable && !runBuf && blockSize <= kRunBytes) {
+        runBuf = static_cast<uint8_t*>(kmalloc(kRunBytes));   // null: writes go one block at a time
+    }
     mounted = true;
+    if (g_mountedCount < kMaxMounted) {
+        g_mounted[g_mountedCount++] = this;
+    }
     return 0;
 }
 
 // ---------------------------------------------------------------------------
 // VNodeOps: read side
 // ---------------------------------------------------------------------------
+
+namespace {
+void refreshVNode(VNode* v);   // reloads the node's inode (Ext4FS::refreshNode)
+}
 
 int Ext4FS::nodeOpen(VNode* node, int flags) {
     (void)node;
@@ -562,6 +624,7 @@ int Ext4FS::nodeClose(VNode* node) {
 }
 
 int64_t Ext4FS::nodeRead(VNode* node, void* buffer, uint64_t size, uint64_t offset) {
+    refreshVNode(node);
     if (!node || !buffer) {
         return -1;
     }
@@ -585,15 +648,37 @@ int64_t Ext4FS::nodeRead(VNode* node, void* buffer, uint64_t size, uint64_t offs
     }
 
     uint8_t* dest = static_cast<uint8_t*>(buffer);
+    const uint64_t bs = fs->blockSize;
     uint64_t done = 0;
-    uint64_t logical = offset / fs->blockSize;
-    uint32_t inBlock = static_cast<uint32_t>(offset % fs->blockSize);
+    uint64_t logical = offset / bs;
+    uint32_t inBlock = static_cast<uint32_t>(offset % bs);
+    constexpr uint64_t kMaxRunBlocks = 256;
 
     while (done < size) {
         const uint64_t phys = fs->resolveBlock(n, logical);
-        uint64_t toRead = fs->blockSize - inBlock;
+        uint64_t toRead = bs - inBlock;
         if (toRead > size - done) {
             toRead = size - done;
+        }
+        if (phys != 0 && toRead == bs && size - done >= 2 * bs) {
+            // Whole blocks at consecutive addresses are read in one go,
+            // straight from the device: file data is never held in the
+            // transaction, and the block cache is write-through, so the disk
+            // is current. Keeping bulk data out of the cache also leaves it to
+            // the metadata it is for.
+            uint64_t run = 1;
+            while (run < kMaxRunBlocks && size - done >= (run + 1) * bs &&
+                   fs->resolveBlock(n, logical + run) == phys + run) {
+                ++run;
+            }
+            if (run > 1) {
+                if (!fs->device->read(phys * bs, dest + done, run * bs)) {
+                    return done > 0 ? static_cast<int64_t>(done) : -1;
+                }
+                done += run * bs;
+                logical += run;
+                continue;
+            }
         }
         if (phys == 0) {
             // Sparse hole: reads as zeroes.
@@ -609,6 +694,7 @@ int64_t Ext4FS::nodeRead(VNode* node, void* buffer, uint64_t size, uint64_t offs
 }
 
 int Ext4FS::nodeStat(VNode* node, FileStats* stats) {
+    refreshVNode(node);
     if (!node || !stats) {
         return -1;
     }
@@ -688,6 +774,7 @@ int Ext4FS::readDirInto(VNode* dir, DirEntry* entries, uint64_t count, uint64_t*
 }
 
 int Ext4FS::nodeReaddir(VNode* node, DirEntry* entries, uint64_t count, uint64_t* read) {
+    refreshVNode(node);
     if (!node || !entries || !read) {
         return -1;
     }
@@ -753,6 +840,7 @@ VNode* Ext4FS::lookupInDir(VNode* dir, const char* name) {
 }
 
 VNode* Ext4FS::nodeLookup(VNode* node, const char* name) {
+    refreshVNode(node);
     if (!node || !name) {
         return nullptr;
     }
@@ -764,6 +852,7 @@ VNode* Ext4FS::nodeLookup(VNode* node, const char* name) {
 }
 
 int64_t Ext4FS::nodeReadlink(VNode* node, char* buffer, uint64_t size) {
+    refreshVNode(node);
     if (!node || !buffer) {
         return -1;
     }
@@ -895,8 +984,8 @@ bool Ext4FS::writeBytes(uint64_t byteOffset, const void* buffer, uint64_t size) 
         const uint32_t boff = static_cast<uint32_t>(pos % blockSize);
         uint32_t chunk = blockSize - boff;
         if (chunk > size - done) chunk = static_cast<uint32_t>(size - done);
-        uint8_t* b = jTxnBlock(block);
-        if (!b) return false;   // transaction overflow
+        uint8_t* b = jTxnBlock(block, !(boff == 0 && chunk == blockSize));
+        if (!b) return false;   // out of memory
         memcpy(b + boff, src + done, chunk);
         done += chunk;
     }
@@ -984,6 +1073,42 @@ bool Ext4FS::writeInodeRaw(uint32_t inodeNum, const Ext4Inode* inode, bool zeroE
     return ok;
 }
 
+void Ext4FS::refreshNode(Ext4Node* n) {
+    Ext4Inode ino;
+    if (!n || !readInode(n->inodeNum, &ino)) {
+        return;
+    }
+    // A freed inode (unlinked while this copy was open) keeps its last state.
+    if (ino.i_mode == 0 || ino.i_links_count == 0) {
+        return;
+    }
+    n->mode = ino.i_mode;
+    n->flags = ino.i_flags;
+    n->linksCount = ino.i_links_count;
+    n->uid = ino.i_uid;
+    n->gid = ino.i_gid;
+    n->atime = ino.i_atime;
+    n->ctime = ino.i_ctime;
+    n->mtime = ino.i_mtime;
+    n->blocksLo = ino.i_blocks_lo;
+    n->generation = ino.i_generation;
+    n->size = (ino.i_mode & kModeFmtMask) == kModeReg
+        ? (static_cast<uint64_t>(ino.i_size_lo) | (static_cast<uint64_t>(ino.i_size_high) << 32))
+        : ino.i_size_lo;
+    for (int i = 0; i < 15; ++i) {
+        n->iBlock[i] = ino.i_block[i];
+    }
+}
+
+namespace {
+void refreshVNode(VNode* v) {
+    if (!v) return;
+    Ext4FS* fs = static_cast<Ext4FS*>(v->getFS());
+    Ext4Node* n = static_cast<Ext4Node*>(v->getData());
+    if (fs && n) fs->refreshNode(n);
+}
+}
+
 bool Ext4FS::syncNodeInode(const Ext4Node* n) {
     // Read-modify-write so untracked on-disk fields (generation, osd, etc.) are
     // preserved.
@@ -1020,13 +1145,21 @@ uint64_t Ext4FS::groupBlockCount(uint32_t group) const {
     const uint64_t remaining = totalBlocks - groupFirst;
     return remaining < blocksPerGroup ? remaining : blocksPerGroup;
 }
-uint64_t Ext4FS::allocBlock() {
-    if (!writable) return 0;
+uint64_t Ext4FS::allocBlock(bool zero) {
+    if (!writable || groupCount == 0) return 0;
     uint8_t* bmp = static_cast<uint8_t*>(kmalloc(blockSize));
     if (!bmp) return 0;
+    // With a running transaction, a block freed in it is still in use in the
+    // last committed state (a crash brings that back), so it must not be handed
+    // out for file data, which is written in place at once. Such blocks are
+    // free in the transaction's bitmap but set in the committed one.
+    uint8_t* committed = jActive ? static_cast<uint8_t*>(kmalloc(blockSize)) : nullptr;
+    if (jActive && !committed) { kfree(bmp); return 0; }
 
     uint64_t result = 0;
-    for (uint32_t g = 0; g < groupCount && result == 0; ++g) {
+    const uint32_t startGroup = allocGoalGroup < groupCount ? allocGoalGroup : 0;
+    for (uint32_t k = 0; k < groupCount && result == 0; ++k) {
+        const uint32_t g = (startGroup + k) % groupCount;
         Ext4GroupDesc gd;
         if (!readGroupDesc(g, &gd)) break;
         uint64_t freeCount = static_cast<uint64_t>(gd.bg_free_blocks_count_lo) |
@@ -1035,12 +1168,31 @@ uint64_t Ext4FS::allocBlock() {
         const uint64_t bitmapBlock = static_cast<uint64_t>(gd.bg_block_bitmap_lo) |
             (has64bit ? (static_cast<uint64_t>(gd.bg_block_bitmap_hi) << 32) : 0);
         if (bitmapBlock == 0 || !readBlock(bitmapBlock, bmp)) continue;
+        const bool checkCommitted = committed && jTxnFind(bitmapBlock) &&
+            devReadBytes(bitmapBlock * static_cast<uint64_t>(blockSize), committed, blockSize);
 
         const uint64_t count = groupBlockCount(g);
-        for (uint64_t i = 0; i < count; ++i) {
-            if (bmp[i >> 3] & (1u << (i & 7))) continue;   // in use
+        uint64_t first = (k == 0) ? allocGoalBit : 0;
+        if (first >= count) first = 0;
+        uint64_t i = count;   // the free bit found, count if none
+        for (uint64_t n = 0; n < count; ++n) {
+            uint64_t b = first + n;
+            if (b >= count) b -= count;
+            uint8_t used = bmp[b >> 3];
+            if (checkCommitted) used |= committed[b >> 3];
+            if (used == 0xFF && (b & 7) == 0 && b + 8 <= count && n + 8 <= count) {
+                n += 7;   // a full byte
+                continue;
+            }
+            if (!(used & (1u << (b & 7)))) { i = b; break; }
+        }
+        if (i < count) {
             bmp[i >> 3] |= static_cast<uint8_t>(1u << (i & 7));
-            if (!writeBlock(bitmapBlock, bmp)) { kfree(bmp); return 0; }
+            if (!writeBlock(bitmapBlock, bmp)) {
+                kfree(bmp);
+                if (committed) kfree(committed);
+                return 0;
+            }
             if (hasMetadataCsum) {
                 const uint32_t c = crc32c(csumSeed, bmp, blocksPerGroup / 8);
                 gd.bg_block_bitmap_csum_lo = static_cast<uint16_t>(c & 0xFFFF);
@@ -1058,14 +1210,24 @@ uint64_t Ext4FS::allocBlock() {
             flushSuperblock();
             result = static_cast<uint64_t>(firstDataBlock) +
                 static_cast<uint64_t>(g) * blocksPerGroup + i;
-            break;
+            allocGoalGroup = g;
+            allocGoalBit = i + 1;
         }
     }
     kfree(bmp);
+    if (committed) kfree(committed);
 
-    if (result) {   // zero the freshly allocated block (direct: data, not journaled)
+    if (result && jActive) {
+        // Allocated and freed within this transaction, the block may still be
+        // buffered as the metadata it was (an indirect or directory block);
+        // checkpointing that copy would overwrite what goes there now.
+        jTxnDrop(result);
+    }
+    if (result && zero) {   // an indirect block: zeros, as metadata
         uint8_t* z = static_cast<uint8_t*>(kmalloc(blockSize));
-        if (z) { memset(z, 0, blockSize); devWriteBytes(result * static_cast<uint64_t>(blockSize), z, blockSize); kfree(z); }
+        bool ok = z != nullptr;
+        if (ok) { memset(z, 0, blockSize); ok = writeBlock(result, z); kfree(z); }
+        if (!ok) { freeBlockNum(result); return 0; }
     }
     return result;
 }
@@ -1223,7 +1385,7 @@ bool Ext4FS::writePointer(uint64_t block, uint32_t index, uint32_t value) {
 
 bool Ext4FS::ensureIndirect(uint32_t* slot, Ext4Node* node) {
     if (*slot != 0) return true;
-    const uint64_t nb = allocBlock();   // allocBlock zeroes the block
+    const uint64_t nb = allocBlock(true);   // zeroed: no pointers yet
     if (nb == 0) return false;
     *slot = static_cast<uint32_t>(nb);
     node->blocksLo += blockSize / 512;
@@ -1248,7 +1410,7 @@ bool Ext4FS::bmapSet(Ext4Node* node, uint64_t lb, uint64_t phys) {
         const uint32_t l2index = static_cast<uint32_t>(lb % ppb);
         uint32_t l1 = readPointer(node->iBlock[13], l1index);
         if (l1 == 0) {
-            const uint64_t nb = allocBlock();
+            const uint64_t nb = allocBlock(true);
             if (nb == 0) return false;
             l1 = static_cast<uint32_t>(nb);
             node->blocksLo += blockSize / 512;
@@ -1700,6 +1862,7 @@ VNode* Ext4FS::createEntry(VNode* parent, const char* name, uint32_t mode,
     return makeVNode(inodeNum, &ino);
 }
 int64_t Ext4FS::nodeWrite(VNode* node, const void* buffer, uint64_t size, uint64_t offset) {
+    refreshVNode(node);
     if (!node || !buffer) return -1;
     Ext4Node* n = static_cast<Ext4Node*>(node->getData());
     Ext4FS* fs = static_cast<Ext4FS*>(node->getFS());
@@ -1714,28 +1877,76 @@ int64_t Ext4FS::nodeWrite(VNode* node, const void* buffer, uint64_t size, uint64
 
     JTxn txn(fs);
     const uint8_t* src = static_cast<const uint8_t*>(buffer);
+    const uint64_t bs = fs->blockSize;
     uint64_t done = 0;
-    uint64_t logical = offset / fs->blockSize;
-    uint32_t inBlock = static_cast<uint32_t>(offset % fs->blockSize);
+    uint64_t logical = offset / bs;
+    uint32_t inBlock = static_cast<uint32_t>(offset % bs);
+
+    // File data bypasses the journal (ordered mode) and goes straight to its
+    // blocks. Whole blocks at consecutive physical addresses are written as
+    // one run (the allocator hands out consecutive blocks), so a large write
+    // is a few device commands rather than one per block.
+    uint64_t runPhys = 0;     // first block of the pending run of whole blocks
+    uint64_t runDone = 0;     // `done` where the run starts
+    uint64_t runBlocks = 0;
+    constexpr uint64_t kMaxRunBlocks = 256;   // 1 MiB at 4 KiB blocks
+    bool failed = false;
+    auto flushRun = [&]() -> bool {
+        if (runBlocks == 0) return true;
+        const bool ok = fs->devWriteBytes(runPhys * bs, src + runDone, runBlocks * bs);
+        if (!ok) done = runDone;   // nothing of the run counts as written
+        runBlocks = 0;
+        return ok;
+    };
+    uint8_t* partial = nullptr;   // a new block written in part: zeros around the data
 
     while (done < size) {
         uint64_t phys = fs->resolveBlock(n, logical);
+        bool fresh = false;
         if (phys == 0) {
             if (extentFile) break;
             const uint64_t nb = fs->allocBlock();
             if (nb == 0) break;
-            n->blocksLo += fs->blockSize / 512;
+            n->blocksLo += bs / 512;
             if (!fs->bmapSet(n, logical, nb)) break;
             phys = nb;
+            fresh = true;
         }
-        uint64_t toWrite = fs->blockSize - inBlock;
+        uint64_t toWrite = bs - inBlock;
         if (toWrite > size - done) toWrite = size - done;
-        // File data bypasses the journal (ordered mode): written directly.
-        if (!fs->devWriteBytes(phys * fs->blockSize + inBlock, src + done, toWrite)) break;
+        if (toWrite == bs) {
+            if (runBlocks != 0 && phys == runPhys + runBlocks && runBlocks < kMaxRunBlocks) {
+                ++runBlocks;
+            } else {
+                if (!flushRun()) { failed = true; break; }
+                runPhys = phys;
+                runDone = done;
+                runBlocks = 1;
+            }
+        } else {
+            if (!flushRun()) { failed = true; break; }
+            bool ok;
+            if (fresh) {
+                // The rest of a new block must read as zeros, whatever the
+                // disk held there before.
+                if (!partial) partial = static_cast<uint8_t*>(kmalloc(bs));
+                ok = partial != nullptr;
+                if (ok) {
+                    memset(partial, 0, bs);
+                    memcpy(partial + inBlock, src + done, toWrite);
+                    ok = fs->devWriteBytes(phys * bs, partial, bs);
+                }
+            } else {
+                ok = fs->devWriteBytes(phys * bs + inBlock, src + done, toWrite);
+            }
+            if (!ok) { failed = true; break; }
+        }
         done += toWrite;
         inBlock = 0;
         ++logical;
     }
+    if (!failed) flushRun();
+    if (partial) kfree(partial);
 
     if (offset + done > n->size) n->size = offset + done;
     n->mtime = n->ctime = nowTime();   // data write advances mtime (and ctime)
@@ -1745,6 +1956,7 @@ int64_t Ext4FS::nodeWrite(VNode* node, const void* buffer, uint64_t size, uint64
 }
 
 int Ext4FS::nodeCreate(VNode* parent, const char* name, uint32_t mode, VNode** result) {
+    refreshVNode(parent);
     if (!parent) return -1;
     Ext4FS* fs = static_cast<Ext4FS*>(parent->getFS());
     if (!fs || !fs->writable) return -1;
@@ -1757,6 +1969,7 @@ int Ext4FS::nodeCreate(VNode* parent, const char* name, uint32_t mode, VNode** r
 }
 
 int Ext4FS::nodeMkdir(VNode* parent, const char* name, uint32_t mode, VNode** result) {
+    refreshVNode(parent);
     if (!parent) return -1;
     Ext4FS* fs = static_cast<Ext4FS*>(parent->getFS());
     if (!fs || !fs->writable) return -1;
@@ -1769,6 +1982,7 @@ int Ext4FS::nodeMkdir(VNode* parent, const char* name, uint32_t mode, VNode** re
 }
 
 int Ext4FS::nodeSymlink(VNode* parent, const char* name, const char* target, VNode** result) {
+    refreshVNode(parent);
     if (!parent || !target) return -1;
     Ext4FS* fs = static_cast<Ext4FS*>(parent->getFS());
     if (!fs || !fs->writable) return -1;
@@ -1781,6 +1995,7 @@ int Ext4FS::nodeSymlink(VNode* parent, const char* name, const char* target, VNo
 }
 
 int Ext4FS::nodeChmod(VNode* node, uint32_t mode) {
+    refreshVNode(node);
     if (!node) return -1;
     Ext4Node* n = static_cast<Ext4Node*>(node->getData());
     Ext4FS* fs = static_cast<Ext4FS*>(node->getFS());
@@ -1793,6 +2008,7 @@ int Ext4FS::nodeChmod(VNode* node, uint32_t mode) {
 }
 
 int Ext4FS::nodeChown(VNode* node, uint32_t uid, uint32_t gid) {
+    refreshVNode(node);
     if (!node) return -1;
     Ext4Node* n = static_cast<Ext4Node*>(node->getData());
     Ext4FS* fs = static_cast<Ext4FS*>(node->getFS());
@@ -1806,16 +2022,18 @@ int Ext4FS::nodeChown(VNode* node, uint32_t uid, uint32_t gid) {
 }
 
 int Ext4FS::nodeFsync(VNode* node) {
+    refreshVNode(node);
     if (!node) return -1;
     Ext4FS* fs = static_cast<Ext4FS*>(node->getFS());
     if (!fs || !fs->device) return -1;
-    // The driver is write-through (data and metadata are already issued to the
-    // device per op), so fsync just needs to push the device's write cache to
-    // stable storage.
-    return fs->device->flush() ? 0 : -1;
+    // File data is already on the device; commit the running transaction's
+    // metadata, then push the device's write cache to stable storage.
+    const int committed = fs->sync(false);
+    return (fs->device->flush() && committed == 0) ? 0 : -1;
 }
 
 int Ext4FS::nodeUtime(VNode* node, uint64_t atime, uint64_t mtime) {
+    refreshVNode(node);
     if (!node) return -1;
     Ext4Node* n = static_cast<Ext4Node*>(node->getData());
     Ext4FS* fs = static_cast<Ext4FS*>(node->getFS());
@@ -1829,6 +2047,7 @@ int Ext4FS::nodeUtime(VNode* node, uint64_t atime, uint64_t mtime) {
 }
 
 int Ext4FS::nodeTruncate(VNode* node, uint64_t newSize) {
+    refreshVNode(node);
     if (!node) return -1;
     Ext4Node* n = static_cast<Ext4Node*>(node->getData());
     Ext4FS* fs = static_cast<Ext4FS*>(node->getFS());
@@ -1856,6 +2075,18 @@ int Ext4FS::nodeTruncate(VNode* node, uint64_t newSize) {
     if (newSize < n->size) {
         const uint64_t keepBlocks = (newSize + fs->blockSize - 1) / fs->blockSize;
         fs->bmapTruncate(n, keepBlocks);
+        // The new last block keeps bytes past the new end: zero them, or a
+        // later extension (truncate up, a write past the end) would show them.
+        const uint32_t tail = static_cast<uint32_t>(newSize % fs->blockSize);
+        const uint64_t last = tail ? fs->resolveBlock(n, newSize / fs->blockSize) : 0;
+        if (last) {
+            uint8_t* z = static_cast<uint8_t*>(kmalloc(fs->blockSize - tail));
+            if (z) {
+                memset(z, 0, fs->blockSize - tail);
+                fs->devWriteBytes(last * fs->blockSize + tail, z, fs->blockSize - tail);
+                kfree(z);
+            }
+        }
     }
     // Growing produces a sparse file (holes read as zero, allocated on write).
     n->size = newSize;
@@ -1865,6 +2096,7 @@ int Ext4FS::nodeTruncate(VNode* node, uint64_t newSize) {
 }
 
 int Ext4FS::nodeUnlink(VNode* parent, const char* name) {
+    refreshVNode(parent);
     if (!parent || !name) return -1;
     Ext4Node* p = static_cast<Ext4Node*>(parent->getData());
     Ext4FS* fs = static_cast<Ext4FS*>(parent->getFS());
@@ -1910,6 +2142,7 @@ int Ext4FS::nodeUnlink(VNode* parent, const char* name) {
 }
 
 int Ext4FS::nodeRmdir(VNode* parent, const char* name) {
+    refreshVNode(parent);
     if (!parent || !name) return -1;
     Ext4Node* p = static_cast<Ext4Node*>(parent->getData());
     Ext4FS* fs = static_cast<Ext4FS*>(parent->getFS());
@@ -1944,6 +2177,7 @@ int Ext4FS::nodeRmdir(VNode* parent, const char* name) {
 }
 
 int Ext4FS::nodeLink(VNode* oldParent, const char* oldName, VNode* newParent, const char* newName) {
+    refreshVNode(oldParent); refreshVNode(newParent);
     if (!oldParent || !oldName || !newParent || !newName) return -1;
     Ext4FS* fs = static_cast<Ext4FS*>(oldParent->getFS());
     if (!fs || !fs->writable || fs != static_cast<Ext4FS*>(newParent->getFS())) return -1;
@@ -1965,6 +2199,7 @@ int Ext4FS::nodeLink(VNode* oldParent, const char* oldName, VNode* newParent, co
 }
 
 int Ext4FS::nodeRename(VNode* oldParent, const char* oldName, VNode* newParent, const char* newName) {
+    refreshVNode(oldParent); refreshVNode(newParent);
     if (!oldParent || !oldName || !newParent || !newName) return -1;
     Ext4FS* fs = static_cast<Ext4FS*>(oldParent->getFS());
     if (!fs || !fs->writable || fs != static_cast<Ext4FS*>(newParent->getFS())) return -1;
@@ -2007,12 +2242,19 @@ int Ext4FS::nodeRename(VNode* oldParent, const char* oldName, VNode* newParent, 
         }
     }
 
+    // oldParent and newParent can be two VNodes of one directory (ext4 makes a
+    // VNode per lookup). dirInsert may append a block through newParent's copy,
+    // so reload oldParent's before dirRemove writes it back, or the old size
+    // drops that block and the renamed entry with it (P7.2 lost mpfr's fma.lo).
+    const bool sameDir = static_cast<Ext4Node*>(oldParent->getData())->inodeNum ==
+                         static_cast<Ext4Node*>(newParent->getData())->inodeNum;
     if (fs->dirInsert(newParent, newName, ino, ft) != 0) { kfree(sn); delete src; return -1; }
+    refreshVNode(oldParent);
     uint32_t rm = 0;
     fs->dirRemove(oldParent, oldName, &rm);
 
     // Moving a directory across parents: fix its ".." and both link counts.
-    if (srcIsDir && oldParent != newParent) {
+    if (srcIsDir && !sameDir) {
         Ext4Node* op = static_cast<Ext4Node*>(oldParent->getData());
         Ext4Node* np = static_cast<Ext4Node*>(newParent->getData());
         uint8_t* buf = static_cast<uint8_t*>(kmalloc(fs->blockSize));
@@ -2287,7 +2529,7 @@ int Ext4FS::journalReplay() {
                             if (flags & kJbd2FlagEscape) {   // restore the escaped magic word
                                 dblk[0] = 0xC0; dblk[1] = 0x3B; dblk[2] = 0x39; dblk[3] = 0x98;
                             }
-                            if (target != 0) writeBlock(target, dblk);
+                            if (target != 0 && writeBlock(target, dblk)) ++replayedBlocks_;
                         }
                         dataJb = jbNext(dataJb, jFirst, jMaxlen);
                         off += tagsz;
@@ -2304,6 +2546,8 @@ int Ext4FS::journalReplay() {
                     break;
                 }
             }
+
+            replayedTransactions_ = lastCommitted + 1 - jSeq;
 
             // Reset the journal to clean and clear the fs RECOVER flag.
             jwbe32(jsb + 28, 0);                    // s_start = 0
@@ -2372,52 +2616,174 @@ bool Ext4FS::journalLoadGeometry() {
     return jWriteEnabled;
 }
 
+// The running transaction's blocks are found through a small open-addressing
+// table (reads look there first, and a transaction holds up to kJTxnCap).
+namespace {
+inline uint32_t jHashSlot(uint64_t block, int size) {
+    return static_cast<uint32_t>((block * 0x9E3779B97F4A7C15ull) >> 40) & static_cast<uint32_t>(size - 1);
+}
+}  // namespace
+
 uint8_t* Ext4FS::jTxnFind(uint64_t block) {
-    for (int i = 0; i < jCount; ++i) {
-        if (jBlockNum[i] == block) return jBlockBuf[i];
+    if (jCount == 0) return nullptr;
+    for (uint32_t s = jHashSlot(block, kJHashSize);; s = (s + 1) & (kJHashSize - 1)) {
+        const int16_t e = jHash[s];
+        if (e == 0) return nullptr;
+        if (jBlockNum[e - 1] == block) return jBlockBuf[e - 1];
     }
-    return nullptr;
 }
 
-uint8_t* Ext4FS::jTxnBlock(uint64_t block) {
+void Ext4FS::jTxnReset() {
+    for (int i = 0; i < jCount; ++i) kfree(jBlockBuf[i]);
+    jCount = 0;
+    memset(jHash, 0, sizeof(jHash));
+}
+
+void Ext4FS::jTxnDrop(uint64_t block) {
+    int found = -1;
+    for (int i = 0; i < jCount; ++i) {
+        if (jBlockNum[i] == block) { found = i; break; }
+    }
+    if (found < 0) return;
+    kfree(jBlockBuf[found]);
+    jBlockNum[found] = jBlockNum[jCount - 1];
+    jBlockBuf[found] = jBlockBuf[jCount - 1];
+    --jCount;
+    // Rare (a block allocated and freed in one transaction): rebuild the index.
+    memset(jHash, 0, sizeof(jHash));
+    for (int i = 0; i < jCount; ++i) {
+        uint32_t s = jHashSlot(jBlockNum[i], kJHashSize);
+        while (jHash[s] != 0) s = (s + 1) & (kJHashSize - 1);
+        jHash[s] = static_cast<int16_t>(i + 1);
+    }
+}
+
+uint32_t Ext4FS::jTxnCapacity() const {
+    // One descriptor block holds every tag: a 12-byte header, 8 bytes a tag,
+    // and the UUID after the first. The log also needs the descriptor and the
+    // commit block.
+    uint32_t cap = kJTxnCap;
+    const uint32_t tags = (blockSize - 12 - 16) / 8;
+    if (tags < cap) cap = tags;
+    if (jMaxlen > 3 && jMaxlen - 3 < cap) cap = jMaxlen - 3;
+    return cap;
+}
+
+void Ext4FS::jOpen() {
+    jActive = true;
+    jOverflow = false;
+    jOpenedMs = time_get_uptime_ms();
+}
+
+bool Ext4FS::jCommitDue() const {
+    return time_get_uptime_ms() >= jOpenedMs + kCommitMs;
+}
+
+uint8_t* Ext4FS::jTxnBlock(uint64_t block, bool load) {
     if (uint8_t* existing = jTxnFind(block)) return existing;
-    if (jCount >= kJTxnCap) { jOverflow = true; return nullptr; }
+    if (static_cast<uint32_t>(jCount) >= jTxnCapacity()) {
+        // Full in the middle of an op (jBegin commits well before that, so only
+        // a very large op gets here): commit what is there and go on in a new
+        // transaction. That op is then not atomic across a crash.
+        if (jCommitRunning() != 0) { jOverflow = true; return nullptr; }
+        jOpen();
+    }
     uint8_t* buf = static_cast<uint8_t*>(kmalloc(blockSize));
     if (!buf) { jOverflow = true; return nullptr; }
-    if (!devReadBytes(block * static_cast<uint64_t>(blockSize), buf, blockSize)) {
+    if (!load || !devReadBytes(block * static_cast<uint64_t>(blockSize), buf, blockSize)) {
         memset(buf, 0, blockSize);
     }
     jBlockNum[jCount] = block;
     jBlockBuf[jCount] = buf;
+    uint32_t s = jHashSlot(block, kJHashSize);
+    while (jHash[s] != 0) s = (s + 1) & (kJHashSize - 1);
+    jHash[s] = static_cast<int16_t>(jCount + 1);
     ++jCount;
     return buf;
 }
 
 void Ext4FS::jBegin() {
-    if (!jWriteEnabled || jActive) return;
-    jActive = true;
-    jOverflow = false;
-    jCount = 0;
+    if (!jWriteEnabled) return;
+    if (!jActive) {
+        jTxnReset();
+        jOpen();
+        return;
+    }
+    // Leave room for this op: commit first when the transaction is filling up.
+    // (A failed commit has written its blocks through; either way go on.)
+    if (static_cast<uint32_t>(jCount) * 4 >= jTxnCapacity() * 3) {
+        jCommitRunning();
+        jOpen();
+    }
+}
+
+int Ext4FS::jCommit() {
+    if (!jActive) return 0;
+    if (jSkipCheckpoint || jOverflow ||
+        static_cast<uint32_t>(jCount) * 4 >= jTxnCapacity() * 3 || jCommitDue()) {
+        return jCommitRunning();
+    }
+    return 0;
 }
 
 void Ext4FS::jAbort() {
-    if (!jActive) return;
-    for (int i = 0; i < jCount; ++i) kfree(jBlockBuf[i]);
-    jCount = 0;
-    jActive = false;
-    jOverflow = false;
-    // Discarded transaction: resync the in-memory superblock from disk (op may
-    // have mutated free counts in memory).
-    devReadBytes(kSuperblockOffset, &sb, sizeof(sb));
+    // The op's changes so far stay: they are consistent as far as they go (each
+    // helper updates bitmap, descriptor and counts together, and the failure
+    // paths free what they allocated), as without a journal.
+    (void)jCommit();
+}
+
+bool Ext4FS::runAdd(uint64_t phys, const uint8_t* data) {
+    if (!runBuf) {
+        return devWriteBytes(phys * static_cast<uint64_t>(blockSize), data, blockSize);
+    }
+    const uint32_t cap = kRunBytes / blockSize;
+    if (runCount != 0 && (phys != runStart + runCount || runCount == cap)) {
+        if (!runFlush()) return false;
+    }
+    if (runCount == 0) runStart = phys;
+    memcpy(runBuf + static_cast<uint64_t>(runCount) * blockSize, data, blockSize);
+    ++runCount;
+    return true;
+}
+
+bool Ext4FS::runFlush() {
+    if (runCount == 0) return true;
+    const bool ok = devWriteBytes(runStart * static_cast<uint64_t>(blockSize), runBuf,
+                                  static_cast<uint64_t>(runCount) * blockSize);
+    runCount = 0;
+    return ok;
+}
+
+bool Ext4FS::setRecoverFlag(bool on) {
+    // s_feature_incompat is at 1024 + 0x60, in the superblock's first sector:
+    // rewrite that whole sector (one command; four bytes would be a read and a
+    // write of it).
+    uint8_t* sector = sectorBuf;
+    if (!devReadBytes(kSuperblockOffset, sector, sizeof(sectorBuf))) return false;
+    const uint8_t old = sector[0x60];
+    sector[0x60] = on ? static_cast<uint8_t>(old | kIncompatRecover)
+                      : static_cast<uint8_t>(old & ~kIncompatRecover);
+    if (sector[0x60] == old) return true;
+    return devWriteBytes(kSuperblockOffset, sector, sizeof(sectorBuf));
 }
 
 int Ext4FS::jCheckpoint() {
-    // Write buffered blocks to their final locations, then reset the journal.
+    // Write the buffered blocks to their final locations, in address order so
+    // neighbours (inode table blocks, bitmaps) go out as one write, then reset
+    // the journal.
+    int16_t* order = jOrder;
     for (int i = 0; i < jCount; ++i) {
-        devWriteBytes(jBlockNum[i] * static_cast<uint64_t>(blockSize), jBlockBuf[i], blockSize);
+        int j = i;
+        while (j > 0 && jBlockNum[order[j - 1]] > jBlockNum[i]) { order[j] = order[j - 1]; --j; }
+        order[j] = static_cast<int16_t>(i);
     }
-    for (int i = 0; i < jCount; ++i) kfree(jBlockBuf[i]);
-    jCount = 0;
+    bool ok = true;
+    for (int k = 0; k < jCount; ++k) {
+        ok = runAdd(jBlockNum[order[k]], jBlockBuf[order[k]]) && ok;
+    }
+    ok = runFlush() && ok;
+    jTxnReset();
 
     uint8_t* jsb = static_cast<uint8_t*>(kmalloc(blockSize));
     if (jsb) {
@@ -2428,30 +2794,19 @@ int Ext4FS::jCheckpoint() {
         }
         kfree(jsb);
     }
-    // Clear the fs RECOVER incompat flag (LE @ 1024+0x60).
-    uint8_t f[4];
-    if (devReadBytes(kSuperblockOffset + 0x60, f, 4)) {
-        f[0] &= static_cast<uint8_t>(~0x04u);
-        devWriteBytes(kSuperblockOffset + 0x60, f, 4);
-    }
-    return 0;
+    setRecoverFlag(false);
+    return ok ? 0 : -1;
 }
 
-int Ext4FS::jCommit() {
+int Ext4FS::jCommitRunning() {
     if (!jActive) return 0;
     jActive = false;   // subsequent I/O in this function is direct
-
-    if (jOverflow) {
-        for (int i = 0; i < jCount; ++i) kfree(jBlockBuf[i]);
-        jCount = 0;
-        devReadBytes(kSuperblockOffset, &sb, sizeof(sb));   // resync
-        return -1;
-    }
+    jOverflow = false;
     if (jCount == 0) return 0;   // nothing to journal
+    ++jCommits;
 
     const uint32_t seq = jSeqNext;
     const uint32_t need = 1u + static_cast<uint32_t>(jCount) + 1u;   // desc + data + commit
-    // One descriptor block must hold all tags (12 header + 8/ea + 16 first uuid).
     const bool tagsFit = (12u + 16u + static_cast<uint32_t>(jCount) * 8u) <= blockSize;
     if (jMaxlen == 0 || need >= jMaxlen || !tagsFit) {
         // Too large to journal in one transaction: write through directly.
@@ -2485,32 +2840,37 @@ int Ext4FS::jCommit() {
         off += 8;
         if (i == 0) { memcpy(desc + off, jUuid, 16); off += 16; }
     }
-    const uint64_t pdesc = resolveBlock(&jNode, jFirst);
-    devWriteBytes(pdesc * static_cast<uint64_t>(blockSize), desc, blockSize);
 
-    // Journal data blocks (escaped copy where needed).
-    for (int i = 0; i < jCount; ++i) {
+    // The log: descriptor and data blocks, coalesced where the journal's blocks
+    // are contiguous on disk (mke2fs makes them so).
+    bool ok = runAdd(resolveBlock(&jNode, jFirst), desc);
+    for (int i = 0; i < jCount && ok; ++i) {
         const uint64_t pj = resolveBlock(&jNode, jFirst + 1 + static_cast<uint32_t>(i));
         const uint8_t* b = jBlockBuf[i];
         if (b[0] == 0xC0 && b[1] == 0x3B && b[2] == 0x39 && b[3] == 0x98) {
-            memcpy(tmp, b, blockSize);
+            memcpy(tmp, b, blockSize);    // escaped copy
             tmp[0] = tmp[1] = tmp[2] = tmp[3] = 0;
-            devWriteBytes(pj * static_cast<uint64_t>(blockSize), tmp, blockSize);
+            ok = runAdd(pj, tmp);
         } else {
-            devWriteBytes(pj * static_cast<uint64_t>(blockSize), b, blockSize);
+            ok = runAdd(pj, b);
         }
     }
+    ok = runFlush() && ok;
 
-    // Commit block.
-    memset(tmp, 0, blockSize);
-    jwbe32(tmp + 0, kJbd2Magic);
-    jwbe32(tmp + 4, 2);      // commit
-    jwbe32(tmp + 8, seq);
-    const uint64_t pcommit = resolveBlock(&jNode, jFirst + 1 + static_cast<uint32_t>(jCount));
-    devWriteBytes(pcommit * static_cast<uint64_t>(blockSize), tmp, blockSize);
-
+    // Commit block, after the rest of the log.
+    if (ok) {
+        memset(tmp, 0, blockSize);
+        jwbe32(tmp + 0, kJbd2Magic);
+        jwbe32(tmp + 4, 2);      // commit
+        jwbe32(tmp + 8, seq);
+        const uint64_t pcommit = resolveBlock(&jNode, jFirst + 1 + static_cast<uint32_t>(jCount));
+        ok = devWriteBytes(pcommit * static_cast<uint64_t>(blockSize), tmp, blockSize);
+    }
     kfree(desc);
     kfree(tmp);
+    if (!ok) {
+        return jCheckpoint();    // the log is incomplete: never mark it dirty
+    }
 
     // Commit point: mark the journal dirty and set the fs RECOVER flag.
     uint8_t* jsb = static_cast<uint8_t*>(kmalloc(blockSize));
@@ -2522,17 +2882,12 @@ int Ext4FS::jCommit() {
         }
         kfree(jsb);
     }
-    uint8_t f[4];
-    if (devReadBytes(kSuperblockOffset + 0x60, f, 4)) {
-        f[0] |= 0x04;   // RECOVER
-        devWriteBytes(kSuperblockOffset + 0x60, f, 4);
-    }
+    setRecoverFlag(true);
     jSeqNext = seq + 1;
 
     if (jSkipCheckpoint) {
         // Simulate a crash after commit: leave the journal dirty for recovery.
-        for (int i = 0; i < jCount; ++i) kfree(jBlockBuf[i]);
-        jCount = 0;
+        jTxnReset();
         return 0;
     }
     return jCheckpoint();

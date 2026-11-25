@@ -1,4 +1,5 @@
 #include <common/string.hpp>
+#include <common/ports.hpp>
 #include <cpu/cpuid.hpp>
 
 namespace {
@@ -198,6 +199,70 @@ void* memcpy_sse2(void* dest, const void* src, size_t count) {
     return dest;
 }
 
+// AVX2 candidates for memcpy/memset (memaccel::Variant::Avx2, MemBench); not
+// picked by the dispatchers below unless the benchmark says they win.
+void* memcpy_avx2(void* dest, const void* src, size_t count) {
+    uint8_t* d = static_cast<uint8_t*>(dest);
+    const uint8_t* s = static_cast<const uint8_t*>(src);
+    while (count >= 128) {
+        asm volatile(
+            "vmovdqu 0(%1), %%ymm0\n"
+            "vmovdqu 32(%1), %%ymm1\n"
+            "vmovdqu 64(%1), %%ymm2\n"
+            "vmovdqu 96(%1), %%ymm3\n"
+            "vmovdqu %%ymm0, 0(%0)\n"
+            "vmovdqu %%ymm1, 32(%0)\n"
+            "vmovdqu %%ymm2, 64(%0)\n"
+            "vmovdqu %%ymm3, 96(%0)"
+            :
+            : "r"(d), "r"(s)
+            : "xmm0", "xmm1", "xmm2", "xmm3", "memory");
+        d += 128;
+        s += 128;
+        count -= 128;
+    }
+    while (count >= 32) {
+        asm volatile(
+            "vmovdqu (%1), %%ymm0\n"
+            "vmovdqu %%ymm0, (%0)"
+            :
+            : "r"(d), "r"(s)
+            : "xmm0", "memory");
+        d += 32;
+        s += 32;
+        count -= 32;
+    }
+    asm volatile("vzeroupper" ::: "xmm0", "xmm1", "xmm2", "xmm3");
+    memcpy_sse2(d, s, count);
+    return dest;
+}
+
+void* memset_avx2(void* dest, int val, size_t count) {
+    uint8_t* d = static_cast<uint8_t*>(dest);
+    const uint32_t byte = static_cast<uint8_t>(val);
+    asm volatile(
+        "vmovd %k0, %%xmm0\n"
+        "vpbroadcastb %%xmm0, %%ymm0"
+        :
+        : "r"(byte)
+        : "xmm0");
+    while (count >= 128) {
+        asm volatile(
+            "vmovdqu %%ymm0, 0(%0)\n"
+            "vmovdqu %%ymm0, 32(%0)\n"
+            "vmovdqu %%ymm0, 64(%0)\n"
+            "vmovdqu %%ymm0, 96(%0)"
+            :
+            : "r"(d)
+            : "memory");
+        d += 128;
+        count -= 128;
+    }
+    asm volatile("vzeroupper" ::: "xmm0");
+    memset_sse2(d, val, count);
+    return dest;
+}
+
 int memcmp_sse2(const void* b1, const void* b2, size_t count) {
     const uint8_t* a = static_cast<const uint8_t*>(b1);
     const uint8_t* b = static_cast<const uint8_t*>(b2);
@@ -256,28 +321,43 @@ void refreshAccelerationFlags() {
     enableAVX2 = features.avx2 && features.avxEnabled;
     accelerationInitialized = true;
 }
+
+// Which implementation memcpy/memset/memset32 use from SIMD_THRESHOLD bytes (or
+// words) up. Chosen per machine by memory_calibrate_acceleration(): the fast
+// string instructions (ERMSB) are twice as fast as the SSE2 loops on the CPUs
+// measured (i3-6100 under WHPX, Xeon E5 v4 under KVM), while under TCG each
+// rep is emulated byte by byte and the SIMD loops are 4-10x faster (MemBench,
+// tools/membench). rep until calibrated: it needs no vector state.
+using memaccel::Variant;
+Variant gCopy = Variant::Rep;
+Variant gFill = Variant::Rep;
+Variant gFill32 = Variant::Rep;
+// memcmp has no fast string form: AVX2 from 32 bytes, SSE2 from 16 (the byte
+// loop is 5-20x slower from 64 bytes on, and was used below 128).
+constexpr size_t MEMCMP_SSE2_MIN = 16;
+constexpr size_t MEMCMP_AVX2_MIN = 32;
 }
 
 void* memset(void* dest, int val, size_t count) {
-    if (accelerationInitialized && enableSSE2 && count >= SIMD_THRESHOLD) {
-        return memset_sse2(dest, val, count);
+    if (count >= SIMD_THRESHOLD) {
+        if (gFill == Variant::Avx2) return memset_avx2(dest, val, count);
+        if (gFill == Variant::Sse2) return memset_sse2(dest, val, count);
     }
     return memset_rep(dest, val, count);
 }
 
 void* memset32(void* dest, uint32_t val, size_t count) {
-    if (accelerationInitialized && enableAVX2 && count >= SIMD_THRESHOLD) {
-        return memset32_avx2(dest, val, count);
-    }
-    if (accelerationInitialized && enableSSE2 && count >= SIMD_THRESHOLD) {
-        return memset32_sse2(dest, val, count);
+    if (count >= SIMD_THRESHOLD) {
+        if (gFill32 == Variant::Avx2) return memset32_avx2(dest, val, count);
+        if (gFill32 == Variant::Sse2) return memset32_sse2(dest, val, count);
     }
     return memset32_rep(dest, val, count);
 }
 
 void* memcpy(void* dest, const void* src, size_t count) {
-    if (accelerationInitialized && enableSSE2 && count >= SIMD_THRESHOLD) {
-        return memcpy_sse2(dest, src, count);
+    if (count >= SIMD_THRESHOLD) {
+        if (gCopy == Variant::Avx2) return memcpy_avx2(dest, src, count);
+        if (gCopy == Variant::Sse2) return memcpy_sse2(dest, src, count);
     }
     return memcpy_rep(dest, src, count);
 }
@@ -295,10 +375,10 @@ void* memmove(void* dest, const void* src, size_t count) {
 }
 
 int memcmp(const void* b1, const void* b2, size_t count) {
-    if (accelerationInitialized && enableAVX2 && count >= SIMD_THRESHOLD) {
+    if (accelerationInitialized && enableAVX2 && count >= MEMCMP_AVX2_MIN) {
         return memcmp_avx2(b1, b2, count);
     }
-    if (accelerationInitialized && enableSSE2 && count >= SIMD_THRESHOLD) {
+    if (accelerationInitialized && enableSSE2 && count >= MEMCMP_SSE2_MIN) {
         return memcmp_sse2(b1, b2, count);
     }
     return memcmp_scalar(b1, b2, count);
@@ -349,6 +429,125 @@ void memory_init_acceleration() {
     refreshAccelerationFlags();
 }
 
+namespace {
+// Best of several timed runs of `op` over the calibration buffers, in TSC
+// cycles: relative timing is all that matters here.
+template <typename Op>
+uint64_t bestCycles(Op op) {
+    uint64_t best = ~0ULL;
+    for (int run = 0; run < 7; ++run) {
+        const uint64_t t0 = rdtsc();
+        for (int i = 0; i < 8; ++i) {
+            op();
+        }
+        const uint64_t t = rdtsc() - t0;
+        if (t < best) {
+            best = t;
+        }
+    }
+    return best;
+}
+
+alignas(64) uint8_t gCalSrc[4096 + 64];
+alignas(64) uint8_t gCalDst[4096 + 64];
+
+// The fastest supported variant for one routine, timed on a 4 KiB operation
+// (a page: the commonest large copy and fill in the kernel). cycles[] gets the
+// time of each variant (Rep, Sse2, Avx2; 0 when unsupported).
+template <typename Op>
+Variant pickFastest(Op op, uint64_t cycles[3]) {
+    const Variant order[3] = {Variant::Rep, Variant::Sse2, Variant::Avx2};
+    Variant best = Variant::Rep;
+    uint64_t bestTime = ~0ULL;
+    for (int i = 0; i < 3; ++i) {
+        cycles[i] = 0;
+        if (!memaccel::supported(order[i])) {
+            continue;
+        }
+        cycles[i] = bestCycles([&] { op(order[i]); });
+        // A SIMD loop must win clearly (5%) to replace the string instruction.
+        if (best == Variant::Rep && i > 0 ? cycles[i] * 105 < bestTime * 100 : cycles[i] < bestTime) {
+            best = order[i];
+            bestTime = cycles[i];
+        }
+    }
+    return best;
+}
+
+const char* variantName(Variant v) {
+    switch (v) {
+        case Variant::Sse2: return "sse2";
+        case Variant::Avx2: return "avx2";
+        default:            return "rep";
+    }
+}
+}  // namespace
+
+void memory_calibrate_acceleration(MemAccelChoice out[3]) {
+    for (size_t i = 0; i < sizeof(gCalSrc); ++i) {
+        gCalSrc[i] = static_cast<uint8_t>(i * 7 + 1);
+    }
+    out[0].routine = "memcpy";
+    gCopy = pickFastest([](Variant v) { memaccel::copy(v, gCalDst, gCalSrc, 4096); }, out[0].cycles);
+    out[0].picked = variantName(gCopy);
+    out[1].routine = "memset";
+    gFill = pickFastest([](Variant v) { memaccel::fill(v, gCalDst, 0x3C, 4096); }, out[1].cycles);
+    out[1].picked = variantName(gFill);
+    out[2].routine = "memset32";
+    gFill32 = pickFastest([](Variant v) { memaccel::fill32(v, gCalDst, 0x12345678U, 1024); }, out[2].cycles);
+    out[2].picked = variantName(gFill32);
+}
+
+// Each implementation on its own, for the MemBench syscall (mem_bench.cpp):
+// Auto is what memcpy() & co. pick, the others bypass the dispatch.
+namespace memaccel {
+bool supported(Variant v) {
+    switch (v) {
+        case Variant::Auto:
+        case Variant::Rep:  return true;
+        case Variant::Sse2: return accelerationInitialized && enableSSE2;
+        case Variant::Avx2: return accelerationInitialized && enableAVX2;
+    }
+    return false;
+}
+
+void* copy(Variant v, void* dest, const void* src, size_t n) {
+    switch (v) {
+        case Variant::Rep:  return memcpy_rep(dest, src, n);
+        case Variant::Sse2: return memcpy_sse2(dest, src, n);
+        case Variant::Avx2: return memcpy_avx2(dest, src, n);
+        default:            return memcpy(dest, src, n);
+    }
+}
+
+void* fill(Variant v, void* dest, int val, size_t n) {
+    switch (v) {
+        case Variant::Rep:  return memset_rep(dest, val, n);
+        case Variant::Sse2: return memset_sse2(dest, val, n);
+        case Variant::Avx2: return memset_avx2(dest, val, n);
+        default:            return memset(dest, val, n);
+    }
+}
+
+void* fill32(Variant v, void* dest, uint32_t val, size_t n) {
+    switch (v) {
+        case Variant::Rep:  return memset32_rep(dest, val, n);
+        case Variant::Sse2: return memset32_sse2(dest, val, n);
+        case Variant::Avx2: return memset32_avx2(dest, val, n);
+        default:            return memset32(dest, val, n);
+    }
+}
+
+int compare(Variant v, const void* a, const void* b, size_t n) {
+    switch (v) {
+        case Variant::Rep:  return memcmp_scalar(a, b, n);   // no rep form: repe cmpsb is slower still
+        case Variant::Sse2: return memcmp_sse2(a, b, n);
+        case Variant::Avx2: return memcmp_avx2(a, b, n);
+        default:            return memcmp(a, b, n);
+    }
+}
+}  // namespace memaccel
+
 bool memory_validate_acceleration() {
     alignas(32) uint8_t source[257];
     alignas(32) uint8_t dest[257];
@@ -398,15 +597,39 @@ bool memory_validate_acceleration() {
         }
     }
 
-    alignas(32) uint32_t words[65];
-    memset32(words + 1, 0xAABBCCDDU, 63);
-    for (size_t i = 1; i < 64; ++i) {
-        if (words[i] != 0xAABBCCDDU) {
+    // 63 words take the rep path, 300 the chosen one (SIMD_THRESHOLD words).
+    alignas(32) uint32_t words[302];
+    const size_t wordCounts[] = {63, 300};
+    for (size_t n : wordCounts) {
+        words[0] = 0;
+        words[n + 1] = 0;
+        memset32(words + 1, 0xAABBCCDDU, n);
+        for (size_t i = 1; i <= n; ++i) {
+            if (words[i] != 0xAABBCCDDU) {
+                return false;
+            }
+        }
+        if (words[0] != 0 || words[n + 1] != 0) {
             return false;
         }
     }
 
+    // memcmp on each path (byte loop, SSE2 from 16, AVX2 from 32): equal, then
+    // the sign of a difference near the end.
     dest[73] ^= 0x40;
+    const size_t compareSizes[] = {9, 20, 45, sizeof(source)};
+    for (size_t n : compareSizes) {
+        for (size_t i = 0; i < n; ++i) {
+            expected[i] = source[i];
+        }
+        if (memcmp(source, expected, n) != 0) {
+            return false;
+        }
+        expected[n - 2] = static_cast<uint8_t>(source[n - 2] + 1);
+        if (memcmp(source, expected, n) >= 0 || memcmp(expected, source, n) <= 0) {
+            return false;
+        }
+    }
     return memcmp(source, source, sizeof(source)) == 0 &&
            memcmp(source, dest, sizeof(source)) != 0;
 }

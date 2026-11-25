@@ -6,6 +6,9 @@
 #include <graphics/console.hpp>
 #include <cpu/cereal/cereal.hpp>
 #include <graphics/intel_gen9_drm.hpp>
+#include <fs/partition/disk_registry.hpp>
+#include <fs/partition/partition.hpp>
+#include <fs/storage/storage_lock.hpp>
 
 namespace {
 DevFS* gActiveDevFS = nullptr;
@@ -105,9 +108,125 @@ int devStatfs(VNode*, FsStats* stats) {
     return 0;
 }
 
+// /dev/diskNpM: an InstantOS partition (DiskRegistry), for mke2fs, e2fsck and
+// instant-install. Nothing else on a disk gets a node.
+void partitionNodeName(const DiskRegistry::Partition& p, char* out) {
+    char disk[12];
+    char index[12];
+    writeDecimal(disk, p.disk);
+    writeDecimal(index, p.index);
+    int n = 0;
+    for (const char* s = "disk"; *s; ++s) out[n++] = *s;
+    for (const char* s = disk; *s; ++s) out[n++] = *s;
+    out[n++] = 'p';
+    for (const char* s = index; *s; ++s) out[n++] = *s;
+    out[n] = 0;
+}
+
+DiskRegistry::Partition* partitionOf(VNode* node) {
+    return node ? static_cast<DiskRegistry::Partition*>(node->getData()) : nullptr;
+}
+
+int devPartitionStat(VNode* node, FileStats* stats) {
+    DiskRegistry::Partition* p = partitionOf(node);
+    if (!stats || !p) {
+        return -1;
+    }
+    memset(stats, 0, sizeof(*stats));
+    stats->type = FileType::BlockDevice;
+    stats->mode = 0060000 | 0600;
+    stats->links = 1;
+    stats->size = p->lengthByte;
+    stats->inode = node->getInode();
+    stats->dev = reinterpret_cast<uint64_t>(gActiveDevFS);
+    stats->rdev = (8u << 8) | (p->disk * 16 + p->index);
+    return 0;
+}
+
+int64_t devPartitionRead(VNode* node, void* buffer, uint64_t size, uint64_t offset) {
+    DiskRegistry::Partition* p = partitionOf(node);
+    if (!p || !p->device || !buffer) {
+        return -1;
+    }
+    if (offset >= p->lengthByte) {
+        return 0;
+    }
+    if (size > p->lengthByte - offset) {
+        size = p->lengthByte - offset;
+    }
+    return p->device->read(offset, buffer, size) ? static_cast<int64_t>(size) : -5;
+}
+
+int64_t devPartitionWrite(VNode* node, const void* buffer, uint64_t size, uint64_t offset) {
+    DiskRegistry::Partition* p = partitionOf(node);
+    if (!p || !p->device || !buffer) {
+        return -1;
+    }
+    if (p->mounted) {
+        return -16;   // EBUSY: a mounted file system is not written behind its back
+    }
+    if (offset >= p->lengthByte) {
+        return -28;   // ENOSPC
+    }
+    if (size > p->lengthByte - offset) {
+        size = p->lengthByte - offset;
+    }
+    return p->device->write(offset, buffer, size) ? static_cast<int64_t>(size) : -5;
+}
+
+int devPartitionFsync(VNode* node) {
+    DiskRegistry::Partition* p = partitionOf(node);
+    return p && p->device && p->device->flush() ? 0 : -5;
+}
+
+VNodeOps* partitionOps() {
+    static VNodeOps ops;
+    static bool ready = false;
+    if (!ready) {
+        memset(&ops, 0, sizeof(ops));
+        ops.stat = devPartitionStat;
+        ops.read = devPartitionRead;
+        ops.write = devPartitionWrite;
+        ops.fsync = devPartitionFsync;
+        StorageLock::wrapOps(&ops);   // disk I/O under the storage lock
+        ready = true;
+    }
+    return &ops;
+}
+
+VNode* partitionNode(size_t i) {
+    static VNode* nodes[DiskRegistry::kMaxPartitions];
+    DiskRegistry::Partition* p = DiskRegistry::at(i);
+    if (!p || !p->instantOS || !gActiveDevFS) {
+        return nullptr;
+    }
+    if (!nodes[i]) {
+        VNode* node = new VNode(gActiveDevFS, DevFS::kPartitionInodeBase + i, FileType::BlockDevice);
+        if (!node) {
+            return nullptr;
+        }
+        node->ops = partitionOps();
+        node->refCount = 1;
+        node->setData(p);
+        nodes[i] = node;
+    }
+    return nodes[i];
+}
+
 VNode* devRootLookup(VNode*, const char* name) {
     if (!gActiveDevFS || !name) {
         return nullptr;
+    }
+    for (size_t i = 0; i < DiskRegistry::count(); ++i) {
+        DiskRegistry::Partition* p = DiskRegistry::at(i);
+        if (!p->instantOS) {
+            continue;
+        }
+        char partName[32];
+        partitionNodeName(*p, partName);
+        if (nameEquals(name, partName)) {
+            return partitionNode(i);
+        }
     }
     if (nameEquals(name, "ptmx")) {
         return gActiveDevFS->getPtmxNode();
@@ -187,11 +306,30 @@ VNode* devPtsLookup(VNode*, const char* name) {
     return gActiveDevFS->ptsSlaveMarker(index);
 }
 
+void appendPartitions(DirEntry* entries, uint64_t count, uint64_t* read) {
+    uint64_t produced = read ? *read : 0;
+    for (size_t i = 0; i < DiskRegistry::count() && produced < count; ++i) {
+        DiskRegistry::Partition* p = DiskRegistry::at(i);
+        if (!p->instantOS) {
+            continue;
+        }
+        DirEntry& e = entries[produced++];
+        memset(&e, 0, sizeof(e));
+        partitionNodeName(*p, e.name);
+        e.type = FileType::BlockDevice;
+    }
+    if (read) {
+        *read = produced;
+    }
+}
+
 int devRootReaddir(VNode*, DirEntry* entries, uint64_t count, uint64_t* read) {
     static const char* names[] = { ".", "..", "ptmx", "pts", "tty", "console", "null", "zero", "urandom", "random", "dri" };
     if (drm::available()) {
-        return fixedReaddir(names, 11, (1ull << 0) | (1ull << 1) | (1ull << 3) | (1ull << 10), FileType::CharDevice,
-                            entries, count, read);
+        const int r = fixedReaddir(names, 11, (1ull << 0) | (1ull << 1) | (1ull << 3) | (1ull << 10),
+                                   FileType::CharDevice, entries, count, read);
+        appendPartitions(entries, count, read);
+        return r;
     }
     constexpr uint64_t kCount = 9;
     uint64_t produced = 0;
@@ -210,6 +348,7 @@ int devRootReaddir(VNode*, DirEntry* entries, uint64_t count, uint64_t* read) {
     if (read) {
         *read = produced;
     }
+    appendPartitions(entries, count, read);
     return 0;
 }
 

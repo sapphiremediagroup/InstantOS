@@ -37,10 +37,30 @@ if ! grep -q "host_machine.system() == 'instantos'" "$MLIBC_SOURCE_DIR/meson.bui
   mv "$tmp" "$MLIBC_SOURCE_DIR/meson.build"
 fi
 
+# InstantOS fixes to mlibc itself. instantos-fixes.patch: stdio reclassifies a
+# stream whose fd became a pipe, qsort_r without C++23 "deducing this" (GCC 13
+# builds mlibc too), readdir errors return NULL. instantos-threads.patch: locks
+# and condition variables make no syscall without contention and wake one waiter,
+# semaphores, deferred cancellation, threads give back their stack and TCB.
+# instantos-mm.patch: memfd_create without the Linux option.
+for FIXES in "$ROOT/tools/mlibc/instantos-fixes.patch" "$ROOT/tools/mlibc/instantos-threads.patch" \
+             "$ROOT/tools/mlibc/instantos-mm.patch"; do
+  if git -C "$MLIBC_SOURCE_DIR" apply --check "$FIXES" 2>/dev/null; then
+    git -C "$MLIBC_SOURCE_DIR" apply "$FIXES"
+  elif ! git -C "$MLIBC_SOURCE_DIR" apply --check --reverse "$FIXES" 2>/dev/null; then
+    printf 'mlibc fixes neither apply nor are applied: %s
+' "$FIXES" >&2
+    exit 2
+  fi
+done
+
 if [ "${MLIBC_CLEAN:-0}" = "1" ]; then
   rm -rf "$MLIBC_BUILD_DIR"
 fi
 
+# Libraries are searched in /lib/mlibc (the initrd's), then /usr/lib: a toolchain
+# on the root disk keeps its runtime there (gcc's libstdc++.so.6, libgcc_s.so.1),
+# as on Linux, so C++ programs built in-OS find it.
 if [ -d "$MLIBC_BUILD_DIR" ] && [ -f "$MLIBC_BUILD_DIR/meson-private/coredata.dat" ]; then
   "$MESON" setup --reconfigure "$MLIBC_BUILD_DIR" "$MLIBC_SOURCE_DIR" \
     --cross-file "$CROSS_FILE" \
@@ -51,7 +71,7 @@ if [ -d "$MLIBC_BUILD_DIR" ] && [ -f "$MLIBC_BUILD_DIR/meson-private/coredata.da
     -Dglibc_option=enabled \
     -Dbsd_option=enabled \
     -Dlibgcc_dependency=false \
-    "-Ddefault_library_paths=['/lib/mlibc']" \
+    "-Ddefault_library_paths=['/lib/mlibc','/usr/lib']" \
     -Dld_library_name=ld-instantos
 else
   "$MESON" setup "$MLIBC_BUILD_DIR" "$MLIBC_SOURCE_DIR" \
@@ -63,8 +83,16 @@ else
     -Dglibc_option=enabled \
     -Dbsd_option=enabled \
     -Dlibgcc_dependency=false \
-    "-Ddefault_library_paths=['/lib/mlibc']" \
+    "-Ddefault_library_paths=['/lib/mlibc','/usr/lib']" \
     -Dld_library_name=ld-instantos
+fi
+
+# frigg (a subproject meson fetched during setup above) uses C++23 "deducing
+# this" in span.hpp, which GCC 13 cannot compile (tools/mlibc/frigg-gcc13.patch).
+FRIGG_DIR="$MLIBC_SOURCE_DIR/subprojects/frigg"
+FRIGG_FIX="$ROOT/tools/mlibc/frigg-gcc13.patch"
+if [ -d "$FRIGG_DIR/.git" ] && git -C "$FRIGG_DIR" apply --check "$FRIGG_FIX" 2>/dev/null; then
+  git -C "$FRIGG_DIR" apply "$FRIGG_FIX"
 fi
 
 "$MESON" compile -C "$MLIBC_BUILD_DIR"

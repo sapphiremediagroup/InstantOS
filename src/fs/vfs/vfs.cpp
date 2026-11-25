@@ -15,6 +15,18 @@ constexpr int kOpenReadWrite = 0x2;
 constexpr int kMaxSymlinkDepth = 40;
 constexpr int kErrNoEntry = 2;
 constexpr int kErrLoop = 40;
+constexpr int kErrExists = 17;      // EEXIST (VFS::open returns -kErrExists)
+
+// Releases a node the VFS got from a filesystem when it goes out of scope.
+// ext4 makes a fresh VNode for every lookup; before this nothing freed them,
+// and a P7.1 build leaked ~58 KB of kernel heap per exec until it ran out.
+struct NodeRef {
+    VNode* node;
+    explicit NodeRef(VNode* n) : node(n) {}
+    ~NodeRef() { VFS::releaseNode(node); }
+    NodeRef(const NodeRef&) = delete;
+    NodeRef& operator=(const NodeRef&) = delete;
+};
 constexpr int kErrCrossDevice = 18;  // EXDEV
 constexpr int kErrNoSys = 38;        // ENOSYS
 
@@ -412,15 +424,19 @@ VNode* VFS::resolvePath(const char* path, char* lastComponent, bool followFinal,
         }
         
         if (!current->ops || !current->ops->lookup) {
+            releaseNode(current);
             setLastError(kErrNoEntry);
             return nullptr;
         }
-        
+
         VNode* child = current->ops->lookup(current, token);
+        releaseNode(current);   // each component is the previous lookup's node
+        current = nullptr;
         if (!child) {
             setLastError(kErrNoEntry);
             return nullptr;
         }
+        NodeRef childRef(child);   // released unless it becomes `current`
 
         if (child->getType() == FileType::Symlink && (followFinal || !isLast)) {
             if (!child->ops || !child->ops->readlink) {
@@ -468,8 +484,9 @@ VNode* VFS::resolvePath(const char* path, char* lastComponent, bool followFinal,
             }
             return resolvePath(resolved, lastComponent, followFinal, symlinkDepth + 1);
         }
-        
+
         current = child;
+        childRef.node = nullptr;
         token = next;
     }
     
@@ -490,28 +507,45 @@ int VFS::open(const char* path, int flags, FileDescriptor** fd, uint32_t mode) {
         if (name[0] == '\0' || pathIsRoot(path)) return -1;
 
         VNode* parentNode = resolvePath(parent, nullptr);
+        NodeRef parentRef(parentNode);
         if (!parentNode || !parentNode->ops || !parentNode->ops->create) return -1;
 
         if (parentNode->ops->create(parentNode, name, mode, &node) != 0 || !node) {
-            return -1;
+            releaseNode(node);
+            // The lookup above and the create run in separate storage-lock
+            // sections, so another CPU may have created the name in between
+            // (15 parallel gcc's whose mkstemps picked the same name). Report
+            // EEXIST then, so mkstemps tries another name, or open that file
+            // when O_EXCL is not set, as POSIX's O_CREAT does.
+            node = resolvePath(path, nullptr, (flags & kOpenNoFollow) == 0);
+            if (!node) return -1;
+            if ((flags & kOpenExclusive) != 0) { releaseNode(node); return -kErrExists; }
         }
     } else if ((flags & (kOpenCreate | kOpenExclusive)) == (kOpenCreate | kOpenExclusive)) {
-        return -1;
+        releaseNode(node);
+        return -kErrExists;
     }
-    
+
     if (node->ops && node->ops->open) {
         int result = node->ops->open(node, flags);
-        if (result != 0) return result;
+        if (result != 0) { releaseNode(node); return result; }
     }
 
     if ((flags & kOpenTruncate) && node->getType() == FileType::Regular) {
         if (!node->ops || !node->ops->truncate || node->ops->truncate(node, 0) != 0) {
+            releaseNode(node);
             return -1;
         }
     }
-    
-    *fd = new FileDescriptor(node, flags, path);
+
+    *fd = new FileDescriptor(node, flags, path);   // released at the last close
     return 0;
+}
+
+void VFS::releaseNode(VNode* node) {
+    if (node && node->getFS()) {
+        node->getFS()->releaseNode(node);
+    }
 }
 
 void VFS::retain(FileDescriptor* fd) {
@@ -528,11 +562,16 @@ int VFS::close(FileDescriptor* fd) {
     }
     
     VNode* node = fd->getNode();
+    // Read the owner first: a pipe or pty node's close deletes the node.
+    FileSystem* owner = node ? node->getFS() : nullptr;
     if (node && node->ops && node->ops->close) {
         node->ops->close(node);
     }
-    
+
     delete fd;
+    if (owner) {
+        owner->releaseNode(node);   // the node VFS::open put in the descriptor
+    }
     return 0;
 }
 
@@ -672,6 +711,7 @@ int VFS::truncate(const char* path, uint64_t size) {
     if (!initialized) return -1;
 
     VNode* node = resolvePath(path, nullptr);
+    NodeRef nodeRef(node);
     if (!node || node->getType() != FileType::Regular) return -1;
     if (!node->ops || !node->ops->truncate) return -1;
 
@@ -691,6 +731,7 @@ int VFS::chmod(const char* path, uint32_t mode) {
     if (!initialized) return -1;
 
     VNode* node = resolvePath(path, nullptr);
+    NodeRef nodeRef(node);
     if (!node || !node->ops || !node->ops->chmod) return -1;
 
     return node->ops->chmod(node, mode);
@@ -709,6 +750,7 @@ int VFS::utime(const char* path, uint64_t atime, uint64_t mtime) {
     if (!initialized) return -1;
 
     VNode* node = resolvePath(path, nullptr);
+    NodeRef nodeRef(node);
     if (!node || !node->ops || !node->ops->utime) return -1;
 
     return node->ops->utime(node, atime, mtime);
@@ -718,6 +760,7 @@ int VFS::stat(const char* path, FileStats* stats) {
     if (!initialized || !stats) return -1;
     
     VNode* node = resolvePath(path, nullptr);
+    NodeRef nodeRef(node);
     if (!node) return -1;
     
     if (!node->ops || !node->ops->stat) return -1;
@@ -728,6 +771,7 @@ int VFS::stat(const char* path, FileStats* stats) {
 int VFS::statfs(const char* path, FsStats* stats) {
     if (!initialized || !stats) { setLastError(kErrNoEntry); return -1; }
     VNode* node = resolvePath(path, nullptr);
+    NodeRef nodeRef(node);
     if (!node) { setLastError(kErrNoEntry); return -1; }
     if (!node->ops || !node->ops->statfs) { setLastError(kErrNoSys); return -1; }
     return node->ops->statfs(node, stats);
@@ -743,6 +787,7 @@ int VFS::statfs(FileDescriptor* fd, FsStats* stats) {
 int VFS::chown(const char* path, uint32_t uid, uint32_t gid, bool followSymlink) {
     if (!initialized || !path) { setLastError(kErrNoEntry); return -1; }
     VNode* node = resolvePath(path, nullptr, followSymlink);
+    NodeRef nodeRef(node);
     if (!node) { setLastError(kErrNoEntry); return -1; }
     if (!node->ops || !node->ops->chown) { setLastError(kErrNoSys); return -1; }
     return node->ops->chown(node, uid, gid);
@@ -764,6 +809,7 @@ int VFS::mknod(const char* path, uint32_t mode, uint64_t dev) {
     if (name[0] == '\0') { setLastError(kErrNoEntry); return -1; }
 
     VNode* parentNode = resolvePath(parent, nullptr);
+    NodeRef parentRef(parentNode);
     if (!parentNode) { setLastError(kErrNoEntry); return -1; }
     if (!parentNode->ops || !parentNode->ops->mknod) { setLastError(kErrNoSys); return -1; }
 
@@ -771,7 +817,7 @@ int VFS::mknod(const char* path, uint32_t mode, uint64_t dev) {
     int rc = parentNode->ops->mknod(parentNode, name, mode, dev, &result);
     if (rc == 0 && result) {
         // The node is persisted in the FS tree; we don't keep the VNode here.
-        delete result;
+        releaseNode(result);
     }
     if (rc != 0) setLastError(kErrNoEntry);
     return rc;
@@ -781,6 +827,7 @@ int VFS::lstat(const char* path, FileStats* stats) {
     if (!initialized || !stats) return -1;
 
     VNode* node = resolvePath(path, nullptr, false);
+    NodeRef nodeRef(node);
     if (!node) return -1;
 
     if (!node->ops || !node->ops->stat) return -1;
@@ -792,6 +839,7 @@ int64_t VFS::readlink(const char* path, char* buffer, uint64_t size) {
     if (!initialized || !buffer) return -1;
 
     VNode* node = resolvePath(path, nullptr, false);
+    NodeRef nodeRef(node);
     if (!node || node->getType() != FileType::Symlink) return -1;
     if (!node->ops || !node->ops->readlink) return -1;
 
@@ -802,6 +850,7 @@ int VFS::readdir(const char* path, DirEntry* entries, uint64_t count, uint64_t* 
     if (!initialized || !entries || !read) return -1;
     
     VNode* node = resolvePath(path, nullptr);
+    NodeRef nodeRef(node);
     if (!node) return -1;
     
     if (node->getType() != FileType::Directory) return -1;
@@ -819,12 +868,15 @@ int VFS::create(const char* path, uint32_t mode) {
     splitPath(path, parent, name);
     
     VNode* parentNode = resolvePath(parent, nullptr);
+    NodeRef parentRef(parentNode);
     if (!parentNode) return -1;
     
     if (!parentNode->ops || !parentNode->ops->create) return -1;
     
     VNode* newNode = nullptr;
-    return parentNode->ops->create(parentNode, name, mode, &newNode);
+    const int rc = parentNode->ops->create(parentNode, name, mode, &newNode);
+    releaseNode(newNode);
+    return rc;
 }
 
 int VFS::mkdir(const char* path, uint32_t mode) {
@@ -835,12 +887,15 @@ int VFS::mkdir(const char* path, uint32_t mode) {
     splitPath(path, parent, name);
     
     VNode* parentNode = resolvePath(parent, nullptr);
+    NodeRef parentRef(parentNode);
     if (!parentNode) return -1;
     
     if (!parentNode->ops || !parentNode->ops->mkdir) return -1;
     
     VNode* newNode = nullptr;
-    return parentNode->ops->mkdir(parentNode, name, mode, &newNode);
+    const int rc = parentNode->ops->mkdir(parentNode, name, mode, &newNode);
+    releaseNode(newNode);
+    return rc;
 }
 
 int VFS::unlink(const char* path) {
@@ -851,6 +906,7 @@ int VFS::unlink(const char* path) {
     splitPath(path, parent, name);
     
     VNode* parentNode = resolvePath(parent, nullptr);
+    NodeRef parentRef(parentNode);
     if (!parentNode) return -1;
     
     if (!parentNode->ops || !parentNode->ops->unlink) return -1;
@@ -866,6 +922,7 @@ int VFS::rmdir(const char* path) {
     splitPath(path, parent, name);
     
     VNode* parentNode = resolvePath(parent, nullptr);
+    NodeRef parentRef(parentNode);
     if (!parentNode) return -1;
     
     if (!parentNode->ops || !parentNode->ops->rmdir) return -1;
@@ -885,7 +942,9 @@ int VFS::rename(const char* oldPath, const char* newPath) {
     if (oldName[0] == '\0' || newName[0] == '\0') { setLastError(kErrNoEntry); return -1; }
 
     VNode* oldParentNode = resolvePath(oldParent, nullptr);
+    NodeRef oldParentNodeRef(oldParentNode);
     VNode* newParentNode = resolvePath(newParent, nullptr);
+    NodeRef newParentNodeRef(newParentNode);
     if (!oldParentNode || !newParentNode) { setLastError(kErrNoEntry); return -1; }
     if (oldParentNode->getFS() != newParentNode->getFS()) { setLastError(kErrCrossDevice); return -1; }
     if (!oldParentNode->ops || !oldParentNode->ops->rename) { setLastError(kErrNoSys); return -1; }
@@ -909,7 +968,9 @@ int VFS::link(const char* oldPath, const char* newPath) {
     }
 
     VNode* oldParentNode = resolvePath(oldParent, nullptr);
+    NodeRef oldParentNodeRef(oldParentNode);
     VNode* newParentNode = resolvePath(newParent, nullptr);
+    NodeRef newParentNodeRef(newParentNode);
     if (!oldParentNode || !newParentNode) return -1;
     if (oldParentNode->getFS() != newParentNode->getFS()) return -1;
     if (!oldParentNode->ops || !oldParentNode->ops->link) return -1;
@@ -926,8 +987,11 @@ int VFS::symlink(const char* target, const char* linkPath) {
     if (name[0] == '\0' || pathIsRoot(linkPath)) return -1;
 
     VNode* parentNode = resolvePath(parent, nullptr);
+    NodeRef parentRef(parentNode);
     if (!parentNode || !parentNode->ops || !parentNode->ops->symlink) return -1;
 
     VNode* newNode = nullptr;
-    return parentNode->ops->symlink(parentNode, name, target, &newNode);
+    const int rc = parentNode->ops->symlink(parentNode, name, target, &newNode);
+    releaseNode(newNode);
+    return rc;
 }

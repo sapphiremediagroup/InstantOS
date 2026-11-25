@@ -1,0 +1,30 @@
+diff --git a/include/frg/span.hpp b/include/frg/span.hpp
+index 1f3f386..e248b1c 100644
+--- a/include/frg/span.hpp
++++ b/include/frg/span.hpp
+@@ -51,16 +51,17 @@ struct span {
+ 		return p_[i];
+ 	}
+ 
+-	template <typename Self>
+-	auto subspan(this Self&& self, size_t disp) {
+-		FRG_ASSERT(disp <= self.n_);
+-		return span{self.data() + disp, self.n_ - disp};
++	// NB: originally used C++23 explicit object parameters ("deducing this"),
++	// which GCC 13 does not support; rewritten as plain const members (span is
++	// a non-owning view, so const suffices).
++	constexpr span subspan(size_t disp) const {
++		FRG_ASSERT(disp <= n_);
++		return span{data() + disp, n_ - disp};
+ 	}
+ 
+-	template <typename Self>
+-	auto subspan(this Self&& self, size_t disp, size_t length) {
+-		FRG_ASSERT(disp + length <= self.n_);
+-		return span{self.data() + disp, length};
++	constexpr span subspan(size_t disp, size_t length) const {
++		FRG_ASSERT(disp + length <= n_);
++		return span{data() + disp, length};
+ 	}
+ 
+ private:

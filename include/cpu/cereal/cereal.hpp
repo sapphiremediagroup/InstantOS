@@ -38,6 +38,11 @@ private:
     // Serializes writers so a whole write() call reaches the port unbroken
     // once more than one CPU is logging. Taken with interrupts disabled.
     volatile int lockFlag;
+    // Characters the transmit FIFO still has room for: when LSR says it is
+    // empty it takes 16 (a 16550A's FIFO, enabled by initialize), so the
+    // status is read once per 16 characters rather than before each one.
+    // Under a hypervisor every port access is a VM exit.
+    uint32_t txRoom = 0;
 
     bool isTransmitEmpty();
     void putRaw(char c);

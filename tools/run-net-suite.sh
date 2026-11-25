@@ -17,7 +17,7 @@
 #
 # The host also pulls the guest's cable over QMP (set_link) to test link loss.
 #
-# With curl built against mbedTLS the suite also tests https:// against a
+# With curl built with TLS (OpenSSL) the suite also tests https:// against a
 # certificate chain made here (build/net-suite/tls: a test CA and a server
 # certificate for 10.0.2.2 and web.test), plus the system CA bundle
 # (tools/fetch-cacert.sh) with NET_INTERNET=1.
@@ -63,7 +63,7 @@ if [ -f "$MLIBC_LIB/libc.so" ]; then
   if [ -x "$BUILD_DIR/bash" ] && [ -x "$BUILD_DIR/net-tools/ping" ]; then
     NET_TOOLS=1
     EXTRA+=("bin/bash:$BUILD_DIR/bash")
-    for tool in ping nslookup netcfg sntp dmesg; do EXTRA+=("bin/$tool:$BUILD_DIR/net-tools/$tool"); done
+    for tool in ping nslookup netcfg sntp dmesg lsmod modload; do EXTRA+=("bin/$tool:$BUILD_DIR/net-tools/$tool"); done
     EXTRA+=("bin/host:$BUILD_DIR/net-tools/nslookup")
     [ -x "$BUILD_DIR/curl/curl" ] && EXTRA+=("bin/curl:$BUILD_DIR/curl/curl")
   fi
@@ -73,7 +73,17 @@ HAVE_CURL=0
 HAVE_TLS=0
 HAVE_CA_BUNDLE=0
 HTTPS_ARGS=()
-if [ "$HAVE_CURL" = "1" ] && grep -qa "mbedTLS" "$BUILD_DIR/curl/curl"; then
+TLS_NAME=none
+if [ "$HAVE_CURL" = "1" ] && llvm-readelf -d "$BUILD_DIR/curl/curl" 2>/dev/null | grep -q "libssl.so.3"; then
+  TLS_NAME=OpenSSL
+fi
+if [ "$TLS_NAME" = OpenSSL ]; then
+  EXTRA+=("lib/mlibc/libssl.so.3:$BUILD_DIR/openssl/libssl.so.3"
+          "lib/mlibc/libcrypto.so.3:$BUILD_DIR/openssl/libcrypto.so.3"
+          "ssl/openssl.cnf:$ROOT/tools/openssl-smoke/openssl.cnf")
+fi
+echo "netsuite: curl's TLS: $TLS_NAME"
+if [ "$TLS_NAME" != none ]; then
   HAVE_TLS=1
   TLS_DIR="$OUT_DIR/tls"
   "$ROOT/tools/net-suite/make-test-certs.sh" "$TLS_DIR"
@@ -88,6 +98,17 @@ fi
 if ss -ltn 2>/dev/null | grep -qE ":($TCP_ECHO_PORT|$HTTP_PORT|$CLOSED_PORT|$SINK_PORT|$HTTPS_PORT)\b"; then
   echo "netsuite: a test port is already in use on this host" >&2; exit 2
 fi
+# QEMU_WIN=1: Windows' QEMU (WHPX). WSL in NAT mode shares neither UDP (the
+# link relay) nor Windows' 127.0.0.1 (QMP) with it, so host_server.py runs on
+# Windows' Python and QMP is TCP.
+HOST_PY=(python3)
+if [ "${QEMU_WIN:-0}" = 1 ]; then
+  . "$ROOT/tools/lib/qemu-win.sh"
+  HOST_PY=(python.exe)
+  if [ "${#HTTPS_ARGS[@]}" -gt 0 ]; then
+    HTTPS_ARGS=(--https "$HTTPS_PORT" --cert "$(winpath "$TLS_DIR/server.pem")" --key "$(winpath "$TLS_DIR/server.key")")
+  fi
+fi
 LINK_ARGS=()
 if [ "$NET_LINK" = "1" ]; then
   LINK_ARGS=(--link "$LINK_PORT")
@@ -99,12 +120,28 @@ fi
 # cannot live on a Windows (drvfs) mount such as /mnt/d.
 QMP_DIR="$(mktemp -d)"
 QMP_SOCK="$QMP_DIR/qmp.sock"
-export QEMU_EXTRA_ARGS="${QEMU_EXTRA_ARGS:-} -qmp unix:$QMP_SOCK,server=on,wait=off"
+HOST_SCRIPT="$ROOT/tools/net-suite/host_server.py"
+PID_ARGS=()
+if [ "${QEMU_WIN:-0}" = 1 ]; then
+  QMP_PORT="${QMP_PORT:-18015}"
+  QMP_SOCK="tcp:127.0.0.1:$QMP_PORT"
+  export QEMU_EXTRA_ARGS="${QEMU_EXTRA_ARGS:-} -qmp tcp:127.0.0.1:$QMP_PORT,server=on,wait=off"
+  HOST_SCRIPT="$(winpath "$HOST_SCRIPT")"
+  rm -f "$OUT_DIR/host.pid"
+  PID_ARGS=(--pidfile "$(winpath "$OUT_DIR/host.pid")")
+else
+  export QEMU_EXTRA_ARGS="${QEMU_EXTRA_ARGS:-} -qmp unix:$QMP_SOCK,server=on,wait=off"
+fi
 HOST_LOG="$OUT_DIR/host_server.log"
-python3 "$ROOT/tools/net-suite/host_server.py" \
-  --tcp-echo "$TCP_ECHO_PORT" --udp-echo "$UDP_ECHO_PORT" --http "$HTTP_PORT" --sink "$SINK_PORT" --qmp "$QMP_SOCK" "${LINK_ARGS[@]}" "${HTTPS_ARGS[@]}" > "$HOST_LOG" 2>&1 &
+"${HOST_PY[@]}" "$HOST_SCRIPT" \
+  --tcp-echo "$TCP_ECHO_PORT" --udp-echo "$UDP_ECHO_PORT" --http "$HTTP_PORT" --sink "$SINK_PORT" --qmp "$QMP_SOCK" "${LINK_ARGS[@]}" "${HTTPS_ARGS[@]}" "${PID_ARGS[@]}" > "$HOST_LOG" 2>&1 &
 host_pid=$!
-trap 'kill "$host_pid" 2>/dev/null || true; rm -rf "$QMP_DIR"' EXIT
+stop_host() {
+  kill "$host_pid" 2>/dev/null || true
+  [ -f "$OUT_DIR/host.pid" ] && taskkill.exe /PID "$(tr -dc 0-9 < "$OUT_DIR/host.pid")" /F >/dev/null 2>&1 || true
+  rm -rf "$QMP_DIR"
+}
+trap stop_host EXIT
 for _ in $(seq 1 50); do grep -q ready "$HOST_LOG" 2>/dev/null && break; sleep 0.1; done
 grep -q ready "$HOST_LOG" || { echo "netsuite: host server did not start" >&2; cat "$HOST_LOG" >&2; exit 2; }
 

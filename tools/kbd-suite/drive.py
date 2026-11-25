@@ -14,7 +14,7 @@ and presses keys over QMP like a user:
            has the trace events, as tools/qemu-rtl8168/build-qemu.sh's does)
            the lock lights the keyboard was told to show.
 """
-import argparse, os, re, subprocess, sys, tempfile, time
+import argparse, os, re, shutil, subprocess, sys, tempfile, time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "netsurf-suite"))
 from drive import Qmp   # noqa: E402
@@ -31,14 +31,26 @@ def check(cond, name, detail=""):
     return cond
 
 
+QMP_PORT = [18390]
+
+
 class Vm:
     def __init__(self, args, mode, iso, tag, trace=None):
         self.out = os.path.join(args.out, "%s-%s" % (tag, mode))
         os.makedirs(self.out, exist_ok=True)
         self.serial = os.path.join(self.out, "serial.log")
         self.sockdir = tempfile.mkdtemp()   # QMP's socket cannot live on drvfs
-        sock = os.path.join(self.sockdir, "qmp.sock")
-        subprocess.run(["cp", args.ovmf_vars, os.path.join(self.out, "vars.fd")], check=True)
+        if args.win:
+            # Windows' QEMU with WHPX: QMP on TCP.
+            QMP_PORT[0] += 1
+            sock = "tcp:127.0.0.1:%d" % QMP_PORT[0]
+            qmp_arg = "tcp:127.0.0.1:%d,server=on,wait=off" % QMP_PORT[0]
+            accel = ["-accel", "whpx,kernel-irqchip=off"]
+        else:
+            sock = os.path.join(self.sockdir, "qmp.sock")
+            qmp_arg = "unix:%s,server,nowait" % sock
+            accel = ["-accel", "tcg", "-cpu", "max,+tsc"]
+        shutil.copyfile(args.ovmf_vars, os.path.join(self.out, "vars.fd"))
         if mode == "ohci":
             usb = ["-device", "pci-ohci,id=ohci", "-device", "usb-kbd,bus=ohci.0"]
         else:
@@ -54,8 +66,8 @@ class Vm:
             "-drive", "file=%s,media=cdrom" % iso] + usb + [
             "-device", "virtio-net-pci,netdev=net0,disable-legacy=on,disable-modern=off",
             "-netdev", "user,id=net0",
-            "-accel", "tcg", "-cpu", "max,+tsc", "-m", "2G", "-smp", str(args.smp),
-            "-display", "none", "-monitor", "none", "-qmp", "unix:%s,server,nowait" % sock,
+            ] + accel + ["-m", "2G", "-smp", str(args.smp),
+            "-display", "gtk" if args.show else "none", "-monitor", "none", "-qmp", qmp_arg,
             "-serial", "file:" + self.serial, "-no-reboot"])
         self.qmp = Qmp(sock)
 
@@ -88,7 +100,7 @@ class Vm:
         crashed = re.search(r"Unknown Instruction|User process crash|KERNEL PANIC", self.log())
         self.proc.kill()
         self.proc.wait()
-        subprocess.run(["rm", "-rf", self.sockdir])
+        shutil.rmtree(self.sockdir, ignore_errors=True)
         return not crashed
 
 
@@ -282,6 +294,8 @@ def main():
     ap.add_argument("--qemu", default="qemu-system-x86_64")
     ap.add_argument("--trace", action="store_true", help="this QEMU has hid_kbd_set_leds")
     ap.add_argument("--smp", type=int, default=2)
+    ap.add_argument("--win", action="store_true", help="Windows' QEMU with WHPX (QMP on TCP)")
+    ap.add_argument("--show", action="store_true", help="a window to watch (-display gtk)")
     ap.add_argument("--boot-timeout", type=int, default=300)
     ap.add_argument("--ovmf-code", default="/usr/share/edk2/x64/OVMF_CODE.4m.fd")
     ap.add_argument("--ovmf-vars", default="/usr/share/edk2/x64/OVMF_VARS.4m.fd")

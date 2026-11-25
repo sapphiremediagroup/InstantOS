@@ -12,8 +12,8 @@ OUT_DIR="${OUT_DIR:-$BUILD_DIR/gcchost}"
 CC="${CC:-clang}"
 LD="${LD:-ld.lld}"
 GP="$ROOT/tools/gcc-port"
-GCCHOST_ROOT="${GCCHOST_ROOT:-/home/sky/gcc-port/gcchost-root}"
-CROSS="/home/sky/gcc-port/gcc-install"
+GCCHOST_ROOT="${GCCHOST_ROOT:-${GCC_PORT_DIR:-$HOME/gcc-port}/gcchost-root}"
+CROSS="${GCC_PORT_DIR:-$HOME/gcc-port}/gcc-install"
 MLIBC_GCC="$BUILD_DIR/mlibc-root-gcc"
 # P6.7 tcc self-host world (libinstant): clang-built tcc-sysroot + tcc 0.9.27
 # sources. The in-OS gcc rebuilds tcc from these, then that tcc self-hosts.

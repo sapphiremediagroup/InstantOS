@@ -11,7 +11,8 @@ set -euo pipefail
 QEMU_DIR="${QEMU_DIR:-/c/Program Files/qemu}"
 QEMU_BIN="$QEMU_DIR/qemu-system-x86_64.exe"
 
-DISK_IMG="build/ahci.img"
+# DISK_IMG=build/dev-disk.img boots with the gcc toolchain disk (tools/make-dev-disk.sh).
+DISK_IMG="${DISK_IMG:-build/ahci.img}"
 OVMF_CODE="$QEMU_DIR/share/edk2-x86_64-code.fd"
 OVMF_VARS_SRC="$QEMU_DIR/share/edk2-i386-vars.fd"
 OVMF_VARS="build/OVMF_VARS_win.fd"
@@ -44,7 +45,7 @@ esac
 mkdir -p build
 
 if [ ! -f "$DISK_IMG" ]; then
-    echo "build/ahci.img missing - build the OS first (it is created by run.sh" >&2
+    echo "$DISK_IMG missing - build the OS first (build/ahci.img is created by run.sh" >&2
     echo "in WSL, or copy an existing formatted image)." >&2
     exit 1
 fi

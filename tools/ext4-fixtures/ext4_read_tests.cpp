@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdint>
+#include <vector>
 
 #include <memory/heap.hpp>
 #include <fs/ext4/ext4.hpp>
@@ -36,6 +37,9 @@ void* kmalloc_aligned(size_t size, size_t /*align*/) { return malloc(size); }
 // fixed value so host-generated images are deterministic and e2fsck-clean.
 uint64_t boot_unix_time = 1700000000ull;
 uint64_t time_get_unix() { return 1700000000ull; }
+// Uptime shim: a frozen clock, so the driver's running transaction is committed
+// only when it fills up, on sync(), or when the Ext4FS goes away.
+uint64_t time_get_uptime_ms() { return 0; }
 
 VNode::VNode(FileSystem* f, uint64_t i, FileType t) {
     ops = nullptr;
@@ -339,6 +343,7 @@ static void testImage(const char* path, const char* label,
     CHECK(fst.nameMax == 255);
     CHECK(fst.totalBlocks > 0);
 
+    fs.sync();
     std::fclose(f);
 }
 
@@ -416,7 +421,434 @@ static void testFuzz(const char* path, uint32_t seed, int ops) {
     std::printf("  fuzz: created=%d wrote=%d trunc=%d chmod=%d renamed=%d removed=%d\n",
                 created, wrote, truncd, chmodd, renamed, removed);
     CHECK(true);   // survived without crashing; e2fsck is the real consistency oracle
+    fs.sync();
     std::fclose(f);
+}
+
+static bool copyFile(const char* src, const char* dst);
+
+// Resolves an absolute path the way the kernel's VFS does: a fresh VNode from
+// lookup() for every component, starting at the root. Returns nullptr if a
+// component is missing; the caller frees the result (unless it is the root).
+static VNode* resolveFresh(Ext4FS& fs, const char* path) {
+    VNode* cur = fs.getRoot();
+    char comp[256];
+    const char* p = path;
+    while (*p == '/') ++p;
+    while (*p) {
+        int n = 0;
+        while (*p && *p != '/') comp[n++] = *p++;
+        comp[n] = '\0';
+        while (*p == '/') ++p;
+        VNode* next = cur->ops->lookup(cur, comp);
+        if (cur != fs.getRoot()) freeVNode(cur);
+        if (!next) return nullptr;
+        cur = next;
+    }
+    return cur;
+}
+static void releaseFresh(Ext4FS& fs, VNode* v) { if (v && v != fs.getRoot()) freeVNode(v); }
+
+// The feature suite's "parallel ext4" case on the host: workers interleaved op
+// by op, each op through fresh lookups (as the kernel runs them, one op at a
+// time under the storage lock), on the journaled format.
+static void testInterleavedWorkers(const char* path, uint32_t seed) {
+    std::printf("== interleaved workers (%s, seed=%u) ==\n", path, seed);
+    FILE* f = std::fopen(path, "r+b");
+    if (!f) { std::printf("  FAIL: cannot open %s\n", path); ++g_failures; ++g_checks; return; }
+    fseek(f, 0, SEEK_END); long fileSize = ftell(f); fseek(f, 0, SEEK_SET);
+    FileBlockDevice dev(f, static_cast<uint64_t>(fileSize));
+    enum { W = 3, F = 16, SZ = 1500 };
+    auto pattern = [](uint8_t* b, int k, int i) { for (int j = 0; j < SZ; ++j) b[j] = static_cast<uint8_t>(k * 31 + i * 7 + j); };
+    int failures = 0;
+    {
+        Ext4FS fs(&dev);
+        CHECK(fs.mount("/") == 0);
+        VNode* root = fs.getRoot();
+        CHECK(root->ops->mkdir(root, "p", 0755, nullptr) == 0);
+        {
+            VNode* p = resolveFresh(fs, "/p");
+            CHECK(p && p->ops->mkdir(p, "shared", 0755, nullptr) == 0);
+            releaseFresh(fs, p);
+        }
+        auto putFile = [&](const char* dir, const char* name, int k, int i) -> bool {
+            VNode* d = resolveFresh(fs, dir);
+            if (!d) return false;
+            VNode* nf = nullptr;
+            const bool created = d->ops->create(d, name, 0644, &nf) == 0 && nf;
+            releaseFresh(fs, d);
+            if (!created) return false;
+            uint8_t b[SZ]; pattern(b, k, i);
+            const bool ok = nf->ops->write(nf, b, SZ, 0) == SZ;
+            freeVNode(nf);
+            return ok;
+        };
+        auto checkFile = [&](const char* full, int k, int i) -> bool {
+            VNode* v = resolveFresh(fs, full);
+            if (!v) return false;
+            uint8_t b[SZ], r[SZ]; pattern(b, k, i);
+            const bool ok = v->ops->read(v, r, SZ, 0) == SZ && std::memcmp(b, r, SZ) == 0;
+            releaseFresh(fs, v);
+            return ok;
+        };
+        auto unlinkIn = [&](const char* dir, const char* name) -> bool {
+            VNode* d = resolveFresh(fs, dir);
+            const bool ok = d && d->ops->unlink(d, name) == 0;
+            releaseFresh(fs, d);
+            return ok;
+        };
+        int stage[W] = {0};   // 0: mkdir, 1..2F: create, 2F+1..3F: verify+unlink, 3F+1: rmdir, then done
+        g_fuzzRng = seed;
+        for (;;) {
+            int live = 0;
+            for (int k = 0; k < W; ++k) live += stage[k] <= 3 * F + 1;
+            if (!live) break;
+            int k = static_cast<int>(fuzzRand() % W);
+            while (stage[k] > 3 * F + 1) k = (k + 1) % W;
+            char dir[32], name[32], full[64];
+            std::snprintf(dir, sizeof dir, "/p/w%d", k);
+            const int s = stage[k]++;
+            bool ok = true;
+            if (s == 0) {
+                VNode* p = resolveFresh(fs, "/p");
+                char wn[16]; std::snprintf(wn, sizeof wn, "w%d", k);
+                ok = p && p->ops->mkdir(p, wn, 0755, nullptr) == 0;
+                releaseFresh(fs, p);
+            } else if (s <= 2 * F) {
+                const int i = (s - 1) / 2;
+                if ((s - 1) % 2 == 0) { std::snprintf(name, sizeof name, "f%d", i); ok = putFile(dir, name, k, i); }
+                else { std::snprintf(name, sizeof name, "w%d_%d", k, i); ok = putFile("/p/shared", name, k, i); }
+            } else if (s <= 3 * F) {
+                const int i = s - 2 * F - 1;
+                std::snprintf(name, sizeof name, "f%d", i);
+                std::snprintf(full, sizeof full, "%s/%s", dir, name);
+                ok = checkFile(full, k, i) && unlinkIn(dir, name);
+            } else {
+                VNode* p = resolveFresh(fs, "/p");
+                char wn[16]; std::snprintf(wn, sizeof wn, "w%d", k);
+                ok = p && p->ops->rmdir(p, wn) == 0;
+                releaseFresh(fs, p);
+            }
+            if (!ok) { ++failures; std::printf("  worker %d failed at stage %d\n", k, s); }
+            if (fuzzRand() % 40 == 0) fs.sync();
+        }
+        int sharedOk = 0;
+        for (int k = 0; k < W; ++k) {
+            for (int i = 0; i < F; ++i) {
+                char full[64]; std::snprintf(full, sizeof full, "/p/shared/w%d_%d", k, i);
+                sharedOk += checkFile(full, k, i);
+                char name[32]; std::snprintf(name, sizeof name, "w%d_%d", k, i);
+                unlinkIn("/p/shared", name);
+            }
+        }
+        CHECK(failures == 0);
+        CHECK(sharedOk == W * F);
+        VNode* p = resolveFresh(fs, "/p");
+        CHECK(p && p->ops->rmdir(p, "shared") == 0);
+        releaseFresh(fs, p);
+        CHECK(root->ops->rmdir(root, "p") == 0);
+        std::printf("  failures=%d shared ok=%d/%d\n", failures, sharedOk, W * F);
+        fs.sync();
+    }
+    std::fclose(f);
+}
+
+// Every open and path lookup makes its own copy of an inode. In the kernel,
+// VFS::open resolves the parent directory in one storage-lock section and
+// creates in the next, so another CPU can grow the directory in between (P7.1:
+// 15 parallel gcc's creating temp files in /work/tmp got ENOENT, and entries
+// were lost). Two handles on one directory and one file, each used after the
+// other changed the inode, must see and keep each other's changes.
+static void testStaleHandles(const char* path) {
+    std::printf("== stale handles (%s) ==\n", path);
+    FILE* f = std::fopen(path, "r+b");
+    if (!f) { std::printf("  FAIL: cannot open %s\n", path); ++g_failures; ++g_checks; return; }
+    fseek(f, 0, SEEK_END); long fileSize = ftell(f); fseek(f, 0, SEEK_SET);
+    FileBlockDevice dev(f, static_cast<uint64_t>(fileSize));
+    {
+        Ext4FS fs(&dev);
+        CHECK(fs.mount("/") == 0);
+        VNode* root = fs.getRoot();
+        CHECK(root->ops->mkdir(root, "st", 0755, nullptr) == 0);
+        VNode* a = resolveFresh(fs, "/st");
+        VNode* b = resolveFresh(fs, "/st");
+        CHECK(a && b);
+        // Long names fill a 4 KiB block in ~16 entries: A grows the directory
+        // by several blocks, then B (made before) adds more.
+        enum { N = 60 };
+        char name[200];
+        int created = 0;
+        for (int i = 0; a && i < N; ++i) {
+            std::snprintf(name, sizeof name, "a%03d_%0180d", i, 0);
+            created += a->ops->create(a, name, 0644, nullptr) == 0;
+        }
+        for (int i = 0; b && i < N; ++i) {
+            std::snprintf(name, sizeof name, "b%03d_%0180d", i, 0);
+            created += b->ops->create(b, name, 0644, nullptr) == 0;
+        }
+        CHECK(created == 2 * N);
+        releaseFresh(fs, a);
+        releaseFresh(fs, b);
+        int found = 0;
+        VNode* d = resolveFresh(fs, "/st");
+        for (int i = 0; d && i < N; ++i) {
+            std::snprintf(name, sizeof name, "a%03d_%0180d", i, 0);
+            found += dirHas(d, name);
+            std::snprintf(name, sizeof name, "b%03d_%0180d", i, 0);
+            found += dirHas(d, name);
+        }
+        std::printf("  entries found %d/%d\n", found, 2 * N);
+        CHECK(found == 2 * N);
+        // A file appended through one handle, then through an older one.
+        VNode* nf = nullptr;
+        CHECK(d && d->ops->create(d, "grow", 0644, &nf) == 0 && nf);
+        if (nf) freeVNode(nf);
+        VNode* f1 = resolveFresh(fs, "/st/grow");
+        VNode* f2 = resolveFresh(fs, "/st/grow");
+        uint8_t blk1[8192], blk2[8192], rd[16384];
+        std::memset(blk1, 0x11, sizeof blk1);
+        std::memset(blk2, 0x22, sizeof blk2);
+        CHECK(f1 && f1->ops->write(f1, blk1, sizeof blk1, 0) == static_cast<int64_t>(sizeof blk1));
+        CHECK(f2 && f2->ops->write(f2, blk2, sizeof blk2, sizeof blk1) == static_cast<int64_t>(sizeof blk2));
+        releaseFresh(fs, f1);
+        releaseFresh(fs, f2);
+        VNode* f3 = resolveFresh(fs, "/st/grow");
+        CHECK(f3 && f3->ops->read(f3, rd, sizeof rd, 0) == static_cast<int64_t>(sizeof rd) &&
+              std::memcmp(rd, blk1, sizeof blk1) == 0 && std::memcmp(rd + sizeof blk1, blk2, sizeof blk2) == 0);
+        releaseFresh(fs, f3);
+        // libtool's `mv fma.loT fma.lo`: VFS::rename resolves the old and the
+        // new parent separately, two copies of one directory. When the new
+        // name needs a new block, dirRemove through the old copy used to write
+        // back the old size and drop that block with the renamed entry (P7.2).
+        int renamed = 0, kept = 0;
+        for (int i = 0; d && i < N; ++i) {
+            char tmp[200];
+            std::snprintf(tmp, sizeof tmp, "r%03d_%0180dT", i, 0);
+            std::snprintf(name, sizeof name, "r%03d_%0180d", i, 0);
+            if (d->ops->create(d, tmp, 0644, nullptr) != 0) continue;
+            VNode* op = resolveFresh(fs, "/st");
+            VNode* np = resolveFresh(fs, "/st");
+            renamed += op && np && op->ops->rename(op, tmp, np, name) == 0;
+            releaseFresh(fs, op);
+            releaseFresh(fs, np);
+        }
+        VNode* d2 = resolveFresh(fs, "/st");
+        for (int i = 0; d2 && i < N; ++i) {
+            char tmp[200];
+            std::snprintf(tmp, sizeof tmp, "r%03d_%0180dT", i, 0);
+            std::snprintf(name, sizeof name, "r%03d_%0180d", i, 0);
+            kept += dirHas(d2, name) && !dirHas(d2, tmp);
+        }
+        std::printf("  renames in one directory %d/%d, kept %d/%d\n", renamed, N, kept, N);
+        CHECK(renamed == N);
+        CHECK(kept == N);
+        // A directory renamed within its parent keeps the parent's link count.
+        const uint16_t links0 = d2 ? static_cast<Ext4Node*>(d2->getData())->linksCount : 0;
+        CHECK(d2 && d2->ops->mkdir(d2, "sub", 0755, nullptr) == 0);
+        releaseFresh(fs, d2);
+        VNode* op = resolveFresh(fs, "/st");
+        VNode* np = resolveFresh(fs, "/st");
+        CHECK(op && np && op->ops->rename(op, "sub", np, "sub2") == 0);
+        releaseFresh(fs, op);
+        releaseFresh(fs, np);
+        d2 = resolveFresh(fs, "/st");
+        CHECK(d2 && static_cast<Ext4Node*>(d2->getData())->linksCount == links0 + 1);
+        CHECK(d2 && dirHas(d2, "sub2") && !dirHas(d2, "sub"));
+        releaseFresh(fs, d2);
+        releaseFresh(fs, d);
+        fs.sync();
+    }
+    std::fclose(f);
+}
+
+// Journaled volumes (the format of every InstantOS disk image: 4 KiB blocks, a
+// simple JBD2 journal) keep one running transaction across ops. This fuzzer
+// keeps a model of every file's contents and checks:
+//  - reads always match the model (block runs, partial new blocks, holes);
+//  - after the run and a sync, a fresh mount sees exactly the model;
+//  - a copy of the image taken in the middle (the running transaction not yet
+//    committed: a crash) mounts to the state of the last sync, with the files
+//    of that time intact unless they were later overwritten in place (as in
+//    Linux's ordered mode): blocks freed since must not have been reused.
+// run-ext4-fixtures.sh e2fsck's both images.
+static void testJournalFuzz(const char* path, const char* crashPath, uint32_t seed, int ops,
+                            bool firstFit) {
+    std::printf("== journaled fuzz (%s, seed=%u, ops=%d%s) ==\n", path, seed, ops,
+                firstFit ? ", first fit" : "");
+    FILE* f = std::fopen(path, "r+b");
+    if (!f) { std::printf("  FAIL: cannot open %s\n", path); ++g_failures; ++g_checks; return; }
+    fseek(f, 0, SEEK_END); long fileSize = ftell(f); fseek(f, 0, SEEK_SET);
+    FileBlockDevice dev(f, static_cast<uint64_t>(fileSize));
+
+    struct ModelFile { bool exists = false; uint32_t id = 0; std::vector<uint8_t> data; };
+    const int NF = 40;
+    char nm[NF][16];
+    for (int i = 0; i < NF; ++i) std::snprintf(nm[i], sizeof(nm[i]), "j%d", i);
+    std::vector<ModelFile> model(NF), atSync(NF);
+    std::vector<bool> overwrittenSinceSync;   // by file id
+    uint32_t nextId = 1;
+    uint64_t commitsAtSync = 0;
+    bool crashTaken = false;
+    std::vector<ModelFile> crashModel;
+    std::vector<bool> crashOverwritten;
+    g_fuzzRng = seed;
+    static uint8_t buf[70000];
+    int mismatches = 0, syncs = 0;
+
+    auto verify = [&](VNode* root, const std::vector<ModelFile>& m, const std::vector<bool>* skip) {
+        int bad = 0;
+        for (int i = 0; i < NF; ++i) {
+            VNode* n = root->ops->lookup(root, nm[i]);
+            if (!m[i].exists) { if (n) { ++bad; freeVNode(n); } continue; }
+            if (skip && m[i].id < skip->size() && (*skip)[m[i].id]) { if (n) freeVNode(n); continue; }
+            if (!n) { ++bad; continue; }
+            FileStats st{}; n->ops->stat(n, &st);
+            std::vector<uint8_t> got(m[i].data.size() + 16);
+            const int64_t r = m[i].data.empty() ? 0 : n->ops->read(n, got.data(), got.size(), 0);
+            if (st.size != m[i].data.size() || r != static_cast<int64_t>(m[i].data.size()) ||
+                std::memcmp(got.data(), m[i].data.data(), m[i].data.size()) != 0) {
+                ++bad;
+            }
+            freeVNode(n);
+        }
+        return bad;
+    };
+
+    {
+        Ext4FS fs(&dev);
+        if (fs.mount("/") != 0 || !fs.isWritable() || !fs.journalWriteEnabled()) {
+            std::printf("  FAIL: mount/writable/journal %s\n", path); ++g_failures; ++g_checks;
+            std::fclose(f); return;
+        }
+        VNode* root = fs.getRoot();
+        for (int i = 0; i < NF; ++i) {   // an earlier seed's files
+            if (VNode* old = root->ops->lookup(root, nm[i])) {
+                freeVNode(old);
+                CHECK(root->ops->unlink(root, nm[i]) == 0);
+            }
+        }
+        CHECK(fs.sync() == 0);
+        commitsAtSync = fs.commitCount();
+        for (int step = 0; step < ops; ++step) {
+            // First fit hands out the blocks freed since the last commit first:
+            // the case where reusing one would corrupt the crash state.
+            if (firstFit) fs.resetAllocationGoal();
+            const int i = static_cast<int>(fuzzRand() % NF);
+            ModelFile& mf = model[i];
+            const uint32_t what = fuzzRand() % 100;
+            if (what < 3) {   // sync: the model becomes the crash-safe state
+                CHECK(fs.sync() == 0);
+                commitsAtSync = fs.commitCount();
+                atSync = model;
+                overwrittenSinceSync.assign(nextId, false);
+                ++syncs;
+            } else if (!mf.exists) {
+                VNode* nn = nullptr;
+                if (root->ops->create(root, nm[i], 0644, &nn) == 0 && nn) {
+                    mf.exists = true; mf.id = nextId++; mf.data.clear();
+                    overwrittenSinceSync.resize(nextId, false);
+                    const uint32_t len = fuzzRand() % 70000;
+                    for (uint32_t k = 0; k < len; ++k) buf[k] = static_cast<uint8_t>(fuzzRand());
+                    if (len && nn->ops->write(nn, buf, len, 0) == static_cast<int64_t>(len)) {
+                        mf.data.assign(buf, buf + len);
+                    }
+                    freeVNode(nn);
+                }
+            } else {
+                VNode* n = root->ops->lookup(root, nm[i]);
+                CHECK(n != nullptr);
+                if (!n) continue;
+                const uint64_t size = mf.data.size();
+                switch (what % 6) {
+                    case 0: case 1: {   // write at a random offset (overwrite, extend, or past a hole)
+                        const uint64_t at = fuzzRand() % (size + 9000);
+                        const uint32_t len = 1 + fuzzRand() % 70000;
+                        for (uint32_t k = 0; k < len; ++k) buf[k] = static_cast<uint8_t>(fuzzRand());
+                        if (n->ops->write(n, buf, len, at) == static_cast<int64_t>(len)) {
+                            if (at < size) overwrittenSinceSync[mf.id] = true;
+                            if (at + len > mf.data.size()) mf.data.resize(at + len, 0);
+                            std::memcpy(mf.data.data() + at, buf, len);
+                        }
+                    } break;
+                    case 2: {   // truncate (shrink or grow)
+                        const uint64_t to = fuzzRand() % (size + 20000);
+                        if (n->ops->truncate(n, to) == 0) {
+                            // Shrinking zeroes the rest of the new last block in place.
+                            if (to < size) overwrittenSinceSync[mf.id] = true;
+                            mf.data.resize(to, 0);
+                        }
+                    } break;
+                    case 3: {   // rename onto another name (replacing it)
+                        const int j = static_cast<int>(fuzzRand() % NF);
+                        if (j != i && root->ops->rename(root, nm[i], root, nm[j]) == 0) {
+                            model[j] = model[i];
+                            model[i] = ModelFile{};
+                        }
+                    } break;
+                    case 4: {   // read back and compare
+                        std::vector<uint8_t> got(size + 16);
+                        const int64_t r = size ? n->ops->read(n, got.data(), got.size(), 0) : 0;
+                        if (r != static_cast<int64_t>(size) || std::memcmp(got.data(), mf.data.data(), size) != 0) {
+                            ++mismatches;
+                        }
+                    } break;
+                    default:
+                        if (root->ops->unlink(root, nm[i]) == 0) model[i] = ModelFile{};
+                        break;
+                }
+                freeVNode(n);
+            }
+            if (!crashTaken && step >= ops * 3 / 5 && fs.commitCount() == commitsAtSync) {
+                // A crash now: the device holds the last commit (the last sync:
+                // no commit came in between) plus file data written since.
+                crashTaken = copyFile(path, crashPath);
+                CHECK(crashTaken);
+                crashModel = atSync;
+                crashOverwritten = overwrittenSinceSync;
+            }
+        }
+        CHECK(mismatches == 0);
+        CHECK(verify(root, model, nullptr) == 0);
+        CHECK(fs.sync() == 0);
+        CHECK(crashTaken);
+        std::printf("  syncs=%d commits=%llu mismatches=%d\n", syncs,
+                    static_cast<unsigned long long>(fs.commitCount()), mismatches);
+    }
+    std::fclose(f);
+
+    // Remount: everything synced is there.
+    FILE* g = std::fopen(path, "r+b");
+    CHECK(g != nullptr);
+    if (g) {
+        fseek(g, 0, SEEK_END); long gs = ftell(g); fseek(g, 0, SEEK_SET);
+        FileBlockDevice dev2(g, static_cast<uint64_t>(gs));
+        {
+            Ext4FS fs2(&dev2);
+            CHECK(fs2.mount("/") == 0);
+            if (fs2.getRoot()) CHECK(verify(fs2.getRoot(), model, nullptr) == 0);
+        }
+        std::fclose(g);
+    }
+
+    // The crash copy: the state of the last sync before it.
+    if (crashTaken) {
+        FILE* c = std::fopen(crashPath, "r+b");
+        CHECK(c != nullptr);
+        if (c) {
+            fseek(c, 0, SEEK_END); long cs = ftell(c); fseek(c, 0, SEEK_SET);
+            FileBlockDevice dev3(c, static_cast<uint64_t>(cs));
+            {
+                Ext4FS fs3(&dev3);
+                CHECK(fs3.mount("/") == 0);
+                if (fs3.getRoot()) {
+                    const int bad = verify(fs3.getRoot(), crashModel, &crashOverwritten);
+                    std::printf("  crash copy: %d file(s) differ from the last sync\n", bad);
+                    CHECK(bad == 0);
+                }
+            }
+            std::fclose(c);
+        }
+    }
 }
 
 // P1.4 HTree-directory write: modifying an indexed directory must convert it to
@@ -454,6 +886,7 @@ static void testHtreeWrite(const char* path) {
         std::free(e);
         freeVNode(many);
     }
+    fs.sync();
     std::fclose(f);
 }
 
@@ -567,6 +1000,7 @@ static void testWriteImage(const char* path) {
     if (wd) { CHECK(wd->ops->unlink(wd, "child.txt") == 0); freeVNode(wd); }
     CHECK(root->ops->rmdir(root, "wdir") == 0);
 
+    CHECK(fs.sync() == 0);
     std::fclose(f);
 
     // Persistence: re-mount read-only and confirm the written data survived.
@@ -821,6 +1255,14 @@ int main(int argc, char** argv) {
     std::snprintf(fuzzcPath, sizeof(fuzzcPath), "%s/ext4fuzzc.img", dir);
     for (uint32_t s = 1; s <= 3; ++s) testFuzz(fuzzPath, s * 2654435761u, 3000);
     for (uint32_t s = 1; s <= 3; ++s) testFuzz(fuzzcPath, s * 40503u + 7, 3000);
+
+    // The InstantOS disk format (4 KiB, simple journal): batched transactions.
+    char jfuzzPath[512], jcrashPath[512];
+    std::snprintf(jfuzzPath, sizeof(jfuzzPath), "%s/ext4fuzzj.img", dir);
+    std::snprintf(jcrashPath, sizeof(jcrashPath), "%s/ext4fuzzj_crash.img", dir);
+    for (uint32_t s = 1; s <= 4; ++s) testJournalFuzz(jfuzzPath, jcrashPath, s * 977u + 3, 1500, s > 2);
+    for (uint32_t s = 1; s <= 3; ++s) testInterleavedWorkers(jfuzzPath, s * 7919u);
+    testStaleHandles(jfuzzPath);
 
     char htreePath[512];
     std::snprintf(htreePath, sizeof(htreePath), "%s/ext4hw.img", dir);

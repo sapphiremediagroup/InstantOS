@@ -6,7 +6,7 @@
  	nsoption_setnull_charp(cookie_jar, strdup("~/.netsurf/Cookies"));
 +
 +	/* InstantOS: the CA certificate bundle is shipped in the initrd and the
-+	 * kernel mounts it at /etc/ssl. Point libcurl/mbedTLS at it so https:// can validate
++	 * kernel mounts it at /etc/ssl. Point libcurl/OpenSSL at it so https:// can validate
 +	 * the server certificate chain. */
 +	nsoption_setnull_charp(ca_bundle,
 +			       strdup("/etc/ssl/certs/ca-certificates.crt"));

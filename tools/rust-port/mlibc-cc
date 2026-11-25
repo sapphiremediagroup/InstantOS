@@ -1,0 +1,30 @@
+#!/bin/sh
+# The linker Rust uses for x86_64-unknown-linux-musl on InstantOS: the program
+# is linked against mlibc (MLIBC_ROOT) and its loader, as a PIE, the way the
+# other mlibc programs are (tools/run-thread-suite.sh). Rust's std for musl is
+# built against the same Linux ABI that mlibc's headers follow, but for two
+# types: the functions of tools/rust-port/wrapped-symbols go through compat.c.
+#
+# std asks for -lgcc_s (its unwinder when not linked statically); InstantOS has
+# LLVM's libunwind (tools/build-libcxx.sh) instead.
+: "${MLIBC_ROOT:?MLIBC_ROOT is the mlibc sysroot (build/mlibc-root)}"
+here="$(dirname "$0")"
+args=""
+for a in "$@"; do
+  case "$a" in
+    -lgcc_s|-lgcc|-lgcc_eh) a="-l:libunwind.a" ;;
+  esac
+  args="$args '$(printf '%s' "$a" | sed "s/'/'\\\\''/g")'"
+done
+eval "set -- $args"
+wrap=""
+for s in $(cat "$here/wrapped-symbols"); do wrap="$wrap -Wl,--wrap=$s"; done
+compat="${RUST_COMPAT_OBJ:-$HOME/rust-port/compat.o}"
+mkdir -p "$(dirname "$compat")"
+if [ ! -f "$compat" ] || [ "$here/compat.c" -nt "$compat" ]; then
+  clang --target=x86_64-unknown-elf -fPIC -fno-stack-protector -O2 -nostdlibinc -isystem "$MLIBC_ROOT/include" \
+    -c "$here/compat.c" -o "$compat" || exit 1
+fi
+exec clang --target=x86_64-unknown-elf -fuse-ld=lld -nostdlib \
+  -L"$MLIBC_ROOT/lib" -Wl,--dynamic-linker,/lib/mlibc/ld-instantos.so -Wl,-rpath,/lib/mlibc $wrap \
+  "$MLIBC_ROOT/lib/crt1.o" "$@" "$compat" -lc

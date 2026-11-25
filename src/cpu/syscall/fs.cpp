@@ -1,5 +1,6 @@
 #include <cpu/syscall/unix_socket.hpp>
 #include <graphics/intel_gen9_drm.hpp>
+#include <cpu/syscall/shm.hpp>
 #include <cpu/syscall/syscall.hpp>
 #include <cpu/cereal/cereal.hpp>
 #include <cpu/process/scheduler.hpp>
@@ -11,6 +12,7 @@
 #include <interrupts/keyboard.hpp>
 #include <ipc/ipc.hpp>
 #include <common/string.hpp>
+#include <memory/heap.hpp>
 
 extern int16_t pollSocketHandle(void* object, uint32_t rights, int16_t events);
 extern bool socketIsNonBlocking(void* object);
@@ -32,11 +34,38 @@ private:
     FileDescriptor* fd;
 };
 
+// The bounce buffer read()/write() move a regular file's bytes through. 512
+// bytes a call into the file system made every 4 KiB block eight calls, and on
+// a disk eight commands (a partial block goes straight to it); a whole run of
+// blocks is one command. Pipes, devices and the rest keep the 512-byte chunks
+// on the stack, as their blocking and short counts follow them.
+struct FileChunk {
+    static constexpr uint64_t kMax = 64 * 1024;
+    char* data = nullptr;
+    uint64_t size = 0;
+    FileChunk(FileDescriptor* fd, uint64_t count) {
+        VNode* node = fd ? fd->getNode() : nullptr;
+        if (count <= 512 || !node || node->getType() != FileType::Regular) return;
+        size = count < kMax ? count : kMax;
+        data = static_cast<char*>(kmalloc(size));
+        if (!data) size = 0;
+    }
+    ~FileChunk() { if (data) kfree(data); }
+    FileChunk(const FileChunk&) = delete;
+    FileChunk& operator=(const FileChunk&) = delete;
+};
+
 constexpr uint64_t kOpenAccessModeMask = 0x3;
 constexpr uint64_t kOpenWriteOnly = 0x1;
 constexpr uint64_t kOpenReadWrite = 0x2;
 constexpr uint64_t kOpenCloseOnExec = 02000000;
-constexpr uint64_t kPipeBufferSize = 4096;
+// Linux's default pipe capacity. bash measures it at build time (PIPESIZE) and
+// writes a here-document that fits into a pipe of its own before anything reads
+// it, so a smaller pipe deadlocks the shell (binutils' config.status, 9 KiB).
+constexpr uint64_t kPipeBufferSize = 65536;
+constexpr uint64_t kFcntlGetPipeSize = 1032;   // F_GETPIPE_SZ
+constexpr uint64_t kFcntlAddSeals = 1033;
+constexpr uint64_t kFcntlGetSeals = 1034;
 constexpr uint64_t kFcntlGetFD = 1;
 constexpr uint64_t kFcntlSetFD = 2;
 constexpr uint64_t kFdCloseOnExec = 1;
@@ -112,6 +141,7 @@ struct PipeEndpoint {
 // EBADF together). They intentionally sit outside the small positive range of a
 // real byte count.
 constexpr int64_t kPipeErrAgain = -static_cast<int64_t>(SysErrAgain);   // -11 (EAGAIN)
+constexpr int64_t kPipeErrIntr = -static_cast<int64_t>(SysErrInterrupted);   // -4: a signal to act on
 constexpr int64_t kPipeErrPipe = -static_cast<int64_t>(SysErrPipe);     // -29 (EPIPE)
 
 // Named-FIFO registry: all opens of the same on-disk FIFO (identified by its
@@ -711,6 +741,11 @@ int64_t pipeRead(VNode* node, void* buffer, uint64_t size, uint64_t) {
         if (!blockCurrentForPipe()) {
             return -1;
         }
+        // A signal to act on: EINTR (or the read starts again, SA_RESTART).
+        Process* waiter = Scheduler::get().getCurrentProcess();
+        if (waiter && waiter->hasDeliverableSignal()) {
+            return kPipeErrIntr;
+        }
     }
 
     uint64_t copied = 0;
@@ -772,6 +807,10 @@ int64_t pipeWrite(VNode* node, const void* buffer, uint64_t size, uint64_t) {
             }
             if (!blockCurrentForPipe()) {
                 return written > 0 ? static_cast<int64_t>(written) : -1;
+            }
+            Process* waiter = Scheduler::get().getCurrentProcess();
+            if (waiter && waiter->hasDeliverableSignal()) {
+                return written > 0 ? static_cast<int64_t>(written) : kPipeErrIntr;
             }
         }
 
@@ -1094,12 +1133,15 @@ uint64_t Syscall::sys_write(uint64_t fileHandle, uint64_t buf, uint64_t count) {
     if (!fileFd) return syscall_error(SysErrBadFile);
     PinnedFd pin(fileFd);
     
-    char chunk[512];
+    char stackChunk[512];
+    FileChunk big(fileFd, count);
+    char* chunk = big.data ? big.data : stackChunk;
+    const uint64_t chunkSize = big.data ? big.size : sizeof(stackChunk);
     uint64_t total = 0;
     while (total < count) {
         uint64_t toCopy = count - total;
-        if (toCopy > sizeof(chunk)) {
-            toCopy = sizeof(chunk);
+        if (toCopy > chunkSize) {
+            toCopy = chunkSize;
         }
         if (!copyFromUser(chunk, buf + total, toCopy)) {
             return syscall_error(SysErrInvalid);
@@ -1114,6 +1156,9 @@ uint64_t Syscall::sys_write(uint64_t fileHandle, uint64_t buf, uint64_t count) {
             // is reported as a short write below via `total`.
             if (written == kPipeErrAgain) {
                 return total > 0 ? total : syscall_error(SysErrAgain);
+            }
+            if (written == kPipeErrIntr) {
+                return total > 0 ? total : syscall_error(SysErrInterrupted);
             }
             if (written == kPipeErrPipe) {
                 return total > 0 ? total : syscall_error(SysErrPipe);
@@ -1267,12 +1312,15 @@ uint64_t Syscall::sys_read(uint64_t fileHandle, uint64_t buf, uint64_t count) {
     if (!fileFd) return syscall_error(SysErrBadFile);
     PinnedFd pin(fileFd);
     
-    char chunk[512];
+    char stackChunk[512];
+    FileChunk big(fileFd, count);
+    char* chunk = big.data ? big.data : stackChunk;
+    const uint64_t chunkSize = big.data ? big.size : sizeof(stackChunk);
     uint64_t total = 0;
     while (total < count) {
         uint64_t toRead = count - total;
-        if (toRead > sizeof(chunk)) {
-            toRead = sizeof(chunk);
+        if (toRead > chunkSize) {
+            toRead = chunkSize;
         }
 
         int64_t bytesRead = VFS::get().read(fileFd, chunk, toRead);
@@ -1283,6 +1331,9 @@ uint64_t Syscall::sys_read(uint64_t fileHandle, uint64_t buf, uint64_t count) {
             // A nonblocking pipe/FIFO read with no data available reports EAGAIN.
             if (bytesRead == kPipeErrAgain) {
                 return syscall_error(SysErrAgain);
+            }
+            if (bytesRead == kPipeErrIntr) {
+                return syscall_error(SysErrInterrupted);
             }
             VNode* node = fileFd->getNode();
             return syscall_error(node && node->getType() == FileType::Directory ? SysErrIsDirectory : SysErrBadFile);
@@ -1401,7 +1452,9 @@ uint64_t Syscall::sys_open(uint64_t path, uint64_t flags, uint64_t mode) {
         if (stats.type == FileType::Pipe) {
             VNode* fifoNode = VFS::get().lookup(pathname, (flags & kOpenNoFollow) == 0);
             if (fifoNode) {
-                return openFifo(current, fifoNode, flags);
+                const uint64_t r = openFifo(current, fifoNode, flags);
+                VFS::releaseNode(fifoNode);   // openFifo keeps only its fs and inode
+                return r;
             }
         }
     } else {
@@ -1427,12 +1480,15 @@ uint64_t Syscall::sys_open(uint64_t path, uint64_t flags, uint64_t mode) {
     int result = VFS::get().open(pathname, flags, &fd, static_cast<uint32_t>(mode ? mode : 0666));
     
     if (result != 0 || !fd) {
+        if (result == -static_cast<int>(SysErrExists)) {
+            return syscall_error(SysErrExists);   // lost a create race (VFS::open)
+        }
         if (VFS::get().getLastError() == SysErrLoop) {
             return syscall_error(SysErrLoop);
         }
         return syscall_error(SysErrNoEntry);
     }
-    
+
     uint64_t fileHandle = current->allocateFD(fd, fileRightsFromOpenFlags(flags), (flags & kOpenCloseOnExec) != 0);
     if (fileHandle == static_cast<uint64_t>(-1)) {
         VFS::get().close(fd);
@@ -1875,7 +1931,12 @@ uint64_t Syscall::sys_dup(uint64_t handle) {
         }
     }
 
-    return current->duplicateHandle(handle);
+    const HandleEntry* entry = current->getHandle(handle);
+    if (!entry) return syscall_error(SysErrBadFile);
+    if (!(entry->rights & HandleRightDuplicate)) return syscall_error(SysErrPermission);
+    const uint64_t copy = current->duplicateHandle(handle);
+    // The table is full (HandleTable::MaxHandles) or out of memory.
+    return copy == static_cast<uint64_t>(-1) ? syscall_error(SysErrTooManyFiles) : copy;
 }
 
 uint64_t Syscall::sys_dup2(uint64_t oldHandle, uint64_t newHandle) {
@@ -2058,6 +2119,14 @@ uint64_t Syscall::sys_fcntl(uint64_t handle, uint64_t command, uint64_t value) {
             // encoded handles rather than lowest-numbered fds; the mlibc
             // userspace fd table maps the returned handle to a small fd.
             return current->duplicateHandle(handle);
+        case kFcntlAddSeals:
+        case kFcntlGetSeals:
+            return memfdSeals(current, handle, command == kFcntlAddSeals, value);
+        case kFcntlGetPipeSize:
+            if (pipeEndpointFromHandle(current, handle)) {
+                return kPipeBufferSize;
+            }
+            return syscall_error(SysErrInvalid);
         default:
             return syscall_error(SysErrInvalid);
     }
@@ -2265,7 +2334,11 @@ uint64_t Syscall::sys_truncate(uint64_t target, uint64_t size, uint64_t byHandle
         if (fileFd->getNode() && fileFd->getNode()->getType() == FileType::Directory) {
             return syscall_error(SysErrIsDirectory);
         }
-        return VFS::get().truncate(fileFd, size) == 0 ? 0 : syscall_error(SysErrInvalid);
+        const int result = VFS::get().truncate(fileFd, size);
+        if (result < -1 && sharedPagesOf(fileFd->getNode())) {
+            return static_cast<uint64_t>(static_cast<int64_t>(result));   // -errno
+        }
+        return result == 0 ? 0 : syscall_error(sharedPagesMayResize(fileFd->getNode(), size) ? SysErrInvalid : SysErrPermission);
     }
 
     char pathname[256];

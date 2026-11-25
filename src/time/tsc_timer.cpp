@@ -49,41 +49,66 @@ void cpuid_read(uint32_t leaf, uint32_t subleaf, uint32_t& eax, uint32_t& ebx, u
     cpuid(&eax, &ebx, &ecx, &edx);
 }
 
+bool same_second(const rtc_time& a, const rtc_time& b) {
+    return a.second == b.second && a.minute == b.minute && a.hour == b.hour &&
+           a.day == b.day && a.month == b.month && a.year == b.year;
+}
+
+// Waits for the RTC's next second and returns the TSC there, as the middle of
+// the window it must lie in: from before the last read that saw the old second
+// to after the first that saw the new one. *window is that window's width.
+uint64_t rtc_next_second_tsc(uint64_t* window) {
+    rtc_time start = {};
+    rtc_time now = {};
+    uint64_t before = rdtsc();
+    rtc_read_time(&start);
+    uint64_t lastOld = before;   // the old second was read after this
+    while (true) {
+        const uint64_t b = rdtsc();
+        rtc_read_time(&now);
+        const uint64_t a = rdtsc();
+        if (!same_second(now, start)) {
+            *window = a - lastOld;
+            return lastOld + (a - lastOld) / 2;
+        }
+        lastOld = b;
+    }
+}
+
+// TSC cycles in one RTC second. Under a hypervisor the vCPU can be off the CPU
+// right at a second's edge, which made the edge look late (a WHPX guest's
+// clock was 0.4% off); so each edge is bounded by the reads around it and a
+// measurement whose edges are not both sharp (1/4000 of the second) is taken
+// again, keeping the sharpest of up to four.
 uint64_t lapic_calibrate_tsc_frequency() {
     LAPIC& lapic = LAPIC::get();
-    rtc_time start_time = {};
-    rtc_time end_time = {};
-
-    rtc_read_time(&start_time);
-    do {
-        rtc_read_time(&end_time);
-    } while (end_time.second == start_time.second &&
-             end_time.minute == start_time.minute &&
-             end_time.hour == start_time.hour &&
-             end_time.day == start_time.day &&
-             end_time.month == start_time.month &&
-             end_time.year == start_time.year);
-
     lapic.write(LAPIC_TIMER, kLapicTimerMasked);
     lapic.setTimerDivide(kLapicTimerDivBy16);
     lapic.write(LAPIC_TIMER_INITCNT, 0xFFFFFFFFU);
 
-    const uint64_t start_tsc = rdtsc();
-    rtc_time deadline = end_time;
-    do {
-        rtc_read_time(&end_time);
-    } while (end_time.second == deadline.second &&
-             end_time.minute == deadline.minute &&
-             end_time.hour == deadline.hour &&
-             end_time.day == deadline.day &&
-             end_time.month == deadline.month &&
-             end_time.year == deadline.year);
+    uint64_t best = 0;
+    uint64_t bestWindow = ~0ULL;
+    uint64_t window = 0;
+    uint64_t edge = rtc_next_second_tsc(&window);
+    uint64_t edgeWindow = window;
+    for (int attempt = 0; attempt < 4; ++attempt) {
+        const uint64_t next = rtc_next_second_tsc(&window);
+        const uint64_t cycles = next - edge;
+        const uint64_t uncertainty = edgeWindow + window;
+        if (uncertainty < bestWindow) {
+            best = cycles;
+            bestWindow = uncertainty;
+        }
+        if (uncertainty * 4000 <= cycles) {
+            break;
+        }
+        edge = next;
+        edgeWindow = window;
+    }
 
-    const uint64_t end_tsc = rdtsc();
     lapic.write(LAPIC_TIMER, kLapicTimerMasked);
     lapic.write(LAPIC_TIMER_INITCNT, 0);
-
-    return end_tsc - start_tsc;
+    return best;
 }
 
 uint64_t cpuid_tsc_frequency_candidate() {
@@ -147,11 +172,30 @@ bool tsc_clock_running() {
 
 // An invariant TSC (CPUID 80000007h EDX bit 8) ticks at one rate whatever
 // the power state; so does the TSC a hypervisor (CPUID 1 ECX bit 31) offers.
+// So does any Intel Core or later and AMD from family 10h, as Linux takes it
+// (X86_FEATURE_CONSTANT_TSC from the family and model): Windows' WHPX shows
+// neither bit, and counting PIT ticks there left the clock at 40-70% speed.
 bool tsc_runs_at_constant_rate() {
     uint32_t eax = 1, ebx = 0, ecx = 0, edx = 0;
     cpuid(&eax, &ebx, &ecx, &edx);
     if ((ecx & (1U << 31)) != 0) {
         return true;
+    }
+    {
+        uint32_t family = (eax >> 8) & 0xF;
+        uint32_t model = (eax >> 4) & 0xF;
+        if (family == 0xF) family += (eax >> 20) & 0xFF;
+        if (family == 0x6 || family >= 0xF) model |= ((eax >> 16) & 0xF) << 4;
+        uint32_t v0 = 0, vendor1 = 0, vendor2 = 0, vendor3 = 0;
+        cpuid(&v0, &vendor1, &vendor2, &vendor3);   // ebx, ecx, edx: the vendor string
+        const bool intel = vendor1 == 0x756E6547 && vendor3 == 0x49656E69 && vendor2 == 0x6C65746E;   // GenuineIntel
+        const bool amd = vendor1 == 0x68747541 && vendor3 == 0x69746E65 && vendor2 == 0x444D4163;     // AuthenticAMD
+        if (intel && ((family == 0x6 && model >= 0x0E) || (family == 0xF && model >= 0x03))) {
+            return true;
+        }
+        if (amd && family >= 0x10) {
+            return true;
+        }
     }
     eax = 0x80000000U; ebx = ecx = edx = 0;
     cpuid(&eax, &ebx, &ecx, &edx);

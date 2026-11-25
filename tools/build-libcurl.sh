@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Cross-build libcurl against the InstantOS mlibc sysroot, with mbedTLS for TLS
-# and zlib for transfer compression.
+# Cross-build libcurl against the InstantOS mlibc sysroot, with OpenSSL (the
+# shared libraries of tools/build-openssl.sh) for TLS and zlib for transfer
+# compression.
 #
 # Produces a static libcurl.a plus headers installed into the mlibc sysroot, so
 # NetSurf's curl fetcher can do http:// and https:// transfers.
 #
 # InstantOS specifics handled here:
-#   - mbedTLS (not OpenSSL) is the TLS backend (--with-mbedtls).
 #   - The synchronous resolver is used (no threads); it goes through mlibc's
 #     getaddrinfo(), which resolves via the kernel UDP socket DNS path.
 #   - Most optional protocols/features are disabled: NetSurf only needs
@@ -15,15 +15,16 @@
 #   - configure runs target link tests; we feed it a config.cache plus
 #     cross-compile host/build triples so it never executes a target binary.
 #
-# Prerequisites: tools/build-mlibc.sh, tools/build-zlib.sh, tools/build-mbedtls.sh
+# Prerequisites: tools/build-mlibc.sh, tools/build-zlib.sh, tools/build-openssl.sh
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="${BUILD_DIR:-$ROOT/build}"
 MLIBC_ROOT="${MLIBC_ROOT:-$BUILD_DIR/mlibc-root}"
-CURL_VERSION="${CURL_VERSION:-curl-8.11.1}"
+CURL_VERSION="${CURL_VERSION:-curl-8.23.0}"
+CURL_SHA256="${CURL_SHA256:-8dadd7d2536a314f982ad05a651b713f426bf7d02cc2c76cffb9796f2218e6c5}"
 CURL_URL="${CURL_URL:-https://curl.se/download/${CURL_VERSION}.tar.xz}"
-WORK_DIR="${WORK_DIR:-$BUILD_DIR/curl-port}"
+WORK_DIR="${WORK_DIR:-$HOME/curl-port}"
 SRC_DIR="$WORK_DIR/$CURL_VERSION"
 OBJ_DIR="$WORK_DIR/build"
 CC="${CC:-clang}"
@@ -34,8 +35,8 @@ if [ ! -f "$MLIBC_ROOT/lib/crt1.o" ] || [ ! -f "$MLIBC_ROOT/lib/libc.so" ]; then
   printf 'mlibc sysroot missing (%s); run tools/build-mlibc.sh first\n' "$MLIBC_ROOT" >&2
   exit 2
 fi
-if [ ! -f "$MLIBC_ROOT/lib/libmbedtls.a" ]; then
-  printf 'mbedTLS missing (%s/lib/libmbedtls.a); run tools/build-mbedtls.sh first\n' "$MLIBC_ROOT" >&2
+if [ ! -f "$MLIBC_ROOT/lib/libssl.so.3" ]; then
+  printf 'OpenSSL missing (%s/lib/libssl.so.3); run tools/build-openssl.sh first\n' "$MLIBC_ROOT" >&2
   exit 2
 fi
 if [ ! -f "$MLIBC_ROOT/lib/libz.a" ]; then
@@ -43,16 +44,18 @@ if [ ! -f "$MLIBC_ROOT/lib/libz.a" ]; then
   exit 2
 fi
 
-# Freestanding-against-mlibc flags. mbedTLS headers need its config file macro.
-TARGET_CFLAGS="--target=x86_64-unknown-elf -ffreestanding -fPIC -fno-stack-protector -nostdlibinc -isystem $MLIBC_ROOT/include -I$MLIBC_ROOT/include -D_GNU_SOURCE -DMBEDTLS_CONFIG_FILE='<instantos_mbedtls_config.h>'"
+# Freestanding-against-mlibc flags.
+TARGET_CFLAGS="--target=x86_64-unknown-elf -ffreestanding -fPIC -fno-stack-protector -nostdlibinc -isystem $MLIBC_ROOT/include -I$MLIBC_ROOT/include -D_GNU_SOURCE"
 TARGET_LDFLAGS="--target=x86_64-unknown-elf -nostdlib -fuse-ld=lld -L$MLIBC_ROOT/lib"
 
 mkdir -p "$WORK_DIR"
-if [ ! -d "$SRC_DIR" ]; then
+if [ ! -f "$WORK_DIR/$CURL_VERSION.tar.xz" ]; then
   printf 'fetching %s\n' "$CURL_URL"
-  curl -sL "$CURL_URL" -o "$WORK_DIR/$CURL_VERSION.tar.xz"
-  tar -C "$WORK_DIR" -xf "$WORK_DIR/$CURL_VERSION.tar.xz"
+  curl -fsSL "$CURL_URL" -o "$WORK_DIR/$CURL_VERSION.tar.xz"
 fi
+echo "$CURL_SHA256  $WORK_DIR/$CURL_VERSION.tar.xz" | sha256sum -c --quiet - || {
+  echo "$CURL_VERSION.tar.xz does not have the pinned checksum: not building it" >&2; exit 1; }
+[ -d "$SRC_DIR" ] || tar -C "$WORK_DIR" -xf "$WORK_DIR/$CURL_VERSION.tar.xz"
 
 rm -rf "$OBJ_DIR"
 mkdir -p "$OBJ_DIR"
@@ -84,8 +87,8 @@ ac_cv_func_gmtime_r=yes
 ac_cv_func_gethostname=yes
 EOF
 
-# mbedTLS link arguments (link order: tls -> x509 -> crypto).
-MBEDTLS_LIBS="-lmbedtls -lmbedx509 -lmbedcrypto"
+# Only the sysroot's .pc files: the host's would name the host's OpenSSL.
+export PKG_CONFIG_LIBDIR="$MLIBC_ROOT/lib/pkgconfig" PKG_CONFIG_PATH=
 
 CC="$CC" \
 AR="$AR" \
@@ -93,7 +96,7 @@ RANLIB="$RANLIB" \
 CFLAGS="$TARGET_CFLAGS" \
 CPPFLAGS="$TARGET_CFLAGS" \
 LDFLAGS="$TARGET_LDFLAGS" \
-LIBS="$MBEDTLS_LIBS -lz -lc" \
+LIBS="-lssl -lcrypto -lz -lc" \
 "$SRC_DIR/configure" \
   --host=x86_64-unknown-elf \
   --build=x86_64-linux-gnu \
@@ -101,7 +104,7 @@ LIBS="$MBEDTLS_LIBS -lz -lc" \
   --prefix="$MLIBC_ROOT" \
   --enable-static \
   --disable-shared \
-  --with-mbedtls="$MLIBC_ROOT" \
+  --with-openssl="$MLIBC_ROOT" \
   --with-zlib="$MLIBC_ROOT" \
   --without-libpsl \
   --without-libidn2 \
@@ -109,7 +112,6 @@ LIBS="$MBEDTLS_LIBS -lz -lc" \
   --without-zstd \
   --without-nghttp2 \
   --without-ngtcp2 \
-  --without-librtmp \
   --without-ca-bundle \
   --without-ca-path \
   --disable-ldap \
@@ -123,7 +125,6 @@ LIBS="$MBEDTLS_LIBS -lz -lc" \
   --disable-smtp \
   --disable-pop3 \
   --disable-imap \
-  --disable-smb \
   --disable-rtsp \
   --disable-mqtt \
   --disable-manual \
@@ -133,7 +134,6 @@ LIBS="$MBEDTLS_LIBS -lz -lc" \
   --disable-unix-sockets \
   --enable-http \
   --enable-proxy \
-  --enable-ipv4 \
   --disable-ipv6
 
 # Build only the library (skip src/ which links the curl executable).
@@ -147,7 +147,7 @@ cp lib/.libs/libcurl.a "$MLIBC_ROOT/lib/libcurl.a"
 cp "$SRC_DIR"/include/curl/*.h "$MLIBC_ROOT/include/curl/"
 
 # Emit a pkg-config file (NetSurf finds libcurl via pkg-config). Declare the
-# private deps so a static link pulls in mbedTLS + zlib in the right order.
+# deps so a link of the static archive gets OpenSSL + zlib in the right order.
 CURL_PC_VERSION="${CURL_VERSION#curl-}"
 mkdir -p "$MLIBC_ROOT/lib/pkgconfig"
 cat > "$MLIBC_ROOT/lib/pkgconfig/libcurl.pc" <<EOF
@@ -159,9 +159,8 @@ includedir=\${prefix}/include
 Name: libcurl
 Description: Library to transfer files with HTTP/HTTPS
 Version: $CURL_PC_VERSION
-Requires.private: mbedtls
-Libs: -L\${libdir} -lcurl -lmbedtls -lmbedx509 -lmbedcrypto -lz
-Libs.private: -lmbedtls -lmbedx509 -lmbedcrypto -lz
+Requires: libssl libcrypto
+Libs: -L\${libdir} -lcurl -lssl -lcrypto -lz
 Cflags: -I\${includedir} -DCURL_STATICLIB
 EOF
 

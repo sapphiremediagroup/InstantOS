@@ -33,12 +33,21 @@ struct PerCPUData {
     uint64_t deviceIrqs;           // 88
     // The syscall this CPU is in, ~0 when none (for the lock-up watchdog).
     volatile uint64_t currentSyscall = ~0ULL;   // 96
+    // Scheduler::kickIdleCpu sent this CPU a reschedule IPI it has not taken
+    // yet (set by the sender, cleared by the IPI): the next kick goes to another.
+    volatile uint32_t idleKicked = 0;           // 104
+    // syscallEntry's return by iretq (after sigreturn): the user's rip and
+    // rflags (rsp is userRSP).
+    uint64_t iretRip = 0;                       // 112
+    uint64_t iretRflags = 0;                    // 120
 };
 
 static_assert(__builtin_offsetof(PerCPUData, kernelStack) == 0, "syscallEntry reads gs:[0]");
 static_assert(__builtin_offsetof(PerCPUData, userRSP) == 8, "syscallEntry uses gs:[8]");
 static_assert(__builtin_offsetof(PerCPUData, self) == 16, "getPerCPU reads gs:[16]");
 static_assert(__builtin_offsetof(PerCPUData, cpuIndex) == 24, "currentCpuIndex reads gs:[24]");
+static_assert(__builtin_offsetof(PerCPUData, iretRip) == 112, "syscallEntry reads gs:[112]");
+static_assert(__builtin_offsetof(PerCPUData, iretRflags) == 120, "syscallEntry reads gs:[120]");
 
 // Sets up the boot CPU's PerCPUData and points GS at it. Call after the GDT is
 // loaded (reloading GS clears the GS base).

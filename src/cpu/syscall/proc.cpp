@@ -57,8 +57,11 @@ bool copyStringVectorFromUser(uint64_t vectorPtr, int* outCount, const char*** o
         return false;
     }
 
+    // Count limit: ProcessExecutor::kMaxArgEnv. A longer vector fails the call
+    // instead of being cut short (ar gets one argument per object file).
+    constexpr int kMaxCount = ProcessExecutor::kMaxArgEnv;
     int count = 0;
-    while (count < 128) { // must stay <= exec.cpp MAX_ARG_ENV
+    for (;;) {
         uint64_t itemPtr = 0;
         if (!Syscall::copyFromUser(&itemPtr, vectorPtr + count * sizeof(uint64_t), sizeof(itemPtr))) {
             return false;
@@ -66,7 +69,10 @@ bool copyStringVectorFromUser(uint64_t vectorPtr, int* outCount, const char*** o
         if (itemPtr == 0) {
             break;
         }
-        count++;
+        if (++count > kMaxCount) {
+            Console::get().drawText("[PROC] exec refused: too many argv/envp entries\n");
+            return false;
+        }
     }
 
     const char** values = new const char*[count + 1];
@@ -74,29 +80,44 @@ bool copyStringVectorFromUser(uint64_t vectorPtr, int* outCount, const char*** o
         return false;
     }
 
+    // Argument/environment strings can be long: gcc puts its whole command
+    // line in COLLECT_GCC_OPTIONS, and make runs every recipe as one `sh -c`
+    // string (binutils' recursive make lines are several KiB; a 4 KiB cap
+    // failed them with EINVAL). Each string is read through one scratch buffer
+    // and kept at its own length.
+    constexpr uint64_t kMaxArgStringLen = ProcessExecutor::kMaxArgStringLen;
+    char* scratch = count ? new char[kMaxArgStringLen] : nullptr;
+    if (count && !scratch) {
+        delete[] values;
+        return false;
+    }
     for (int i = 0; i < count; i++) {
         uint64_t itemPtr = 0;
-        if (!Syscall::copyFromUser(&itemPtr, vectorPtr + i * sizeof(uint64_t), sizeof(itemPtr))) {
-            for (int j = 0; j < i; j++) delete[] values[j];
-            delete[] values;
-            return false;
+        char* item = nullptr;
+        char first = 1;
+        if (Syscall::copyFromUser(&itemPtr, vectorPtr + i * sizeof(uint64_t), sizeof(itemPtr)) &&
+            Syscall::copyFromUser(&first, itemPtr, 1)) {
+            if (first == '\0') {
+                // An empty argument is valid (ld's genscripts.sh gets several
+                // ""); copyStringFromUser rejects empty strings, as paths must.
+                item = new char[1];
+                if (item) item[0] = '\0';
+            } else if (Syscall::copyStringFromUser(itemPtr, scratch, kMaxArgStringLen)) {
+                const size_t len = strlen(scratch) + 1;
+                item = new char[len];
+                if (item) memcpy(item, scratch, len);
+            }
         }
-
-        // Argument/environment strings can be long: e.g. gcc sets
-        // COLLECT_GCC_OPTIONS to the full concatenated driver command line when
-        // it exec()s cc1/as/collect2. A 256-byte cap made copyStringFromUser()
-        // fail (no NUL within the buffer) -> the whole exec returned EINVAL,
-        // breaking real toolchain command lines (observed building tcc via gcc).
-        constexpr int kMaxArgStringLen = 4096;
-        char* item = new char[kMaxArgStringLen];
-        if (!Syscall::copyStringFromUser(itemPtr, item, kMaxArgStringLen)) {
-            delete[] item;
+        if (!item) {
+            Console::get().drawText("[PROC] exec refused: an argv/envp string over 128 KiB or unreadable\n");
             for (int j = 0; j < i; j++) delete[] values[j];
             delete[] values;
+            delete[] scratch;
             return false;
         }
         values[i] = item;
     }
+    delete[] scratch;
     values[count] = nullptr;
 
     *outCount = count;
@@ -120,6 +141,10 @@ int waitStatusFor(Process* process) {
         return 0;
     }
 
+    // As Linux: the signal in the low 7 bits, or the exit code in the next 8.
+    if (process->termSignal) {
+        return process->termSignal & 0x7F;
+    }
     const int code = process->getExitCode() & 0xFF;
     return code << 8;
 }
@@ -175,6 +200,11 @@ uint64_t Syscall::sys_getpid() {
     return current ? current->getPID() : 0;
 }
 
+uint64_t Syscall::sys_gettgid() {
+    Process* current = Scheduler::get().getCurrentProcess();
+    return current ? current->getGroupPID() : 0;
+}
+
 uint64_t Syscall::sys_procinfo(uint64_t entriesPtr, uint64_t capacity, uint64_t totalPtr) {
     if (capacity > 0 && !isValidUserPointer(entriesPtr, capacity * sizeof(ProcInfoEntry))) {
         return syscall_error(SysErrInvalid);
@@ -219,11 +249,12 @@ uint64_t Syscall::sys_procinfo(uint64_t entriesPtr, uint64_t capacity, uint64_t 
 
 uint64_t Syscall::sys_fork() {
     Process* parent = Scheduler::get().getCurrentProcess();
-    if (!parent || parent->isThread()) {
+    if (!parent) {
         return syscall_error(SysErrInvalid);
     }
 
-    // The parent's full userspace register state was captured into its context
+    // The child is a process with one thread, a copy of the caller (which may be
+    // any thread). The parent's full userspace register state was captured into its context
     // by saveSyscallState() on syscall entry.
     const ProcessContext parentUserCtx = *parent->getContext();
     const uint64_t parentFsBase = parent->getUserFsBase();
@@ -260,7 +291,7 @@ uint64_t Syscall::sys_fork() {
     }
 
     // Inherit identity, cwd, name, fd table, and signal dispositions.
-    child->setParentPID(parent->getPID());
+    child->setParentPID(parent->getGroupPID());
     child->setUID(parent->getUID());
     child->setGID(parent->getGID());
     child->setSessionID(parent->getSessionID());
@@ -281,6 +312,9 @@ uint64_t Syscall::sys_fork() {
     }
     dst->blocked = src->blocked;
     dst->pending = 0;  // pending signals are not inherited
+    dst->altStackSp = src->altStackSp;   // the copied memory holds it
+    dst->altStackSize = src->altStackSize;
+    dst->altStackFlags = src->altStackFlags;
 
     // Arrange for the child to resume in usermode returning 0.
     child->setupForkResume(parentUserCtx, parentFsBase);
@@ -425,7 +459,7 @@ uint64_t Syscall::sys_wait(uint64_t pid, uint64_t statusPtr, uint64_t options) {
         current->setState(ProcessState::Blocked);
 
         bool hasMatchingChild = false;
-        Process* child = Scheduler::get().findChild(current->getPID(), requestedPid, true, &hasMatchingChild);
+        Process* child = Scheduler::get().findChild(current->getGroupPID(), requestedPid, true, &hasMatchingChild);
         if (child) {
             current->setState(ProcessState::Running);
             const uint32_t childPid = child->getPID();
@@ -457,25 +491,6 @@ uint64_t Syscall::sys_wait(uint64_t pid, uint64_t statusPtr, uint64_t options) {
             return syscall_error(SysErrInterrupted);
         }
     }
-}
-
-uint64_t Syscall::sys_kill(uint64_t pid, uint64_t sig) {
-    if (sig >= NSIG) {
-        return syscall_error(SysErrInvalid);
-    }
-
-    Process* target = nullptr;
-    if (pid == 0) {
-        target = Scheduler::get().getCurrentProcess();
-    } else if (pid <= UINT32_MAX) {
-        target = Scheduler::get().getProcessByPID((uint32_t)pid);
-    }
-    if (!target) return syscall_error(SysErrNoEntry);
-
-    if (sig != 0) {
-        target->sendSignal((int)sig);
-    }
-    return 0;
 }
 
 uint64_t Syscall::sys_yield() {
@@ -666,6 +681,9 @@ uint64_t Syscall::sys_sleep(uint64_t ms) {
 
 uint64_t Syscall::sys_getppid() {
     Process* current = Scheduler::get().getCurrentProcess();
+    if (current && current->isThread()) {
+        current = Scheduler::get().getProcessByPID(current->getGroupPID());
+    }
     return current ? current->getParentPID() : 0;
 }
 
@@ -720,7 +738,7 @@ uint64_t Syscall::sys_spawn(uint64_t path, uint64_t argv, uint64_t envp) {
 
     Process* current = Scheduler::get().getCurrentProcess();
     if (current) {
-        newProc->setParentPID(current->getPID());
+        newProc->setParentPID(current->getGroupPID());
         newProc->setUID(current->getUID());
         newProc->setGID(current->getGID());
         newProc->setSessionID(current->getSessionID());
@@ -740,6 +758,49 @@ uint64_t Syscall::sys_spawn(uint64_t path, uint64_t argv, uint64_t envp) {
     return pid;
 }
 
+namespace {
+constexpr uint64_t kRlimitNofile = 7;            // Linux's RLIMIT_NOFILE
+constexpr uint64_t kRlimInfinity = ~0ULL;
+struct RlimitPair {
+    uint64_t cur;
+    uint64_t max;
+};
+}
+
+// Resource limits. Only RLIMIT_NOFILE means anything: mlibc keeps its fd
+// numbers below the soft limit (the kernel's handles are more than files and
+// stop at HandleTable::MaxHandles). The others read as unlimited and setting
+// them does nothing, as before.
+uint64_t Syscall::sys_getrlimit(uint64_t resource, uint64_t limitPtr) {
+    Process* current = Scheduler::get().getCurrentProcess();
+    if (!current) return syscall_error(SysErrInvalid);
+    if (resource > 15) return syscall_error(SysErrInvalid);
+    RlimitPair limit{kRlimInfinity, kRlimInfinity};
+    if (resource == kRlimitNofile) {
+        current->getNofileLimit(&limit.cur, &limit.max);
+    }
+    if (!copyToUser(limitPtr, &limit, sizeof(limit))) return syscall_error(SysErrFault);
+    return 0;
+}
+
+uint64_t Syscall::sys_setrlimit(uint64_t resource, uint64_t limitPtr) {
+    Process* current = Scheduler::get().getCurrentProcess();
+    if (!current) return syscall_error(SysErrInvalid);
+    if (resource > 15) return syscall_error(SysErrInvalid);
+    RlimitPair limit{};
+    if (!copyFromUser(&limit, limitPtr, sizeof(limit))) return syscall_error(SysErrFault);
+    if (limit.cur > limit.max) return syscall_error(SysErrInvalid);
+    if (resource != kRlimitNofile) return 0;
+    uint64_t soft = 0, hard = 0;
+    current->getNofileLimit(&soft, &hard);
+    // As Linux: never above the system's ceiling (nr_open), and raising the hard
+    // limit is for root.
+    if (limit.max > HandleTable::MaxNofile) return syscall_error(SysErrPermission);
+    if (limit.max > hard && current->getUID() != 0) return syscall_error(SysErrPermission);
+    current->setNofileLimit(limit.cur, limit.max);
+    return 0;
+}
+
 uint64_t Syscall::sys_fdtable_stash(uint64_t ptr, uint64_t count) {
     // Snapshot libc's fd-number -> handle table into the Process so it survives
     // the image replacement in the following exec. See Process::getFdStash().
@@ -748,11 +809,16 @@ uint64_t Syscall::sys_fdtable_stash(uint64_t ptr, uint64_t count) {
     if (count > static_cast<uint64_t>(Process::kFdStashMax)) {
         count = static_cast<uint64_t>(Process::kFdStashMax);
     }
-    if (count == 0) { current->setFdStashCount(0); return 0; }
+    if (count == 0) { current->dropFdStash(); current->setFdStashCount(0); return 0; }
     if (!isValidUserPointer(ptr, count * sizeof(uint64_t))) {
         return syscall_error(SysErrInvalid);
     }
-    if (!copyFromUser(current->getFdStash(), ptr, count * sizeof(uint64_t))) {
+    uint64_t* stash = current->makeFdStash(static_cast<int>(count));
+    if (!stash) {
+        return syscall_error(SysErrNoMemory);
+    }
+    if (!copyFromUser(stash, ptr, count * sizeof(uint64_t))) {
+        current->dropFdStash();
         return syscall_error(SysErrInvalid);
     }
     current->setFdStashCount(static_cast<int>(count));
@@ -768,6 +834,8 @@ uint64_t Syscall::sys_fdtable_fetch(uint64_t ptr, uint64_t count) {
     if (!current) return syscall_error(SysErrInvalid);
     int stashed = current->getFdStashCount();
     if (stashed <= 0) return 0;
+    // (0, 0): how many entries there are, for a caller sizing its table.
+    if (ptr == 0 && count == 0) return static_cast<uint64_t>(stashed);
     if (count > static_cast<uint64_t>(stashed)) {
         count = static_cast<uint64_t>(stashed);
     }
@@ -785,7 +853,7 @@ uint64_t Syscall::sys_fdtable_fetch(uint64_t ptr, uint64_t count) {
     if (!copyToUser(ptr, stash, count * sizeof(uint64_t))) {
         return syscall_error(SysErrInvalid);
     }
-    current->setFdStashCount(-1);   // one-shot per exec
+    current->dropFdStash();   // one-shot per exec
     return count;
 }
 
@@ -880,11 +948,9 @@ uint64_t Syscall::sys_thread_clone(uint64_t entry, uint64_t userStack) {
         return syscall_error(SysErrInvalid);
     }
 
-    // Reuse the shared-address-space thread constructor. It also allocates a
-    // small kernel-managed user stack we never use (mlibc runs on `userStack`);
-    // that stack is reclaimed by ~Process() when the thread is reaped. Sharing
-    // the parent's page table is what makes this a thread rather than a process.
-    Process* thread = new Process(Scheduler::get().allocatePID(), current, kMinThreadStackSize);
+    // Sharing the parent's page table is what makes this a thread rather than a
+    // process. mlibc runs it on `userStack`, so the kernel makes no stack.
+    Process* thread = new Process(Scheduler::get().allocatePID(), current, Process::kNoUserStack);
     if (!thread || !thread->getPageTable() || !thread->getKernelStack()) {
         delete thread;
         return syscall_error(SysErrNoMemory);
@@ -950,12 +1016,24 @@ uint64_t Syscall::sys_thread_exit(uint64_t code) {
     if (ThreadObject* object = current->getThreadObject()) {
         object->exitCode = static_cast<int>(code);
         object->completed = true;
+        if (object->joiners) Scheduler::get().wakeThreadsOf(current->getGroupPID());
     }
 
     current->setExitCode(static_cast<int>(code));
     current->setState(ProcessState::Terminated);
     Scheduler::get().scheduleFromSyscall();
     return static_cast<uint64_t>(-1);
+}
+
+// The thread ends, then its word says so: whoever waits for that may free the
+// thread's stack and TLS, since nothing runs in user mode on them any more.
+uint64_t Syscall::sys_thread_exit_notify(uint64_t word) {
+    Process* current = Scheduler::get().getCurrentProcess();
+    if (current && current->isThread() && (word & 3) == 0 && isValidUserPointer(word, sizeof(uint32_t))) {
+        __atomic_store_n(reinterpret_cast<uint32_t*>(word), 0U, __ATOMIC_SEQ_CST);
+        sys_futex_wake(word, ~0ULL);   // under the big kernel lock, as is the exit
+    }
+    return sys_thread_exit(0);
 }
 
 uint64_t Syscall::sys_thread_join(uint64_t handle, uint64_t statusPtr) {
@@ -986,7 +1064,18 @@ uint64_t Syscall::sys_thread_join(uint64_t handle, uint64_t statusPtr) {
             break;
         }
 
-        Scheduler::get().yield();
+        // Woken by the thread's exit (sys_thread_exit); the deadline is for a
+        // thread that ends in another way.
+        object->joiners++;
+        current->sleepUntil(time_get_uptime_ms() + 100, true);
+        current->setState(ProcessState::Blocked);
+        Scheduler::get().scheduleFromSyscall();
+        current->clearSleep();
+        object->joiners--;
+        if (current->killPending()) {
+            object->release();
+            return syscall_error(SysErrInterrupted);
+        }
     }
 
     int status = object->exitCode;
@@ -1046,22 +1135,24 @@ extern "C" void saveSyscallState(uint64_t* stack) {
     current->setValidUserState(true);
 }
 
-static void restoreSyscallStateLocked(uint64_t* stack, uint64_t result);
+static uint64_t restoreSyscallStateLocked(uint64_t* stack, uint64_t result);
 
 // Last C code before sysret: drops the big kernel lock taken in
 // saveSyscallState() (the syscall may have been resumed on another CPU; the
-// lock moved with it through the context switch).
-extern "C" void restoreSyscallState(uint64_t* stack, uint64_t result) {
-    restoreSyscallStateLocked(stack, result);
+// lock moved with it through the context switch). Nonzero: return by iretq
+// (syscallEntry), with rip and rflags in PerCPUData.
+extern "C" uint64_t restoreSyscallState(uint64_t* stack, uint64_t result) {
+    const uint64_t full = restoreSyscallStateLocked(stack, result);
     KernelLock::leave();
+    return full;
 }
 
-static void restoreSyscallStateLocked(uint64_t* stack, uint64_t result) {
+static uint64_t restoreSyscallStateLocked(uint64_t* stack, uint64_t result) {
     Process* current = Scheduler::get().getCurrentProcess();
-    if (!current || !stack) return;
+    if (!current || !stack) return 0;
 
     ProcessContext* context = current->getContext();
-    if (!context) return;
+    if (!context) return 0;
 
     if (!current->hasValidUserState()) {
         context->r15 = stack[0];
@@ -1109,4 +1200,14 @@ static void restoreSyscallStateLocked(uint64_t* stack, uint64_t result) {
     stack[14] = context->rax;
 
     getPerCPU()->userRSP = context->rsp;
+    if (current->fullUserRestore) {
+        // sigreturn checked rip, rsp and rflags (restoreSignalFrame).
+        current->fullUserRestore = false;
+        stack[4] = context->r11;
+        stack[12] = context->rcx;
+        getPerCPU()->iretRip = context->rip;
+        getPerCPU()->iretRflags = context->rflags;
+        return 1;
+    }
+    return 0;
 }

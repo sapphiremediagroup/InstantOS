@@ -90,6 +90,17 @@ xorriso -as mkisofs \
 
 rm -f "$LOG"
 set +e
+if [ "${QEMU_WIN:-0}" = 1 ]; then
+  # Windows' QEMU with WHPX (tools/lib/qemu-win.sh), stopped once the launcher is done.
+  . "$ROOT/tools/lib/qemu-win.sh"
+  : > "$LOG"
+  qemu_win_start "$OUT_DIR" -drive "file=$(winpath "$ISO"),media=cdrom" -vga std -m 1G \
+    -smp "${QEMU_SMP:-2}" -display "${QEMU_DISPLAY_WIN:-none}" -monitor none -serial "file:$(winpath "$LOG")" -no-shutdown -no-reboot
+  qemu_win_wait "$LOG" "${QEMU_TIMEOUT%s}" 'bash-smoke: done'
+  sleep 1
+  qemu_win_stop "$OUT_DIR"
+  status=0
+else
 timeout "$QEMU_TIMEOUT" "$QEMU" \
   -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
   -drive "if=pflash,format=raw,file=$OVMF_VARS" \
@@ -103,6 +114,7 @@ timeout "$QEMU_TIMEOUT" "$QEMU" \
   -no-reboot \
   ${QEMU_EXTRA_ARGS:-}
 status=$?
+fi
 set -e
 
 if [ "$status" -ne 0 ] && [ "$status" -ne 124 ]; then
@@ -117,14 +129,9 @@ if grep -q 'Unknown Instruction' "$LOG" || grep -q 'User process crash' "$LOG"; 
 fi
 
 # Success criteria (verified end-to-end):
-#  1. bash's mlibc runtime starts (reaches its entry point).
-#  2. bash runs the -c script and exits cleanly (status 0), reaped by waitpid.
-#  3. bash's stdout actually reaches the console/serial.
-#  4. no user-process crash occurred (checked above).
-if ! grep -q 'mlibc-entry: before-main' "$LOG"; then
-  printf 'bash smoke: bash mlibc runtime did not reach main in %s\n' "$LOG" >&2
-  exit 1
-fi
+#  1. bash runs the -c script and exits cleanly (status 0), reaped by waitpid.
+#  2. bash's stdout actually reaches the console/serial (so its main ran).
+#  3. no user-process crash occurred (checked above).
 if ! grep -qE 'bash-smoke: waited rc=0x[0-9a-f]+ status=0x0+$' "$LOG"; then
   printf 'bash smoke: bash did not exit cleanly (status 0) in %s\n' "$LOG" >&2
   grep -nE 'bash-smoke:' "$LOG" >&2 || true
@@ -141,4 +148,4 @@ if ! grep -q 'arith=42' "$LOG"; then
 fi
 
 printf 'bash smoke passed: %s\n' "$LOG"
-grep -nE 'bash-smoke:|BASH_SMOKE_OK|arith=|shell=|mlibc-entry' "$LOG" || true
+grep -nE 'bash-smoke:|BASH_SMOKE_OK|arith=|shell=' "$LOG" || true

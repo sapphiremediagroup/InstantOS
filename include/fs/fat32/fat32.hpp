@@ -94,6 +94,7 @@ public:
     int mount(const char* path) override;
     int unmount() override;
     VNode* getRoot() override;
+    void releaseNode(VNode* node) override;   // lookups hand out a fresh VNode + FAT32Node
     bool isBlockBacked() const override { return true; }
     
     static int nodeOpen(VNode* node, int flags);

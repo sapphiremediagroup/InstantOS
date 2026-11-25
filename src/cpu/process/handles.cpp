@@ -1,13 +1,42 @@
 #include <cpu/process/handles.hpp>
+#include <memory/heap.hpp>
+#include <common/string.hpp>
 
 HandleTable::HandleTable() {
-    for (int i = 0; i < MaxHandles; i++) {
-        clearEntry(i);
-    }
 }
 
 HandleTable::~HandleTable() {
     closeAll();
+    for (int c = 0; c < MaxChunks; c++) {
+        if (chunks[c]) {
+            kfree(chunks[c]);
+            chunks[c] = nullptr;
+        }
+    }
+}
+
+HandleEntry* HandleTable::slotEntry(int slot) const {
+    if (!isValidSlot(slot)) {
+        return nullptr;
+    }
+    HandleEntry* chunk = chunks[slot / ChunkSlots];
+    return chunk ? &chunk[slot % ChunkSlots] : nullptr;
+}
+
+HandleEntry* HandleTable::makeSlot(int slot) {
+    if (!isValidSlot(slot)) {
+        return nullptr;
+    }
+    HandleEntry*& chunk = chunks[slot / ChunkSlots];
+    if (!chunk) {
+        auto* fresh = static_cast<HandleEntry*>(kmalloc(sizeof(HandleEntry) * ChunkSlots));
+        if (!fresh) {
+            return nullptr;
+        }
+        memset(fresh, 0, sizeof(HandleEntry) * ChunkSlots);   // HandleType::None, no object
+        chunk = fresh;
+    }
+    return &chunk[slot % ChunkSlots];
 }
 
 uint64_t HandleTable::allocate(HandleType type, uint32_t rights, void* object, HandleRetainFn retain, HandleReleaseFn release, bool closeOnExec) {
@@ -15,13 +44,23 @@ uint64_t HandleTable::allocate(HandleType type, uint32_t rights, void* object, H
         return static_cast<uint64_t>(-1);
     }
 
-    for (int slot = FirstAllocHandle; slot < MaxHandles; slot++) {
-        if (entries[slot].type == HandleType::None) {
-            return allocateAt(encodeHandle(type, slot), type, rights, object, retain, release, closeOnExec);
+    // The lowest free slot, from the first that may be free.
+    int slot = searchFrom < FirstAllocHandle ? FirstAllocHandle : searchFrom;
+    while (slot < MaxHandles) {
+        HandleEntry* chunk = chunks[slot / ChunkSlots];
+        if (!chunk) {
+            break;   // a chunk not made yet: its first slot is free
         }
+        if (chunk[slot % ChunkSlots].type == HandleType::None) {
+            break;
+        }
+        slot++;
     }
-
-    return static_cast<uint64_t>(-1);
+    if (slot >= MaxHandles || !makeSlot(slot)) {
+        return static_cast<uint64_t>(-1);
+    }
+    searchFrom = slot + 1;
+    return allocateAt(encodeHandle(type, slot), type, rights, object, retain, release, closeOnExec);
 }
 
 uint64_t HandleTable::allocateAt(uint64_t handle, HandleType type, uint32_t rights, void* object, HandleRetainFn retain, HandleReleaseFn release, bool closeOnExec) {
@@ -30,17 +69,22 @@ uint64_t HandleTable::allocateAt(uint64_t handle, HandleType type, uint32_t righ
     if (!decodeHandle(handle, &handleType, &slot) || handleType != type || type == HandleType::None || !object) {
         return static_cast<uint64_t>(-1);
     }
-
-    if (entries[slot].type != HandleType::None) {
-        close(handle);
+    HandleEntry* entry = makeSlot(slot);
+    if (!entry) {
+        return static_cast<uint64_t>(-1);
     }
 
-    entries[slot].type = type;
-    entries[slot].rights = rights;
-    entries[slot].object = object;
-    entries[slot].retain = retain;
-    entries[slot].release = release;
-    entries[slot].closeOnExec = closeOnExec;
+    if (entry->type != HandleType::None) {
+        close(encodeHandle(entry->type, slot));
+    }
+
+    entry->type = type;
+    entry->rights = rights;
+    entry->object = object;
+    entry->retain = retain;
+    entry->release = release;
+    entry->closeOnExec = closeOnExec;
+    open++;
 
     return handle;
 }
@@ -48,19 +92,29 @@ uint64_t HandleTable::allocateAt(uint64_t handle, HandleType type, uint32_t righ
 bool HandleTable::close(uint64_t handle) {
     HandleType type = HandleType::None;
     int slot = -1;
-    if (!decodeHandle(handle, &type, &slot) || entries[slot].type == HandleType::None || entries[slot].type != type) {
+    if (!decodeHandle(handle, &type, &slot)) {
+        return false;
+    }
+    HandleEntry* entry = slotEntry(slot);
+    if (!entry || entry->type == HandleType::None || entry->type != type) {
         return false;
     }
 
-    releaseEntry(entries[slot]);
+    // Cleared before the release runs: it may open or close other handles.
+    HandleEntry old = *entry;
     clearEntry(slot);
+    releaseEntry(old);
     return true;
 }
 
 bool HandleTable::close(uint64_t handle, HandleType expectedType) {
     HandleType type = HandleType::None;
     int slot = -1;
-    if (!decodeHandle(handle, &type, &slot) || type != expectedType || entries[slot].type != expectedType) {
+    if (!decodeHandle(handle, &type, &slot) || type != expectedType) {
+        return false;
+    }
+    HandleEntry* entry = slotEntry(slot);
+    if (!entry || entry->type != expectedType) {
         return false;
     }
 
@@ -68,17 +122,24 @@ bool HandleTable::close(uint64_t handle, HandleType expectedType) {
 }
 
 void HandleTable::closeAll() {
-    for (int slot = 0; slot < MaxHandles; slot++) {
-        if (entries[slot].type != HandleType::None) {
-            close(encodeHandle(entries[slot].type, slot));
+    for (int c = 0; c < MaxChunks; c++) {
+        if (!chunks[c]) continue;
+        for (int i = 0; i < ChunkSlots; i++) {
+            const HandleEntry& entry = chunks[c][i];
+            if (entry.type != HandleType::None) {
+                close(encodeHandle(entry.type, c * ChunkSlots + i));
+            }
         }
     }
 }
 
 void HandleTable::closeAllFiles() {
-    for (int slot = 0; slot < MaxHandles; slot++) {
-        if (entries[slot].type == HandleType::File) {
-            close(encodeHandle(entries[slot].type, slot));
+    for (int c = 0; c < MaxChunks; c++) {
+        if (!chunks[c]) continue;
+        for (int i = 0; i < ChunkSlots; i++) {
+            if (chunks[c][i].type == HandleType::File) {
+                close(encodeHandle(HandleType::File, c * ChunkSlots + i));
+            }
         }
     }
 }
@@ -86,19 +147,27 @@ void HandleTable::closeAllFiles() {
 HandleEntry* HandleTable::get(uint64_t handle) {
     HandleType type = HandleType::None;
     int slot = -1;
-    if (!decodeHandle(handle, &type, &slot) || entries[slot].type == HandleType::None || entries[slot].type != type) {
+    if (!decodeHandle(handle, &type, &slot)) {
         return nullptr;
     }
-    return &entries[slot];
+    HandleEntry* entry = slotEntry(slot);
+    if (!entry || entry->type == HandleType::None || entry->type != type) {
+        return nullptr;
+    }
+    return entry;
 }
 
 const HandleEntry* HandleTable::get(uint64_t handle) const {
     HandleType type = HandleType::None;
     int slot = -1;
-    if (!decodeHandle(handle, &type, &slot) || entries[slot].type == HandleType::None || entries[slot].type != type) {
+    if (!decodeHandle(handle, &type, &slot)) {
         return nullptr;
     }
-    return &entries[slot];
+    const HandleEntry* entry = slotEntry(slot);
+    if (!entry || entry->type == HandleType::None || entry->type != type) {
+        return nullptr;
+    }
+    return entry;
 }
 
 void* HandleTable::getObject(uint64_t handle, HandleType expectedType, uint32_t requiredRights) {
@@ -119,14 +188,15 @@ uint64_t HandleTable::duplicate(uint64_t handle) {
     if (!entry || !(entry->rights & HandleRightDuplicate)) {
         return static_cast<uint64_t>(-1);
     }
+    const HandleEntry copy = *entry;
 
-    if (entry->retain) {
-        entry->retain(entry->object);
+    if (copy.retain) {
+        copy.retain(copy.object);
     }
 
-    uint64_t newHandle = allocate(entry->type, entry->rights, entry->object, entry->retain, entry->release);
-    if (newHandle == static_cast<uint64_t>(-1) && entry->release) {
-        entry->release(entry->object);
+    uint64_t newHandle = allocate(copy.type, copy.rights, copy.object, copy.retain, copy.release);
+    if (newHandle == static_cast<uint64_t>(-1) && copy.release) {
+        copy.release(copy.object);
     }
 
     return newHandle;
@@ -156,21 +226,27 @@ bool HandleTable::duplicateTo(uint64_t oldHandle, uint64_t newHandle) {
     if (!decodeHandle(newHandle, &newType, &newSlot) || newType != entry->type) {
         return false;
     }
-
-    if (entry->retain) {
-        entry->retain(entry->object);
+    const HandleEntry copy = *entry;
+    HandleEntry* target = makeSlot(newSlot);
+    if (!target) {
+        return false;
     }
 
-    if (entries[newSlot].type != HandleType::None) {
-        close(newHandle);
+    if (copy.retain) {
+        copy.retain(copy.object);
     }
 
-    entries[newSlot].type = entry->type;
-    entries[newSlot].rights = entry->rights;
-    entries[newSlot].object = entry->object;
-    entries[newSlot].retain = entry->retain;
-    entries[newSlot].release = entry->release;
-    entries[newSlot].closeOnExec = false;
+    if (target->type != HandleType::None) {
+        close(encodeHandle(target->type, newSlot));
+    }
+
+    target->type = copy.type;
+    target->rights = copy.rights;
+    target->object = copy.object;
+    target->retain = copy.retain;
+    target->release = copy.release;
+    target->closeOnExec = false;
+    open++;
     return true;
 }
 
@@ -186,7 +262,8 @@ bool HandleTable::duplicateTo(uint64_t oldHandle, uint64_t newHandle, HandleType
         return false;
     }
 
-    if (entries[newSlot].type != HandleType::None && entries[newSlot].type != expectedType) {
+    const HandleEntry* target = slotEntry(newSlot);
+    if (target && target->type != HandleType::None && target->type != expectedType) {
         return false;
     }
 
@@ -214,47 +291,61 @@ bool HandleTable::setCloseOnExec(uint64_t handle, bool enabled) {
 }
 
 void HandleTable::closeOnExecHandles() {
-    for (int slot = 0; slot < MaxHandles; slot++) {
-        if (entries[slot].type != HandleType::None && entries[slot].closeOnExec) {
-            close(encodeHandle(entries[slot].type, slot));
+    for (int c = 0; c < MaxChunks; c++) {
+        if (!chunks[c]) continue;
+        for (int i = 0; i < ChunkSlots; i++) {
+            const HandleEntry& entry = chunks[c][i];
+            if (entry.type != HandleType::None && entry.closeOnExec) {
+                close(encodeHandle(entry.type, c * ChunkSlots + i));
+            }
         }
     }
 }
 
 void HandleTable::cloneFrom(const HandleTable& source, bool skipCloseOnExec, bool filesOnly) {
-    for (int slot = 0; slot < MaxHandles; slot++) {
-        const HandleEntry& src = source.entries[slot];
-        if (src.type == HandleType::None || !src.object) {
-            continue;
-        }
-        if (skipCloseOnExec && src.closeOnExec) {
-            continue;
-        }
-        if (filesOnly && src.type != HandleType::File && src.type != HandleType::Pipe &&
-            src.type != HandleType::Socket) {
-            continue;
-        }
+    nofileSoft = source.nofileSoft;
+    nofileHard = source.nofileHard;
+    for (int c = 0; c < MaxChunks; c++) {
+        if (!source.chunks[c]) continue;
+        for (int i = 0; i < ChunkSlots; i++) {
+            const HandleEntry& src = source.chunks[c][i];
+            const int slot = c * ChunkSlots + i;
+            if (src.type == HandleType::None || !src.object) {
+                continue;
+            }
+            if (skipCloseOnExec && src.closeOnExec) {
+                continue;
+            }
+            if (filesOnly && src.type != HandleType::File && src.type != HandleType::Pipe &&
+                src.type != HandleType::Socket) {
+                continue;
+            }
+            HandleEntry* dst = makeSlot(slot);
+            if (!dst) {
+                continue;   // out of memory: the child goes without it
+            }
 
-        // Bump the underlying object's refcount so both tables share it.
-        if (src.retain) {
-            src.retain(src.object);
-        }
+            // Bump the underlying object's refcount so both tables share it.
+            if (src.retain) {
+                src.retain(src.object);
+            }
 
-        if (entries[slot].type != HandleType::None) {
-            releaseEntry(entries[slot]);
-            clearEntry(slot);
+            if (dst->type != HandleType::None) {
+                close(encodeHandle(dst->type, slot));
+            }
+            dst->type = src.type;
+            dst->rights = src.rights;
+            dst->object = src.object;
+            dst->retain = src.retain;
+            dst->release = src.release;
+            dst->closeOnExec = src.closeOnExec;
+            open++;
         }
-        entries[slot].type = src.type;
-        entries[slot].rights = src.rights;
-        entries[slot].object = src.object;
-        entries[slot].retain = src.retain;
-        entries[slot].release = src.release;
-        entries[slot].closeOnExec = src.closeOnExec;
     }
 }
 
 uint64_t HandleTable::encodeHandle(HandleType type, int slot) {
-    if (type == HandleType::None || slot >= MaxHandles) {
+    if (type == HandleType::None || slot < 0 || slot >= MaxHandles) {
         return static_cast<uint64_t>(-1);
     }
     // File handles may occupy the reserved stdio slots 0/1/2 so that POSIX
@@ -297,12 +388,22 @@ bool HandleTable::isValidSlot(int slot) const {
 }
 
 void HandleTable::clearEntry(int slot) {
-    entries[slot].type = HandleType::None;
-    entries[slot].rights = HandleRightNone;
-    entries[slot].object = nullptr;
-    entries[slot].retain = nullptr;
-    entries[slot].release = nullptr;
-    entries[slot].closeOnExec = false;
+    HandleEntry* entry = slotEntry(slot);
+    if (!entry) {
+        return;
+    }
+    if (entry->type != HandleType::None) {
+        open--;
+        if (slot < searchFrom && slot >= FirstAllocHandle) {
+            searchFrom = slot;
+        }
+    }
+    entry->type = HandleType::None;
+    entry->rights = HandleRightNone;
+    entry->object = nullptr;
+    entry->retain = nullptr;
+    entry->release = nullptr;
+    entry->closeOnExec = false;
 }
 
 void HandleTable::releaseEntry(HandleEntry& entry) {

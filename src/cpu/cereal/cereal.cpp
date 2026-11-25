@@ -78,7 +78,11 @@ void Cereal::unlock(uint64_t flags) {
 }
 
 void Cereal::putRaw(char c) {
-    while (!isTransmitEmpty());
+    if (txRoom == 0) {
+        while (!isTransmitEmpty());
+        txRoom = 16;
+    }
+    --txRoom;
     outb(COM1, c);
 }
 

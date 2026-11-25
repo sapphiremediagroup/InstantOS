@@ -66,7 +66,7 @@ public:
 // hardware is present and that initializes successfully).
 class NetDeviceRegistry {
 public:
-    static constexpr size_t MAX_DEVICES = 8;
+    static constexpr size_t MAX_DEVICES = 16;
 
     // Register a driver instance.  Called from each driver's static
     // self-registration.  Safe to call before any device is initialized.

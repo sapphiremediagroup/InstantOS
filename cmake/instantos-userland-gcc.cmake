@@ -8,7 +8,12 @@
 set(CMAKE_SYSTEM_NAME Linux)
 set(CMAKE_SYSTEM_PROCESSOR x86_64)
 
-set(_GCC_PREFIX "/home/sky/gcc-port/gcc-install/bin/x86_64-unknown-instantos-")
+if(DEFINED ENV{GCC_PORT_DIR})
+  set(_GCC_PORT_DIR "$ENV{GCC_PORT_DIR}")
+else()
+  set(_GCC_PORT_DIR "$ENV{HOME}/gcc-port")
+endif()
+set(_GCC_PREFIX "${_GCC_PORT_DIR}/gcc-install/bin/x86_64-unknown-instantos-")
 set(CMAKE_C_COMPILER   "${_GCC_PREFIX}gcc")
 set(CMAKE_CXX_COMPILER "${_GCC_PREFIX}g++")
 set(CMAKE_ASM_COMPILER "${_GCC_PREFIX}gcc")

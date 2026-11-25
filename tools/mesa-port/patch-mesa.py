@@ -40,10 +40,11 @@ fix("clc-llvm20", "src/compiler/clc/clc_helpers.cpp",
                            &c->getDiagnosticOpts()));
 #endif""")
 
-# Futexes on InstantOS (__instantos__): the kernel has none yet, so a wait
-# yields until the word changes or the absolute CLOCK_MONOTONIC deadline
-# passes, and a wake does nothing (mlibc's own futex sysdeps do the same).
-# anv's block pool calls futex_wait/futex_wake directly.
+# Futexes on InstantOS (__instantos__): <instantos/futex.h>, whose timeout is
+# relative where Mesa's is an absolute CLOCK_MONOTONIC time. As on Linux, -1 and
+# errno on failure: util_queue's fences look for that. anv's block pool calls
+# futex_wait/futex_wake directly. (A tree with the earlier, polling version is
+# brought up to date.)
 fix("futex-supported", "src/util/futex.h",
     """#elif defined(__FreeBSD__)
 #define UTIL_FUTEX_SUPPORTED 1""",
@@ -51,42 +52,58 @@ fix("futex-supported", "src/util/futex.h",
 #define UTIL_FUTEX_SUPPORTED 1
 #elif defined(__FreeBSD__)
 #define UTIL_FUTEX_SUPPORTED 1""")
-fix("futex-instantos", "src/util/futex.c",
-    """#if UTIL_FUTEX_SUPPORTED
-
-#if defined(HAVE_LINUX_FUTEX_H)
-""",
-    """#if UTIL_FUTEX_SUPPORTED
+FUTEX_INSTANTOS = """#if UTIL_FUTEX_SUPPORTED
 
 #if defined(__instantos__)
 
-#include <sched.h>
+#include <instantos/futex.h>
 #include <time.h>
 
 int futex_wake(uint32_t *addr, int32_t count)
 {
-   (void)addr;
-   (void)count;
-   return 0;   /* the waiters poll */
+   return instantos_futex_wake(addr, count);
 }
 
 int futex_wait(uint32_t *addr, int32_t value, const struct timespec *timeout)
 {
-   while (__atomic_load_n(addr, __ATOMIC_ACQUIRE) == (uint32_t)value) {
-      if (timeout) {
-         struct timespec now;
-         clock_gettime(CLOCK_MONOTONIC, &now);
-         if (now.tv_sec > timeout->tv_sec ||
-             (now.tv_sec == timeout->tv_sec && now.tv_nsec >= timeout->tv_nsec))
-            return ETIMEDOUT;
+   struct timespec rel;
+   if (timeout) {
+      struct timespec now;
+      clock_gettime(CLOCK_MONOTONIC, &now);
+      rel.tv_sec = timeout->tv_sec - now.tv_sec;
+      rel.tv_nsec = timeout->tv_nsec - now.tv_nsec;
+      if (rel.tv_nsec < 0) {
+         rel.tv_sec--;
+         rel.tv_nsec += 1000000000;
       }
-      sched_yield();
+      if (rel.tv_sec < 0) {
+         rel.tv_sec = 0;
+         rel.tv_nsec = 0;
+      }
+   }
+   int e = instantos_futex_wait(addr, (uint32_t)value, timeout ? &rel : NULL);
+   if (e) {
+      errno = e;
+      return -1;
    }
    return 0;
 }
 
 #elif defined(HAVE_LINUX_FUTEX_H)
-""")
+"""
+futex_c = ROOT / "src/util/futex.c"
+text = futex_c.read_text(encoding="utf-8")
+if "#if defined(__instantos__)" in text and "instantos/futex.h" not in text:
+    start = text.index("#if UTIL_FUTEX_SUPPORTED\n")
+    end = text.index("#elif defined(HAVE_LINUX_FUTEX_H)\n")
+    futex_c.write_text(text[:start] + FUTEX_INSTANTOS + text[end + len("#elif defined(HAVE_LINUX_FUTEX_H)\n"):],
+                       encoding="utf-8")
+    applied.append("futex-instantos (update)")
+fix("futex-instantos", "src/util/futex.c",
+    """#if UTIL_FUTEX_SUPPORTED
+
+#if defined(HAVE_LINUX_FUTEX_H)
+""", FUTEX_INSTANTOS)
 fix("futex-errno", "src/util/futex.c",
     """#include "util/futex.h"
 """,

@@ -13,8 +13,18 @@ extern "C" void processTrampoline();
 namespace {
 constexpr uint64_t USER_ELF_BASE = 0x0000400000000000ULL;
 constexpr uint64_t USER_INTERP_BASE = 0x0000500000000000ULL;
-constexpr uint64_t MAX_USER_ELF_SIZE = 256 * 1024 * 1024;
-constexpr int MAX_ARG_ENV = 128;
+// A sanity bound on the file only: exec reads the headers and the PT_LOAD
+// bytes, never the rest, so debug info costs nothing. gcc's bootstrap builds
+// stage2 with -gtoggle (debug on), and its cc1/cc1plus are 280-300 MiB (P7.2).
+// What a non-PIE image may map is bounded separately (kExecImageEnd).
+constexpr uint64_t MAX_USER_ELF_SIZE = 2ULL * 1024 * 1024 * 1024;
+// A non-PIE (ET_EXEC) image is mapped where its headers say; one placed in the
+// low identity map (gcc's cc1 at 0x400000) must end below the window kernel
+// memory stays out of.
+constexpr uint64_t kExecImageEnd = PMM::KERNEL_HIGH_ALLOC_MIN;
+constexpr int MAX_ARG_ENV = ProcessExecutor::kMaxArgEnv;
+// Strings and pointer tables must leave the program this much of its stack.
+constexpr uint64_t kMinStackLeft = 32 * 1024;
 constexpr int MAX_SHEBANG_DEPTH = 4;   // guard against #! interpreter loops
 constexpr size_t SHEBANG_LINE_MAX = 255;
 
@@ -44,27 +54,62 @@ void assignUserProcessPriority(Process* proc, const char* path) {
     }
 }
 
-void freeBinaryBuffer(void* buffer, size_t size) {
-    if (!buffer || size == 0) {
-        return;
-    }
+// Where an ELF image's bytes come from: a buffer in memory (a kernel pointer
+// through the direct map) or an open file. Images are read from the file piece
+// by piece, straight into the frames that will hold them: cc1 is 36 MB, and
+// after hours of a build physical memory has no contiguous run that large
+// for a whole-file buffer (exec then failed with "invalid ELF image").
+struct ElfSource {
+    const uint8_t* mem = nullptr;
+    FileDescriptor* fd = nullptr;
+    uint64_t size = 0;
 
-    const uint64_t pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
-    PMM::FreeFrames(reinterpret_cast<uint64_t>(buffer), pages);
+    bool read(uint64_t offset, void* dst, uint64_t len) const {
+        uint64_t end = 0;
+        if (!checkedAdd(offset, len, &end) || end > size) {
+            return false;
+        }
+        if (mem) {
+            memcpy(dst, mem + offset, len);
+            return true;
+        }
+        uint8_t* out = static_cast<uint8_t*>(dst);
+        fd->setOffset(offset);
+        while (len > 0) {
+            const int64_t got = VFS::get().read(fd, out, len);
+            if (got <= 0) {
+                return false;
+            }
+            out += got;
+            len -= static_cast<uint64_t>(got);
+        }
+        return true;
+    }
+};
+
+// Opens `path` as an image source. The caller closes src->fd.
+bool openElfSource(const char* path, ElfSource* src) {
+    FileDescriptor* fd = nullptr;
+    if (VFS::get().open(path, 0, &fd) != 0 || !fd) {
+        return false;
+    }
+    FileStats stats;
+    if (fd->getNode()->ops->stat(fd->getNode(), &stats) != 0 || stats.size == 0 ||
+        stats.size > MAX_USER_ELF_SIZE) {
+        VFS::get().close(fd);
+        return false;
+    }
+    src->mem = nullptr;
+    src->fd = fd;
+    src->size = stats.size;
+    return true;
 }
 
-void* allocateBinaryBuffer(size_t size) {
-    if (size == 0 || size > MAX_USER_ELF_SIZE) {
-        return nullptr;
+void closeElfSource(ElfSource* src) {
+    if (src->fd) {
+        VFS::get().close(src->fd);
+        src->fd = nullptr;
     }
-
-    const uint64_t pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
-    const uint64_t phys = PMM::AllocFrames(pages);
-    if (!phys) {
-        return nullptr;
-    }
-
-    return reinterpret_cast<void*>(phys);
 }
 
 bool copyIntoProcess(PageTable* pageTable, uint64_t dest, const void* source, size_t size) {
@@ -153,32 +198,48 @@ bool validateElfHeader(const void* image, size_t imageSize, const Elf::Header64*
     return true;
 }
 
-bool loadElfImage(Process* proc, const void* image, size_t imageSize, uint64_t dynamicBase,
+// Frames are allocated in runs of up to this many pages, a page at a time when
+// no run that long is free, so a large segment needs no contiguous memory.
+constexpr uint64_t kSegmentRunPages = 256;
+
+bool loadElfImage(Process* proc, const ElfSource& src, uint64_t dynamicBase,
                   bool allowInterpreter, LoadedElfImage* loaded) {
-    if (!proc || !loaded || !image) {
+    if (!proc || !loaded) {
         return false;
     }
 
-    // The image buffer is a physical (identity) allocation from readWholeFile.
-    // Read it through the higher-half direct map: loadElfImage runs in the
-    // calling process's address space, which may itself be a non-PIE (ET_EXEC)
-    // image mapped low (0x400000). Such an image shadows the buffer's identity
-    // VA, so an identity read of the ELF header / program headers here would
-    // parse the user image instead of the buffer (observed as a spurious
-    // "invalid ELF interpreter" when gcc exec'd cc1).
-    const uint8_t* bytes = reinterpret_cast<const uint8_t*>(
-        VMM::PhysToVirt(reinterpret_cast<uint64_t>(image)));
+    // Everything is written through the higher-half direct map, never a frame's
+    // low identity address: this runs in the calling process's address space,
+    // which may be a non-PIE (ET_EXEC) image mapped low (0x400000) that shadows
+    // those identity addresses (seen as a spurious "invalid ELF interpreter"
+    // when gcc exec'd cc1).
+    Elf::Header64 headerCopy;
+    if (!src.read(0, &headerCopy, sizeof(headerCopy))) {
+        return false;
+    }
     const Elf::Header64* header = nullptr;
-    if (!validateElfHeader(bytes, imageSize, &header)) {
+    if (!validateElfHeader(&headerCopy, src.size, &header)) {
         return false;
     }
 
-    const auto* phdrs = reinterpret_cast<const Elf::ProgramHeader64*>(bytes + header->programHeaderOffset);
+    const uint16_t phCount = header->programHeaderCount;
+    Elf::ProgramHeader64* phdrs = new Elf::ProgramHeader64[phCount];
+    if (!phdrs) {
+        return false;
+    }
+    struct FreePhdrs {
+        Elf::ProgramHeader64* p;
+        ~FreePhdrs() { delete[] p; }
+    } freePhdrs{phdrs};
+    if (!src.read(header->programHeaderOffset, phdrs, sizeof(Elf::ProgramHeader64) * phCount)) {
+        return false;
+    }
+
     const uint64_t loadBias = header->type == Elf::TypeDynamic ? dynamicBase : 0;
     PageTable* pageTable = proc->getPageTable();
     uint64_t phdrAddress = 0;
 
-    for (uint16_t i = 0; i < header->programHeaderCount; ++i) {
+    for (uint16_t i = 0; i < phCount; ++i) {
         const Elf::ProgramHeader64& ph = phdrs[i];
 
         if (ph.type == Elf::ProgramPhdr) {
@@ -189,14 +250,10 @@ bool loadElfImage(Process* proc, const void* image, size_t imageSize, uint64_t d
             if (!allowInterpreter || ph.fileSize == 0 || ph.fileSize >= sizeof(loaded->interpreter)) {
                 return false;
             }
-
-            uint64_t end = 0;
-            if (!checkedAdd(ph.offset, ph.fileSize, &end) || end > imageSize) {
+            if (!src.read(ph.offset, loaded->interpreter, ph.fileSize)) {
                 return false;
             }
-
-            memcpy(loaded->interpreter, bytes + ph.offset, ph.fileSize);
-            loaded->interpreter[sizeof(loaded->interpreter) - 1] = '\0';
+            loaded->interpreter[ph.fileSize] = '\0';
             loaded->hasInterpreter = true;
             continue;
         }
@@ -210,7 +267,7 @@ bool loadElfImage(Process* proc, const void* image, size_t imageSize, uint64_t d
         }
 
         uint64_t fileEnd = 0;
-        if (!checkedAdd(ph.offset, ph.fileSize, &fileEnd) || fileEnd > imageSize) {
+        if (!checkedAdd(ph.offset, ph.fileSize, &fileEnd) || fileEnd > src.size) {
             return false;
         }
 
@@ -219,38 +276,55 @@ bool loadElfImage(Process* proc, const void* image, size_t imageSize, uint64_t d
             return false;
         }
 
-        const uint64_t mappedStart = alignDown(segmentStart, PAGE_SIZE);
-        const uint64_t pageOffset = segmentStart - mappedStart;
-        const uint64_t mappedSize = alignUp(pageOffset + ph.memorySize, PAGE_SIZE);
-        const uint64_t pages = mappedSize / PAGE_SIZE;
-        if (pages == 0) {
-            continue;
+        uint64_t segmentEnd = 0;
+        if (!checkedAdd(segmentStart, ph.memorySize, &segmentEnd)) {
+            return false;
         }
-
-        uint64_t phys = PMM::AllocFrames(pages);
-        if (!phys) {
+        // Only an image placed in the window can run into its end; the native
+        // userland's ET_EXEC programs are linked far above it.
+        if (header->type != Elf::TypeDynamic && segmentStart < kExecImageEnd &&
+            segmentEnd > kExecImageEnd) {
+            Console::get().drawText("[PROC] non-PIE image reaches past the low-memory window\n");
             return false;
         }
 
-        // Map the segment into the target address space, then populate the
-        // freshly-allocated destination frames through the higher-half direct
-        // map. Reading the source (`bytes`, also a direct-map alias) and writing
-        // the destination through the direct map makes the copy immune to
-        // identity-map shadowing by a low non-PIE user image in the currently
-        // active address space -- both the source ELF buffer and the destination
-        // frames would otherwise be shadowed. No address-space switch needed.
+        const uint64_t mappedStart = alignDown(segmentStart, PAGE_SIZE);
+        const uint64_t pageOffset = segmentStart - mappedStart;
+        const uint64_t pages = alignUp(pageOffset + ph.memorySize, PAGE_SIZE) / PAGE_SIZE;
         const uint64_t elfFlags = pageFlagsFromElf(ph.flags);
-        VMM::MapRangeInto(pageTable, mappedStart, phys, pages, elfFlags | PageFlags::ReadWrite);
+        // The file's bytes land at [fileStart, fileStop) in the mapping.
+        const uint64_t fileStart = pageOffset;
+        const uint64_t fileStop = pageOffset + ph.fileSize;
 
-        uint8_t* dstBase = reinterpret_cast<uint8_t*>(VMM::PhysToVirt(phys));
-        memset(dstBase, 0, mappedSize);
-        if (ph.fileSize > 0) {
-            memcpy(dstBase + pageOffset, bytes + ph.offset, ph.fileSize);
-        }
+        for (uint64_t done = 0; done < pages;) {
+            uint64_t run = pages - done < kSegmentRunPages ? pages - done : kSegmentRunPages;
+            uint64_t phys = run > 1 ? PMM::AllocFrames(run) : 0;
+            if (!phys) {
+                run = 1;
+                phys = PMM::AllocFrame();
+                if (!phys) {
+                    return false;   // frames mapped so far go with the process
+                }
+            }
 
-        // Re-apply the real protection: drop write for read-only segments.
-        if (!(ph.flags & Elf::FlagWrite)) {
-            VMM::MapRangeInto(pageTable, mappedStart, phys, pages, elfFlags);
+            const uint64_t runVa = mappedStart + done * PAGE_SIZE;
+            VMM::MapRangeInto(pageTable, runVa, phys, run, elfFlags | PageFlags::ReadWrite);
+
+            uint8_t* dst = reinterpret_cast<uint8_t*>(VMM::PhysToVirt(phys));
+            const uint64_t runLo = done * PAGE_SIZE;
+            const uint64_t runHi = runLo + run * PAGE_SIZE;
+            memset(dst, 0, run * PAGE_SIZE);
+            const uint64_t lo = fileStart > runLo ? fileStart : runLo;
+            const uint64_t hi = fileStop < runHi ? fileStop : runHi;
+            if (lo < hi && !src.read(ph.offset + (lo - fileStart), dst + (lo - runLo), hi - lo)) {
+                return false;
+            }
+
+            // Re-apply the real protection: drop write for read-only segments.
+            if (!(ph.flags & Elf::FlagWrite)) {
+                VMM::MapRangeInto(pageTable, runVa, phys, run, elfFlags);
+            }
+            done += run;
         }
     }
 
@@ -263,53 +337,6 @@ bool loadElfImage(Process* proc, const void* image, size_t imageSize, uint64_t d
     loaded->phdr = phdrAddress;
     loaded->phent = header->programHeaderEntrySize;
     loaded->phnum = header->programHeaderCount;
-    return true;
-}
-
-bool readWholeFile(const char* path, void** outBuffer, size_t* outSize) {
-    if (!path || !outBuffer || !outSize) {
-        return false;
-    }
-
-    *outBuffer = nullptr;
-    *outSize = 0;
-
-    FileDescriptor* fd = nullptr;
-    int result = VFS::get().open(path, 0, &fd);
-    if (result != 0 || !fd) {
-        return false;
-    }
-
-    FileStats stats;
-    if (fd->getNode()->ops->stat(fd->getNode(), &stats) != 0 || stats.size == 0) {
-        VFS::get().close(fd);
-        return false;
-    }
-
-    void* buffer = allocateBinaryBuffer(stats.size);
-    if (!buffer) {
-        VFS::get().close(fd);
-        return false;
-    }
-
-    // Fill the buffer through the higher-half direct map, not its low identity
-    // address: this runs in the spawning/exec'ing process's address space, which
-    // may itself be a non-PIE (ET_EXEC) image mapped low (0x400000). Such an
-    // image shadows the identity VA of the buffer's frames, so a plain identity
-    // write would scribble on the user image instead of the buffer. The caller
-    // still receives the physical pointer (loadElfImage reads it with the kernel
-    // address space active, freeBinaryBuffer frees it by physical address).
-    void* readDest = reinterpret_cast<void*>(VMM::PhysToVirt(reinterpret_cast<uint64_t>(buffer)));
-    const int64_t readBytes = VFS::get().read(fd, readDest, stats.size);
-    VFS::get().close(fd);
-
-    if (readBytes != static_cast<int64_t>(stats.size)) {
-        freeBinaryBuffer(buffer, stats.size);
-        return false;
-    }
-
-    *outBuffer = buffer;
-    *outSize = stats.size;
     return true;
 }
 
@@ -378,11 +405,39 @@ bool setupInitialStack(Process* proc, const char* execPath, const InitialStackIn
 
     PageTable* pageTable = proc->getPageTable();
     uint64_t stack = proc->getUserStackBase() + proc->getUserStackSize();
-    uint64_t argvAddrs[MAX_ARG_ENV] = {};
-    uint64_t envAddrs[MAX_ARG_ENV] = {};
 
     const char* path = execPath ? execPath : "";
     const size_t pathLen = strlen(path) + 1;
+
+    // Everything below must fit in the user stack with room to run.
+    size_t needed = pathLen + 64 + static_cast<size_t>(argc + envc + 32) * sizeof(uint64_t) * 2;
+    for (int i = 0; i < envc; ++i) needed += (envp && envp[i] ? strlen(envp[i]) : 0) + 1;
+    for (int i = 0; i < argc; ++i) needed += (argv && argv[i] ? strlen(argv[i]) : 0) + 1;
+    if (needed > ProcessExecutor::kMaxArgBytes) {
+        Console::get().drawText("[PROC] exec refused: argv + envp over 2 MiB\n");
+        return false;
+    }
+    // Beyond the mapped top of the stack the strings go into its demand-paged
+    // reserve (Process ctor); copyIntoProcess needs those pages present.
+    const uint64_t lowest = alignDown(stack - needed - kMinStackLeft, PAGE_SIZE);
+    for (uint64_t va = lowest; va < proc->getUserStackBase(); va += PAGE_SIZE) {
+        if (!proc->handleDemandFault(va)) {
+            Console::get().drawText("[PROC] exec refused: no stack for argv + envp\n");
+            return false;
+        }
+    }
+
+    // On the heap: the kernel stack is 16 KiB.
+    uint64_t* argvAddrs = new uint64_t[argc + envc + 1];
+    if (!argvAddrs) {
+        return false;
+    }
+    uint64_t* envAddrs = argvAddrs + argc;
+    struct FreeAddrs {
+        uint64_t* p;
+        ~FreeAddrs() { delete[] p; }
+    } freeAddrs{argvAddrs};
+
     stack -= pathLen;
     const uint64_t execFnAddress = stack;
     if (!copyIntoProcess(pageTable, execFnAddress, path, pathLen)) {
@@ -523,8 +578,9 @@ Process* ProcessExecutor::createUserProcessWithCode(void* code, size_t codeSize)
     return createUserProcessWithArgs(code, codeSize, 1, argv, 0, nullptr, "<memory>");
 }
 
-Process* ProcessExecutor::createUserProcessWithArgs(void* code, size_t codeSize, int argc, const char** argv,
-                                                    int envc, const char** envp, const char* execPath) {
+namespace {
+Process* createProcessFromSource(const ElfSource& image, int argc, const char** argv,
+                                 int envc, const char** envp, const char* execPath) {
     uint32_t pid = Scheduler::get().allocatePID();
     Process* proc = new Process(pid);
     if (!proc || !proc->getPageTable()) {
@@ -534,8 +590,10 @@ Process* ProcessExecutor::createUserProcessWithArgs(void* code, size_t codeSize,
     proc->setName("<elf>");
 
     LoadedElfImage mainImage;
-    if (!loadElfImage(proc, code, codeSize, USER_ELF_BASE, true, &mainImage)) {
-        Console::get().drawText("[PROC] invalid ELF image\n");
+    if (!loadElfImage(proc, image, USER_ELF_BASE, true, &mainImage)) {
+        Console::get().drawText("[PROC] invalid ELF image or out of memory (free MiB: ");
+        Console::get().drawNumber(static_cast<int64_t>(PMM::FreeMemory() / (1024 * 1024)));
+        Console::get().drawText(")\n");
         delete proc;
         return nullptr;
     }
@@ -544,9 +602,8 @@ Process* ProcessExecutor::createUserProcessWithArgs(void* code, size_t codeSize,
     uint64_t interpreterBase = 0;
 
     if (mainImage.hasInterpreter) {
-        void* interpBuffer = nullptr;
-        size_t interpSize = 0;
-        if (!readWholeFile(mainImage.interpreter, &interpBuffer, &interpSize)) {
+        ElfSource interpSource;
+        if (!openElfSource(mainImage.interpreter, &interpSource)) {
             Console::get().drawText("[PROC] failed to read ELF interpreter: ");
             Console::get().drawText(mainImage.interpreter);
             Console::get().drawText("\n");
@@ -555,16 +612,16 @@ Process* ProcessExecutor::createUserProcessWithArgs(void* code, size_t codeSize,
         }
 
         LoadedElfImage interpreter;
-        if (!loadElfImage(proc, interpBuffer, interpSize, USER_INTERP_BASE, false, &interpreter)) {
-            Console::get().drawText("[PROC] invalid ELF interpreter\n");
-            freeBinaryBuffer(interpBuffer, interpSize);
+        const bool ok = loadElfImage(proc, interpSource, USER_INTERP_BASE, false, &interpreter);
+        closeElfSource(&interpSource);
+        if (!ok) {
+            Console::get().drawText("[PROC] invalid ELF interpreter or out of memory\n");
             delete proc;
             return nullptr;
         }
 
         startEntry = interpreter.entry;
         interpreterBase = interpreter.base;
-        freeBinaryBuffer(interpBuffer, interpSize);
     }
 
     initializeTrampoline(proc, startEntry);
@@ -585,6 +642,19 @@ Process* ProcessExecutor::createUserProcessWithArgs(void* code, size_t codeSize,
 
     return proc;
 }
+}
+
+// `code` is a physical (identity) address, read through the direct map.
+Process* ProcessExecutor::createUserProcessWithArgs(void* code, size_t codeSize, int argc, const char** argv,
+                                                    int envc, const char** envp, const char* execPath) {
+    if (!code || codeSize == 0) {
+        return nullptr;
+    }
+    ElfSource source;
+    source.mem = reinterpret_cast<const uint8_t*>(VMM::PhysToVirt(reinterpret_cast<uint64_t>(code)));
+    source.size = codeSize;
+    return createProcessFromSource(source, argc, argv, envc, envp, execPath);
+}
 
 Process* ProcessExecutor::loadUserBinary(const char* path) {
     const char* argv[] = { path, nullptr };
@@ -599,7 +669,16 @@ Process* ProcessExecutor::loadUserBinaryWithArgs(const char* path, int argc, con
 
     // Working argv, seeded from the caller. Rewritten in place by each level of
     // "#!" resolution: argv := [interp, optional-arg, scriptpath, oldargv[1..]].
-    const char* curArgv[MAX_ARG_ENV + 1];
+    // Both vectors live on the heap: the kernel stack is 16 KiB.
+    const char** curArgv = new const char*[2 * (MAX_ARG_ENV + 1)];
+    if (!curArgv) {
+        return nullptr;
+    }
+    const char** oldArgv = curArgv + MAX_ARG_ENV + 1;
+    struct FreeArgv {
+        const char** p;
+        ~FreeArgv() { delete[] p; }
+    } freeArgv{curArgv};
     int curArgc = 0;
     if (argc <= 0 || !argv) {
         curArgv[curArgc++] = path;
@@ -615,13 +694,12 @@ Process* ProcessExecutor::loadUserBinaryWithArgs(const char* path, int argc, con
     int ownedCount = 0;
 
     const char* curPath = path;
-    void* buffer = nullptr;
-    size_t size = 0;
+    ElfSource source;
     Process* proc = nullptr;
     bool haveElf = false;
 
     for (int depth = 0; depth <= MAX_SHEBANG_DEPTH; ++depth) {
-        if (!readWholeFile(curPath, &buffer, &size)) {
+        if (!openElfSource(curPath, &source)) {
             Console::get().drawText("[PROC] failed to read user binary: ");
             Console::get().drawText(curPath);
             Console::get().drawText("\n");
@@ -630,20 +708,21 @@ Process* ProcessExecutor::loadUserBinaryWithArgs(const char* path, int argc, con
 
         char interp[256];
         char shArg[256];
-        // Inspect the buffer through the higher-half direct map: this runs in
-        // the calling process's address space, which may be a non-PIE image
-        // mapped low whose mapping shadows the buffer's identity VA (see
-        // loadElfImage / readWholeFile). A raw identity read here would sniff
-        // the user image's bytes instead of the file's first line.
-        const void* shBuf = reinterpret_cast<const void*>(
-            VMM::PhysToVirt(reinterpret_cast<uint64_t>(buffer)));
-        if (!parseShebang(shBuf, size, interp, sizeof(interp), shArg, sizeof(shArg))) {
-            haveElf = true; // `buffer` is a real image to load
+        char firstLine[SHEBANG_LINE_MAX];
+        const uint64_t lineBytes = source.size < sizeof(firstLine) ? source.size : sizeof(firstLine);
+        if (!source.read(0, firstLine, lineBytes)) {
+            Console::get().drawText("[PROC] failed to read user binary: ");
+            Console::get().drawText(curPath);
+            Console::get().drawText("\n");
+            closeElfSource(&source);
+            break;
+        }
+        if (!parseShebang(firstLine, lineBytes, interp, sizeof(interp), shArg, sizeof(shArg))) {
+            haveElf = true; // `source` is a real image to load
             break;
         }
 
-        freeBinaryBuffer(buffer, size);
-        buffer = nullptr;
+        closeElfSource(&source);
 
         if (depth == MAX_SHEBANG_DEPTH ||
             ownedCount + 3 > static_cast<int>(sizeof(owned) / sizeof(owned[0]))) {
@@ -664,7 +743,6 @@ Process* ProcessExecutor::loadUserBinaryWithArgs(const char* path, int argc, con
         owned[ownedCount++] = scriptCopy;
         if (argCopy) owned[ownedCount++] = argCopy;
 
-        const char* oldArgv[MAX_ARG_ENV + 1];
         const int oldArgc = curArgc;
         for (int i = 0; i < oldArgc; ++i) oldArgv[i] = curArgv[i];
 
@@ -679,11 +757,46 @@ Process* ProcessExecutor::loadUserBinaryWithArgs(const char* path, int argc, con
         curPath = interpCopy; // loop and load the interpreter
     }
 
-    if (haveElf && buffer) {
-        proc = createUserProcessWithArgs(buffer, size, curArgc, curArgv, envc, envp, path);
+    if (haveElf) {
+        proc = createProcessFromSource(source, curArgc, curArgv, envc, envp, path);
         if (proc) {
             proc->setName(path);
             assignUserProcessPriority(proc, path);
+            // Memory over a long build (P7.1: is something leaking?).
+            static uint64_t s_execs = 0;
+            if ((++s_execs & 255) == 0) {
+                const HeapStats hs = heap_stats();
+                Console::get().drawText("[mem] execs=");
+                Console::get().drawNumber(static_cast<int64_t>(s_execs));
+                Console::get().drawText(" free MiB=");
+                Console::get().drawNumber(static_cast<int64_t>(PMM::FreeMemory() >> 20));
+                Console::get().drawText(" heap used MiB=");
+                Console::get().drawNumber(static_cast<int64_t>(hs.total_allocated >> 20));
+                Console::get().drawText(" arenas=");
+                Console::get().drawNumber(heap_arena_count());
+                Console::get().drawText(" low=");
+                Console::get().drawNumber(heap_low_arena_count());
+                Console::get().drawText(" spaces=");
+                Console::get().drawNumber(g_liveSharedStates);
+                Console::get().drawText(" tables=");
+                Console::get().drawNumber(VMM::liveTables);
+                Console::get().drawText("\n");
+                if ((s_execs & 16383) == 0) {   // live heap blocks by caller, mmap-heavy processes
+                    heap_dump_callers(12);
+                    for (Process* p = Scheduler::get().getAllProcessesHead(); p; p = p->allNext) {
+                        const uint64_t regions = p->mmapRegionCount();
+                        if (regions >= 64) {
+                            Console::get().drawText("[heap] regions=");
+                            Console::get().drawNumber(static_cast<int64_t>(regions));
+                            Console::get().drawText(" pid=");
+                            Console::get().drawNumber(static_cast<int64_t>(p->getPID()));
+                            Console::get().drawText(" ");
+                            Console::get().drawText(p->getName());
+                            Console::get().drawText("\n");
+                        }
+                    }
+                }
+            }
         } else {
             Console::get().drawText("[PROC] create ELF process failed path=");
             Console::get().drawText(path);
@@ -691,9 +804,7 @@ Process* ProcessExecutor::loadUserBinaryWithArgs(const char* path, int argc, con
         }
     }
 
-    if (buffer) {
-        freeBinaryBuffer(buffer, size);
-    }
+    closeElfSource(&source);
     for (int i = 0; i < ownedCount; ++i) {
         delete[] owned[i];
     }

@@ -96,7 +96,7 @@ and the userland syscall header:
 | 18 | `FBInfo` | `fb_info` | `FBInfo* info` | `0` or `-1` | Fills the screen geometry, pitch, format and masks for anyone; only `/bin/graphics-compositor` also gets the framebuffer mapped (`addr`, else 0). |
 | 19 | `FBMap` | `fb_map` | none | framebuffer user address or `-1` | Restricted to `/bin/graphics-compositor`. Maps framebuffer at the fixed user framebuffer base. |
 | 20 | `Signal` | `signal` | `uint64_t sig, sighandler_t handler` | old handler or `-errno` | Compatibility handler install for `sig < NSIG`; rejects `SIGKILL` and clears the per-signal mask/flags. |
-| 21 | `SigReturn` | `sigreturn` | none | `0` or `-errno` | Restores saved `rip`, previous blocked signal mask, and advances `rsp` by 128 bytes after signal delivery. |
+| 21 | `SigReturn` | `sigreturn` (the restorer) | none (`rsp` at the frame's `ucontext_t`) | the restored `rax` | Puts back everything in the `ucontext_t` at `rsp`: every general register, `rip`, `rsp`, the user flags, the mask (`uc_sigmask`) and the vector state at `uc_mcontext.fpregs`; the syscall then returns by `iretq`. A frame with a `rip` or `rsp` outside user space kills the process with `SIGSEGV`. |
 | 22 | `Login` | `login` | `const LoginInfo* info` | session id or `-1` | Authenticates username/password, creates or updates the caller's session, UID, and GID. |
 | 23 | `Logout` | `logout` | `uint64_t session_id` | `0` or `-1` | Destroys a session if owned by the caller or caller is privileged. Clears caller credentials if logging out of its own session. |
 | 24 | `GetUID` | `getuid` | none | uid or `-1` | Returns the current process UID. |
@@ -209,9 +209,27 @@ and the userland syscall header:
 | 149 | `SetUnixTime` | `clock_settime` / `settimeofday` (sntp) | `uint64_t unix_ns` | `0` or `-errno` | Sets the wall clock (root only, else `-EPERM`); `-EINVAL` for a time before boot. Monotonic time and timers are unaffected, and the RTC is not written. |
 | 150 | `WindowPostEvent` | `window_post_event` | `uint64_t windowId, const Event* event` | `0` or `-1` | Compositor only: queues a pointer or key event on that window's event queue. The compositor routes the pointer this way (the kernel only sends it the screen position): to the window under it, or to the one a press in its content started, with coordinates relative to the content area. |
 | 151 | `KernelLog` | `dmesg` | `char* buffer, uint64_t length` | bytes copied or `-errno` | The newest `length` bytes (at most 128 KiB) of the kernel log, oldest first: everything the kernel writes to the serial port, kept in a ring whether or not the machine has one. |
-| 153 | `Reboot` | `reboot` (`/bin/reboot`, `/bin/poweroff`) | `RebootMode mode` | only `-errno` | Root only (`-EPERM`). Flushes every AHCI drive's write cache, then restarts (`Restart`: the FADT reset register, the keyboard controller, port 0xCF9, a triple fault, in turn) or powers off (`PowerOff`: ACPI S5, restarting if that does not take). |
+| 153 | `Reboot` | `reboot` (`/bin/reboot`, `/bin/poweroff`) | `RebootMode mode` | only `-errno` | Root only (`-EPERM`). Commits every ext4 volume's running transaction and flushes every AHCI drive's write cache, then restarts (`Restart`: the FADT reset register, the keyboard controller, port 0xCF9, a triple fault, in turn) or powers off (`PowerOff`: ACPI S5, restarting if that does not take). |
 | 154 | `Display` | `display` (graphics-compositor) | `DisplayCommand command, u64 arg` | `0` or `-errno` | The graphics-compositor only (`-EPERM`). Tear-free presentation on the Intel Gen9 display: `Acquire` (arg `DisplayBuffersInfo*`) maps two screen-sized scanout buffers write-combining into the caller (`address[]`, `width`, `height`, `pitch` in bytes); `Flip` (arg: buffer index) points plane A at one from the next vertical blank and returns at once; `Wait` (arg: timeout ms, at most 1000) sleeps until the last flip is on screen (`-ETIMEDOUT`); `Release` puts the firmware's framebuffer back on screen (also done when the owner exits, and by panic/watchdog paths). Without the Intel display `-ENODEV`, unless `Acquire` is passed `flags = kDisplayEmulated`: then the buffers are RAM and a flip copies one to the framebuffer (for testing the compositor in QEMU). |
 | 152 | `GpuTest` | `gpu_test` (`/bin/gpu-test`) | `GpuTestCommand command, char* buffer, uint64_t length` | bytes copied or `-errno` | Root only (`-EPERM`); `-ENODEV` without an Intel Gen9 GPU. Runs one experiment on it (`Info`: map the GGTT and report it; `Gtt`: buffer objects, checked through the aperture and the pages; `FlipOn`/`FlipOff`: plane A onto a test pattern and back; `Engine`: the blitter runs MI_STORE_DWORD_IMM and MI_FLUSH_DW's post-sync write; `Hang`: a semaphore wait nobody releases is detected, the engine reset, and the stores run again; `Render`: the stores on the render engine; `Irq`: both engines raise MI_USER_INTERRUPT and the caller sleeps until the GPU's MSI; `Ppgtt`: a batch from a 48-bit per-process address space on each engine) and copies what the kernel logged meanwhile (at most 64 KiB), ending in `[gpu-test] <command>: ok` or `: FAILED`. The engine experiments fail with `-EBUSY` while a program's batch runs. `DrmWithoutGpu` (9) works without the GPU too: from then on `/dev/dri/renderD128` opens anyway (its execbuffer fails with `-ENODEV`), for QEMU checks; it returns 0. `DrmState` (10) reports the request queue without touching the engines: requests run, retired from the interrupt or by a waiter, failed or skipped, time on the engine, forcewake wakes, interrupt counts, and each engine's registers and active request. |
+| 161 | `StorageSync` | storage-manager (`Due`, about once a second) | `StorageSyncMode mode` | `0` or `-errno` | Commits the running transaction of every mounted ext4 volume (`All`), or only those at least `Ext4FS::kCommitMs` (1 s) old (`Due`). The ext4 driver collects the metadata of all write ops in one transaction and commits it once it is that old, nearly full, on `fsync`, or here; `-EIO` if a commit failed. |
+| 162 | `MemBench` | `membench` (`tools/membench`) | `uint64_t spec, uint64_t size, uint64_t reps` | TSC cycles of the best of 5 runs, or `-errno` | Root only (`-EPERM`). Times one of the kernel's memory routines on its own (`memaccel` in `common/string.cpp`): `spec` = op (0 memcpy, 1 memset, 2 memset32, 3 memcmp; 255 returns `cycles_per_us`) \| variant << 8 (0 the dispatch memcpy() & co. use, 1 `rep` string instructions / the byte loop for memcmp, 2 SSE2, 3 AVX2) \| destination offset << 16 \| source offset << 24 (each < 64); `size` up to 8 MiB (memset32: a multiple of 4); `reps` calls per run, at most 2^20. `-ENODEV` when the CPU lacks the variant, `-EIO` when its result is wrong. Interrupts stay off for the whole call, so keep each one short. |
+| 163 | `ModuleList` | `lsmod` | `ModuleInfo* buffer, uint64_t capacity` | how many modules are loaded (copies up to `capacity`), or `-errno` | `ModuleInfo` (`syscall.hpp`): name, version, description, source file, load address, image size, devices taken, relocations, flags (`ModuleInitFailed` 1, `ModuleAtBoot` 2). |
+| 164 | `ModuleLoad` | `modload` | `const char* path` | `0`, or `-errno` | Root only (`-EPERM`). Loads an `.idrv` driver module (`docs/idrv.md`) for the PCI devices its table matches and no other module has taken. `path` must be absolute (`-EINVAL` otherwise, and for a file that is not a module, is damaged, or was built for another driver API version). `-ENOENT` no such file, `-EEXIST` a module of that name is loaded, `-ENODEV` no device for it (it is dropped before its init runs). The kernel log (`[idrv] ...`) says why. |
+| 165 | `PartitionList` | `instant-install` | `PartitionRecord* buffer, uint64_t capacity` | how many partitions there are (copies up to `capacity`), or `-errno` | Every AHCI disk's GPT partitions, scanned at boot (`DiskRegistry`): disk, GPT index, byte range, type and unique GUIDs, name, flags (`PartitionInstantOS` 1: InstantOS's by the mount rule, so it has a `/dev/disk<d>p<i>` node and may be re-typed or mounted; `PartitionEsp` 2; `PartitionMounted` 4). |
+| 166 | `PartitionSetType` | `instant-install` | `uint64_t disk, uint64_t index` | `0`, or `-errno` | Root only. Gives an InstantOS partition (as scanned at boot) the InstantOS data type `9566fa50-...` in both GPT copies, CRCs recomputed. `-EACCES` for another system's partition, `-EBUSY` while mounted. |
+| 167 | `PartitionMount` | `instant-install` | `uint64_t disk, uint64_t index, const char* path` | `0`, or `-errno` | Root only. Mounts an InstantOS partition's ext4 at the absolute `path`. `-EACCES` another system's, `-EBUSY` mounted already, `-EINVAL` not ext4 or a bad path. |
+| 168 | `FutexWait` | mlibc's locks | `uint32_t* address, uint32_t expected, uint64_t timeout_ns` | `0` once woken, or `-errno` | Sleeps until `FutexWake` on the same word, if the word still holds `expected` (`-EAGAIN` otherwise; checked and put to sleep in one step, so no wake is lost). `timeout_ns` is relative, `UINT64_MAX` for none; `-ETIMEDOUT` never early, about 1 ms late (`0` times out at once). `-EINTR` for a signal, `-EINVAL` unless 4-byte aligned, `-EFAULT` for memory the caller cannot read. Waiters are per address space, except on pages shared between processes (`SharedMap`, dma-buf mappings), where the physical word counts; memory that is copy-on-write after `fork` is private. |
+| 169 | `FutexWake` | mlibc's locks | `uint32_t* address, uint64_t count` | how many were woken, or `-errno` | Wakes up to `count` threads waiting on the word, the longest waiting first. The memory need not exist any more. `-EINVAL` unless 4-byte aligned, `-EFAULT` for no user address. |
+| 170 | `GetTgid` | mlibc's `getpid` | none | the process's id | The main thread's pid, in every thread of the process (`GetPID` is the calling thread's own). Children belong to the process: any of its threads may `Wait` for them, and `GetPPID` in a thread is the process's parent. |
+| 171 | `ThreadExitNotify` | mlibc's thread exit | `uint32_t* word` | never | `ThreadExit(0)` after which `*word` is 0 and its futex waiters are woken: the thread runs no more user code, so its stack and TLS can be freed (Linux's `CLONE_CHILD_CLEARTID`). In the main thread it is `Exit(0)`. |
+| 172 | `MemfdCreate` | mlibc's `memfd_create` | `const char* name, uint64_t flags` | a File handle, or `-errno` | A file of shared memory without a name (`include/memory/shared_pages.hpp`). `flags`: 1 close-on-exec, 2 allow sealing (`Fcntl` 1033/1034). It reads, writes, truncates (up to 64 GiB) and maps like a file, is inherited and passed over AF_UNIX sockets; `MAP_SHARED` mappings (`MmapFile`) of it, of RamFS files (`/tmp`, `/dev/shm`) and of `MAP_SHARED\|MAP_ANONYMOUS` memory are the same pages in every process, made as they are touched. Past the end a mapping reads zeros. Writable shared mappings need a writable descriptor (`-EACCES`). Protection `0x100` (`MemoryProtNone`) in `Mmap`/`MmapFile`/`Mprotect` is PROT_NONE: pages not there yet fault. |
+| 173 | `Sigsuspend` | mlibc's `sigsuspend` | `const uint64_t* mask` | `-EINTR` | Sets the mask and sleeps until a signal is to be acted on; the handler's frame keeps the old mask, which comes back when it returns (or at once if no handler runs). |
+| 174 | `Sigpending` | mlibc's `sigpending` | `uint64_t* set` | `0` | The pending signals that are blocked. |
+| 175 | `Sigtimedwait` | mlibc's `sigtimedwait`/`sigwaitinfo`/`sigwait` | `const uint64_t* set, siginfo_t* info, uint64_t timeoutNs` | the signal, or `-EAGAIN` (timeout), `-EINTR` | Takes a pending signal of `set` (normally blocked) without running its handler and fills Linux's `siginfo_t`; `timeoutNs` `~0` waits for ever, `0` only looks. |
+| 176 | `Tgkill` | mlibc's `pthread_kill`/`raise`/`tgkill` | `uint64_t tgid, uint64_t tid, uint64_t sig` | `0`, `-ESRCH` | Sends to one thread, with `si_code` `SI_TKILL`; `tgid` 0 accepts any process, otherwise the thread must belong to it. |
+| 177 | `GetRlimit` | mlibc's `getrlimit`/`sysconf(_SC_OPEN_MAX)` | `uint64_t resource, uint64_t limit[2]` (cur, max) | `0`, `-EINVAL` | `RLIMIT_NOFILE` (7): the process's soft and hard limit, 1024 and 65536 at first, shared by its threads, copied to fork and spawn children, kept across exec. The other resources read as unlimited (`~0`). |
+| 178 | `SetRlimit` | mlibc's `setrlimit` | `uint64_t resource, const uint64_t limit[2]` | `0`, `-EINVAL` (cur > max), `-EPERM` | `RLIMIT_NOFILE` up to 65536 (`HandleTable::MaxNofile`); raising the hard limit is for root. The kernel does not count its handles against it (a process has up to 131072, `HandleTable::MaxHandles`, in chunks of 256 made as needed); mlibc keeps its fd numbers below the soft limit (`EMFILE`). Other resources: accepted, nothing changes. |
 
 ## Aliases and Helper Wrappers
 
@@ -235,22 +253,33 @@ syscall numbers:
 - `ProcInfo` snapshots the scheduler process list into fixed-size
   `ProcInfoEntry` records. `/bin/process-manager` registers `process.manager`
   and periodically reports the real process snapshot through that syscall.
-- Signal action state is kernel-backed for `signal()` and `sigaction()`:
-  handlers, masks, flags, restorer trampolines, and old-action returns are stored
-  per process/thread image. Pending signal delivery runs on syscall return or
-  scheduler return, honors per-thread blocked masks and delivered action masks,
-  supports alternate stacks via `sigaltstack()`, and restores saved context via
-  the libc restorer calling `SigReturn`. `SIGKILL` cannot be blocked or handled;
-  `SIGCHLD` defaults to ignored; other default actions terminate. `read()` and
-  `waitpid()` return `EINTR` for delivered signals and libc retries those calls
-  when an installed action uses `SA_RESTART`.
+- Signals (`src/cpu/syscall/signal.cpp`). Dispositions (`Signal`,
+  `Sigaction`) belong to the process: every thread sees the same ones. Masks are
+  per thread, one 64-bit word with signal N at bit N (mlibc's `sigset_t` has it
+  at bit N-1; its sysdeps shift). A signal is acted on whenever its thread goes
+  back to user mode: at a syscall's exit and at the exit of any interrupt or
+  exception taken in user mode, so a program in a loop without syscalls is
+  reached at its next tick, or at once when the sender interrupts its CPU. A
+  handler (it needs a restorer) gets Linux's x86-64 frame: `rdi` the signal,
+  `rsi` a `siginfo_t` (`si_code` `SI_USER` with the sender's pid and uid from
+  `Kill`, `SI_TKILL` from `Tgkill`/`ThreadSignal`, `SI_KERNEL`, `CLD_*` for
+  `SIGCHLD`, the fault address for `SIGSEGV`/`SIGBUS`/`SIGILL`/`SIGFPE`/`SIGTRAP`),
+  `rdx` a `ucontext_t` with every register, the old mask and the XSAVE image,
+  skipping the 128-byte red zone (or on the `sigaltstack` with `SA_ONSTACK`).
+  `SA_SIGINFO`, `SA_NODEFER`, `SA_RESETHAND` and `SA_RESTART` (read, write,
+  wait, socket calls and `ThreadJoin` start again; sleeps, poll and futexes
+  return `EINTR`) do what they do on Linux. A user-mode exception runs the
+  handler of its signal when there is one and it is not blocked, else the
+  process dies of it. `SIGKILL` cannot be blocked or handled; `SIGCHLD`,
+  `SIGCONT`, `SIGURG`, `SIGWINCH` and the stop signals default to ignored; other
+  default actions terminate the whole process, which `Wait` reports as a death
+  by that signal (Linux's status: the signal in the low 7 bits).
 - The pthread layer supports kernel-backed thread creation/join/detach plus
   libc-managed normal, recursive, and error-checking mutexes; condition
   variables with timed waits; writer-preferred rwlocks; unnamed process-local
   semaphores; per-thread `errno`; pthread TLS keys with destructors; deferred
   cancellation; `pthread_sigmask()`; and `pthread_kill()`. Blocking pthread
-  waits currently cooperate with the scheduler through yield loops rather than a
-  futex-style kernel wait queue.
+  waits sleep on futexes (`FutexWait`/`FutexWake`).
 - An optional mlibc port scaffold lives under
   `outside/iUserApps/outside/mlibc-sysdeps/instantos`. It provides Meson sysdeps
   wiring, x86_64 syscall entry wrappers with InstantOS `-errno` translation,

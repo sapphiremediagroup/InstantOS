@@ -20,44 +20,10 @@ extern "C" void enterUsermode(uint64_t entry, uint64_t stack);
 
 constexpr uint64_t USER_STACK_TOP = 0x00007FFFFFFFE000;
 constexpr size_t USER_STACK_PAGES = 32;
+constexpr uint64_t kUserStackReserve = 8ULL * 1024 * 1024;   // demand-paged below the 32 pages
 
 namespace {
-struct UserSignalFrame {
-    uint64_t rip;
-    uint64_t rsp;
-    uint64_t blocked;
-    uint64_t rax;
-    uint64_t rdi;
-    uint64_t rsi;
-    uint64_t rdx;
-    uint64_t rcx;
-    uint64_t r8;
-    uint64_t r9;
-    uint64_t r10;
-    uint64_t r11;
-    uint64_t rflags;
-    uint64_t altStackFlags;
-};
 
-// Linux ignores SIGCHLD, SIGCONT, SIGURG and SIGWINCH by default. Its default
-// for SIGSTOP, SIGTSTP, SIGTTIN and SIGTTOU is to stop the process, which this
-// kernel cannot do; ignoring them beats killing it (bash sends itself SIGTTIN
-// until it owns its terminal, and dies before its first prompt otherwise).
-bool defaultIgnoredSignal(int sig) {
-    switch (sig) {
-    case SIGCHLD:
-    case 18:   // SIGCONT
-    case 19:   // SIGSTOP
-    case 20:   // SIGTSTP
-    case 21:   // SIGTTIN
-    case 22:   // SIGTTOU
-    case 23:   // SIGURG
-    case 28:   // SIGWINCH
-        return true;
-    default:
-        return false;
-    }
-}
 }
 
 // A demand-paged memory region (VMA). Held in a sorted singly-linked list per
@@ -90,6 +56,22 @@ struct ProcessSharedState {
 namespace {
 constexpr uint32_t kDefaultFileRights = HandleRightRead | HandleRightWrite | HandleRightDuplicate;
 constexpr uint64_t kKernelStackSize = 4 * PAGE_SIZE;
+
+// Kernel stacks are heap blocks used through the higher-half direct map, not
+// their low identity address: a non-PIE program (gcc, cc1: 0x400000 up) maps
+// its image over the identity addresses of whatever frames lie there, so a
+// stack in that range was the program's own memory during its syscalls (cc1's
+// pointers got kernel values) and vanished when exec unmapped the old image
+// (double fault in gcc's Exec, P7.1).
+uint64_t kernelStackTop(void* block) {
+    return VMM::PhysToVirt(reinterpret_cast<uint64_t>(block)) + kKernelStackSize;
+}
+
+void* kernelStackBlock(uint64_t top) {
+    const uint64_t base = top - kKernelStackSize;
+    const uint64_t dm = VMM::DirectMapBase();
+    return reinterpret_cast<void*>(dm && base >= dm ? base - dm : base);
+}
 
 uint64_t alignUp(uint64_t value, uint64_t alignment) {
     return (value + alignment - 1) & ~(alignment - 1);
@@ -171,6 +153,7 @@ void releaseSharedState(ProcessSharedState* state) {
     }
     state->vmaList = nullptr;
     delete state;
+    __atomic_fetch_sub(&g_liveSharedStates, 1, __ATOMIC_RELAXED);
 }
 
 void retainFileHandle(void* object) {
@@ -236,7 +219,7 @@ bool initializeAddressSpace(ProcessSharedState* state) {
 }
 
 Process::Process(uint32_t pid)
-    : sharedState(nullptr), sessionID(0), uid(0), gid(0), pid(pid), parentPID(0), exitCode(0),
+    : sharedState(nullptr), sessionID(0), uid(0), gid(0), pid(pid), groupPID(pid), parentPID(0), exitCode(0),
       state(ProcessState::Ready), priority(ProcessPriority::Normal), kernelStack(0), userStack(0),
       userStackBase(0), userStackSize(0), userStackHeapBacked(false), fpuState(nullptr), userFpuState(nullptr), validUserState(false), savedUserRSP(0),
       userFsBase(0), userGsBase(0), sleepDeadlineMs(0), sleeping(false),
@@ -267,25 +250,31 @@ Process::Process(uint32_t pid)
     signalHandler.altStackFlags = SS_DISABLE;
 
     sharedState = new ProcessSharedState();
+    if (sharedState) __atomic_fetch_add(&g_liveSharedStates, 1, __ATOMIC_RELAXED);
     if (!sharedState || !initializeAddressSpace(sharedState)) {
         return;
     }
 
     void* kstackPhys = kmalloc_aligned(kKernelStackSize, PAGE_SIZE);
     if (kstackPhys) {
-        kernelStack = reinterpret_cast<uint64_t>(kstackPhys) + kKernelStackSize;
+        kernelStack = kernelStackTop(kstackPhys);
     }
 
     userStackBase = USER_STACK_TOP - (USER_STACK_PAGES * PAGE_SIZE);
     userStackSize = USER_STACK_PAGES * PAGE_SIZE;
     void* ustackPhys = kmalloc_aligned(userStackSize, PAGE_SIZE);
     if (ustackPhys) {
-        memset(ustackPhys, 0, userStackSize);
+        memset(reinterpret_cast<void*>(VMM::PhysToVirt(reinterpret_cast<uint64_t>(ustackPhys))), 0, userStackSize);
         VMM::MapRangeInto(sharedState->pageTable, userStackBase, reinterpret_cast<uint64_t>(ustackPhys),
                           USER_STACK_PAGES,
                           PageFlags::Present | PageFlags::ReadWrite | PageFlags::UserSuper | PageFlags::NoExecute);
         userStack = USER_STACK_TOP - 8;
         userStackHeapBacked = true;
+        // The rest of an 8 MiB stack (Linux's default RLIMIT_STACK) below the
+        // mapped part, filled with zero pages on first touch: GNU ld recursed
+        // past 128 KiB linking as-new (P7.1).
+        mmapAddRegion(USER_STACK_TOP - kUserStackReserve, kUserStackReserve - userStackSize,
+                      MemoryProtRead | MemoryProtWrite);
     }
 
     void* fpuPhys = kmalloc_aligned(sizeof(FPUState), 64);
@@ -328,7 +317,7 @@ Process::Process(uint32_t pid)
 }
 
 Process::Process(uint32_t pid, Process* sharedFrom, uint64_t stackSize)
-    : sharedState(nullptr), sessionID(0), uid(0), gid(0), pid(pid), parentPID(0), exitCode(0),
+    : sharedState(nullptr), sessionID(0), uid(0), gid(0), pid(pid), groupPID(sharedFrom->getGroupPID()), parentPID(0), exitCode(0),
       state(ProcessState::Ready), priority(ProcessPriority::Normal), kernelStack(0), userStack(0),
       userStackBase(0), userStackSize(0), userStackHeapBacked(false), fpuState(nullptr), validUserState(false), savedUserRSP(0),
       userFsBase(0), userGsBase(0), sleepDeadlineMs(0), sleeping(false),
@@ -378,14 +367,17 @@ Process::Process(uint32_t pid, Process* sharedFrom, uint64_t stackSize)
 
     void* kstackPhys = kmalloc_aligned(kKernelStackSize, PAGE_SIZE);
     if (kstackPhys) {
-        kernelStack = reinterpret_cast<uint64_t>(kstackPhys) + kKernelStackSize;
+        kernelStack = kernelStackTop(kstackPhys);
     }
 
-    userStackSize = alignUp(stackSize ? stackSize : (16 * PAGE_SIZE), PAGE_SIZE);
-    userStackBase = reserveMmapRegion(userStackSize);
-    void* ustackPhys = kmalloc_aligned(userStackSize, PAGE_SIZE);
+    void* ustackPhys = nullptr;
+    if (stackSize != kNoUserStack) {
+        userStackSize = alignUp(stackSize ? stackSize : (16 * PAGE_SIZE), PAGE_SIZE);
+        userStackBase = reserveMmapRegion(userStackSize);
+        ustackPhys = kmalloc_aligned(userStackSize, PAGE_SIZE);
+    }
     if (ustackPhys) {
-        memset(ustackPhys, 0, userStackSize);
+        memset(reinterpret_cast<void*>(VMM::PhysToVirt(reinterpret_cast<uint64_t>(ustackPhys))), 0, userStackSize);
         VMM::MapRangeInto(sharedState->pageTable, userStackBase, reinterpret_cast<uint64_t>(ustackPhys),
                           userStackSize / PAGE_SIZE,
                           PageFlags::Present | PageFlags::ReadWrite | PageFlags::UserSuper | PageFlags::NoExecute);
@@ -396,6 +388,14 @@ Process::Process(uint32_t pid, Process* sharedFrom, uint64_t stackSize)
     void* fpuPhys = kmalloc_aligned(sizeof(FPUState), 64);
     if (fpuPhys) {
         fpuState = reinterpret_cast<FPUState*>(fpuPhys);
+    }
+
+    // Where kernel entries from user mode save the vector registers: without it
+    // an interrupt, page fault or syscall of a thread left it the kernel's.
+    void* userFpuPhys = kmalloc_aligned(sizeof(FPUState), 64);
+    if (userFpuPhys) {
+        userFpuState = reinterpret_cast<FPUState*>(userFpuPhys);
+        CPU::initializeExtendedState(userFpuState);
     }
 
     context.rax = 0;
@@ -424,7 +424,44 @@ Process::Process(uint32_t pid, Process* sharedFrom, uint64_t stackSize)
     }
 }
 
+uint64_t* Process::makeFdStash(int count) {
+    dropFdStash();
+    if (count <= 0) {
+        return nullptr;
+    }
+    fdStash = static_cast<uint64_t*>(kmalloc(static_cast<uint64_t>(count) * sizeof(uint64_t)));
+    fdStashCapacity = fdStash ? count : 0;
+    return fdStash;
+}
+
+void Process::dropFdStash() {
+    if (fdStash) {
+        kfree(fdStash);
+    }
+    fdStash = nullptr;
+    fdStashCapacity = 0;
+    fdStashCount = -1;
+}
+
+void Process::getNofileLimit(uint64_t* soft, uint64_t* hard) const {
+    const bool have = sharedState != nullptr;
+    *soft = have ? sharedState->handleTable.nofileSoft : HandleTable::DefaultNofileSoft;
+    *hard = have ? sharedState->handleTable.nofileHard : HandleTable::MaxNofile;
+}
+
+void Process::setNofileLimit(uint64_t soft, uint64_t hard) {
+    if (!sharedState) return;
+    sharedState->handleTable.nofileSoft = soft;
+    sharedState->handleTable.nofileHard = hard;
+}
+
+int Process::openHandleCount() const {
+    return sharedState ? sharedState->handleTable.openCount() : 0;
+}
+
 Process::~Process() {
+    dropFdStash();
+    futexForget(this);
     IPCManager::get().cleanupProcess(this);
     // The compositor's scanout buffers must not stay on screen without it.
     intel_gen9::IntelGen9Driver::get().displayProcessGone(pid);
@@ -438,8 +475,7 @@ Process::~Process() {
     }
 
     if (kernelStack) {
-        uint64_t kstackVirt = kernelStack - kKernelStackSize;
-        kfree(reinterpret_cast<void*>(kstackVirt));
+        kfree(kernelStackBlock(kernelStack));
     }
 
     if (userStackBase && userStackSize && getPageTable()) {
@@ -491,6 +527,32 @@ bool Process::cloneAddressSpaceFrom(Process* parent) {
             kfree(reinterpret_cast<void*>(ustackPhys));
         }
         userStackHeapBacked = false;
+    }
+
+    // Stacks the kernel made (the main thread's, and those of ThreadCreate's
+    // threads) are kernel heap memory: copied at once, never copy-on-write (see
+    // below). Every thread's, whichever of them forks.
+    struct StackRange {
+        uint64_t start, end;
+    };
+    uint64_t stackCount = 1;
+    for (Process* p = Scheduler::get().getAllProcessesHead(); p; p = p->allNext) {
+        if (p->sharesStateWith(parent)) stackCount++;
+    }
+    auto* stacks = reinterpret_cast<StackRange*>(kmalloc(stackCount * sizeof(StackRange)));
+    if (!stacks) return false;
+    struct FreeStacks {
+        StackRange* p;
+        ~FreeStacks() { kfree(p); }
+    } freeStacks{stacks};
+    uint64_t stackRanges = 0;
+    if (parent->userStackSize) {
+        stacks[stackRanges++] = {parent->userStackBase, parent->userStackBase + parent->userStackSize};
+    }
+    for (Process* p = Scheduler::get().getAllProcessesHead(); p && stackRanges < stackCount; p = p->allNext) {
+        if (p != parent && p->sharesStateWith(parent) && p->userStackHeapBacked && p->userStackSize) {
+            stacks[stackRanges++] = {p->userStackBase, p->userStackBase + p->userStackSize};
+        }
     }
 
     PageTable* parentPml4 = parent->sharedState->pageTable;
@@ -570,9 +632,10 @@ bool Process::cloneAddressSpaceFrom(Process* parent) {
                     // NOTE: test against the PARENT's stack region -- `this` is the
                     // freshly bare-constructed fork child whose userStack* are 0,
                     // so using them here disabled the eager copy entirely.
-                    const bool inStack = parent->userStackSize &&
-                        vaddr >= parent->userStackBase &&
-                        vaddr < parent->userStackBase + parent->userStackSize;
+                    bool inStack = false;
+                    for (uint64_t s = 0; s < stackRanges && !inStack; s++) {
+                        inStack = vaddr >= stacks[s].start && vaddr < stacks[s].end;
+                    }
 
                     // A page participates in COW if it is writable now, or is
                     // already a shared COW page from an earlier fork generation.
@@ -821,7 +884,8 @@ bool Process::mmapAddFileRegion(uint64_t start, uint64_t length, uint64_t prot,
 
 // A region whose pages the caller has mapped already (kSharedFrame) and
 // `object` owns; the region keeps a reference to it until it is dropped.
-bool Process::mmapAddObjectRegion(uint64_t start, uint64_t length, uint64_t prot, MappedObject* object) {
+bool Process::mmapAddObjectRegion(uint64_t start, uint64_t length, uint64_t prot, MappedObject* object,
+                                  uint64_t offset) {
     if (!sharedState || length == 0 || !object) {
         return false;
     }
@@ -835,6 +899,7 @@ bool Process::mmapAddObjectRegion(uint64_t start, uint64_t length, uint64_t prot
     node->prot = prot;
     node->shared = true;
     node->object = object;
+    node->fileOffset = offset;
     object->retain();
     VmaRegion** link = &sharedState->vmaList;
     while (*link && (*link)->start < start) {
@@ -914,8 +979,26 @@ bool Process::mmapRegionCovers(uint64_t addr) const {
     }
     for (VmaRegion* r = sharedState->vmaList; r; r = r->next) {
         if (addr >= r->start && addr < r->end) {
-            return true;   // covered by a reserved region; will fault in on access
+            return (r->prot & MemoryProtNone) == 0;   // covered by a reserved region; will fault in on access
         }
+    }
+    return false;
+}
+
+bool Process::mmapTouchShared(uint64_t addr) {
+    if (!sharedState || !sharedState->pageTable) {
+        return false;
+    }
+    for (VmaRegion* r = sharedState->vmaList; r; r = r->next) {
+        if (addr < r->start || addr >= r->end) continue;
+        if (!r->object) return false;
+        // On the kernel's address space, as for any demand fault (isr.cpp).
+        uint64_t savedCR3;
+        asm volatile("mov %%cr3, %0" : "=r"(savedCR3));
+        if (PageTable* kernel = VMM::GetKernelAddressSpace()) VMM::SetAddressSpace(kernel);
+        const bool there = handleDemandFault(addr);
+        asm volatile("mov %0, %%cr3" :: "r"(savedCR3) : "memory");
+        return there;
     }
     return false;
 }
@@ -942,14 +1025,22 @@ bool Process::handleDemandFault(uint64_t faultAddr) {
         return false;   // address is in no mmap region -> genuine fault (SIGSEGV)
     }
 
+    if (region->prot & MemoryProtNone) {
+        return false;   // a guard page or a reservation
+    }
     // Already backed (e.g. a duplicate fault) -> nothing to do.
     if (VMM::VirtualToPhysicalIn(sharedState->pageTable, va)) {
         return true;
     }
-    // An object's region is mapped whole when it is made; a page missing
-    // there is a real fault, never a place for an anonymous frame.
+    // An object gives its own pages (or none: one mapped whole when it was
+    // made), never a place for an anonymous frame.
     if (region->object) {
-        return false;
+        const uint64_t shared = region->object->faultPage(region->fileOffset + (va - region->start));
+        if (!shared) {
+            return false;
+        }
+        VMM::MapPageInto(sharedState->pageTable, va, shared, vmaPageFlags(region->prot) | kSharedFrame);
+        return true;
     }
 
     uint64_t phys = PMM::AllocFrame();
@@ -1010,6 +1101,19 @@ bool Process::mmapCloneRegionsFrom(const Process* parent) {
     // copy-on-write by cloneAddressSpaceFrom; not-yet-faulted pages fault in
     // independently on each side). File-backed regions carry their backing file
     // across; the child takes its own reference so both survive independently.
+    // The child's own records go first: its constructor already added its
+    // stack reserve (the parent's list has one too), and writing the copy over
+    // the list head leaked that record on every fork.
+    while (VmaRegion* old = sharedState->vmaList) {
+        sharedState->vmaList = old->next;
+        if (old->file) {
+            VFS::get().close(old->file);
+        }
+        if (old->object) {
+            old->object->release();
+        }
+        delete old;
+    }
     VmaRegion** link = &sharedState->vmaList;
     for (VmaRegion* r = parent->sharedState->vmaList; r; r = r->next) {
         VmaRegion* copy = new VmaRegion{};
@@ -1033,6 +1137,15 @@ bool Process::mmapCloneRegionsFrom(const Process* parent) {
         }
         *link = copy;
         link = &copy->next;
+    }
+    // Continue the parent's mmap cursor. A fresh child starts at the bottom of
+    // the mmap area, where everything it just inherited lives (ld.so's heap,
+    // the libraries, the TLS block and DTV): its first mmap landed on top of
+    // them and its munmap took them away (P7.2: bash's command-substitution
+    // children freed a 2.25 MiB string and lost the DTV page at
+    // 0x60000023f000, then crashed in __tls_get_addr).
+    if (parent->sharedState->mmapBase > sharedState->mmapBase) {
+        sharedState->mmapBase = parent->sharedState->mmapBase;
     }
     return true;
 }
@@ -1079,6 +1192,7 @@ bool Process::replaceImageFrom(Process* image) {
     }
     exitCode = 0;
     exitRequested = false;
+    termSignal = 0;
     signalHandler.pending = 0;
     signalHandler.blocked = 0;
     for (int i = 0; i < NSIG; ++i) {
@@ -1090,6 +1204,8 @@ bool Process::replaceImageFrom(Process* image) {
     signalHandler.altStackSp = 0;
     signalHandler.altStackSize = 0;
     signalHandler.altStackFlags = SS_DISABLE;
+    signalHandler.suspended = false;
+    fullUserRestore = false;
     return true;
 }
 
@@ -1106,14 +1222,6 @@ void Process::jumpToUsermode(uint64_t entry, GDT* gdt) {
     context.rsp = userStack;
 
     enterUsermode(entry, userStack);
-}
-
-void Process::sendSignal(int sig) {
-    if (sig < 0 || sig >= NSIG) return;
-    signalHandler.pending |= (1ULL << sig);
-    if (state == ProcessState::Blocked) {
-        Scheduler::get().wakeProcess(this);
-    }
 }
 
 bool Process::hasDeliverableSignal() const {
@@ -1135,7 +1243,7 @@ bool Process::hasDeliverableSignal() const {
         if (handler == reinterpret_cast<sighandler_t>(1)) {
             continue; // SIG_IGN: explicitly ignored.
         }
-        if (!handler && defaultIgnoredSignal(sig)) {
+        if (!handler && signalIgnoredByDefault(sig)) {
             continue; // SIG_DFL with a default-ignore disposition (SIGCHLD).
         }
         return true; // Custom handler, or a default action that terminates.
@@ -1143,98 +1251,15 @@ bool Process::hasDeliverableSignal() const {
     return false;
 }
 
-void Process::handlePendingSignals() {
-    // Once terminated the exit code is fixed; do not let a still-pending signal
-    // re-run the termination logic and clobber it (or double-report the death).
-    if (state == ProcessState::Terminated) return;
-    if (!signalHandler.pending) return;
-    // SIGKILL wins over any lower-numbered signal that has a handler.
-    if (terminateIfKilled()) return;
-
-    for (int sig = 0; sig < NSIG; sig++) {
-        if (!(signalHandler.pending & (1ULL << sig))) continue;
-        if (signalHandler.blocked & (1ULL << sig)) continue;
-
-        signalHandler.pending &= ~(1ULL << sig);
-
-        if (sig == SIGKILL) {
-            closeFilesOnExit();
-            state = ProcessState::Terminated;
-            exitCode = 128 + sig;
-            return;
-        }
-
-        sighandler_t handler = signalHandler.handlers[sig];
-        if (handler == reinterpret_cast<sighandler_t>(1)) {
-            continue;
-        }
-        if (!handler) {
-            if (defaultIgnoredSignal(sig)) {
-                continue;
-            }
-            // A fatal signal kills the whole process, not just this thread.
-            if (isThread()) {
-                Scheduler::get().exitThreadGroup(this, 128 + sig);
-            }
-            closeFilesOnExit();
-            state = ProcessState::Terminated;
-            exitCode = 128 + sig;
-            return;
-        }
-
-        uint64_t frameStack = context.rsp;
-        const bool useAltStack =
-            (signalHandler.flags[sig] & SA_ONSTACK) != 0 &&
-            (signalHandler.altStackFlags & (SS_DISABLE | SS_ONSTACK)) == 0 &&
-            signalHandler.altStackSp != 0 &&
-            signalHandler.altStackSize >= 2048;
-        const uint32_t oldAltStackFlags = signalHandler.altStackFlags;
-        if (useAltStack) {
-            frameStack = signalHandler.altStackSp + signalHandler.altStackSize;
-            signalHandler.altStackFlags |= SS_ONSTACK;
-        }
-
-        frameStack = (frameStack - sizeof(UserSignalFrame) - 16) & ~0xFULL;
-        frameStack += 8;
-
-        const uint64_t oldBlocked = signalHandler.blocked;
-        signalHandler.blocked |= signalHandler.masks[sig] | (1ULL << sig);
-        if (sig == SIGKILL) {
-            signalHandler.blocked &= ~(1ULL << SIGKILL);
-        }
-
-        uint64_t* stack = reinterpret_cast<uint64_t*>(frameStack);
-        stack[0] = signalHandler.restorers[sig] ? signalHandler.restorers[sig] : context.rip;
-        auto* frame = reinterpret_cast<UserSignalFrame*>(frameStack + sizeof(uint64_t));
-        frame->rip = context.rip;
-        frame->rsp = context.rsp;
-        frame->blocked = oldBlocked;
-        frame->rax = context.rax;
-        frame->rdi = context.rdi;
-        frame->rsi = context.rsi;
-        frame->rdx = context.rdx;
-        frame->rcx = context.rcx;
-        frame->r8 = context.r8;
-        frame->r9 = context.r9;
-        frame->r10 = context.r10;
-        frame->r11 = context.r11;
-        frame->rflags = context.rflags;
-        frame->altStackFlags = oldAltStackFlags;
-
-        context.rip = reinterpret_cast<uint64_t>(handler);
-        context.rsp = frameStack;
-        context.rdi = sig;
-
-        break;
-    }
-}
-
 bool Process::terminateIfKilled() {
     if (state == ProcessState::Terminated || !killPending()) return false;
     signalHandler.pending &= ~(1ULL << SIGKILL);
     closeFilesOnExit();
     state = ProcessState::Terminated;
-    if (!exitRequested) exitCode = 128 + SIGKILL;
+    if (!exitRequested) {
+        exitCode = 128 + SIGKILL;
+        termSignal = SIGKILL;
+    }
     return true;
 }
 
@@ -1352,4 +1377,12 @@ HandleEntry* Process::getHandle(uint64_t handle) {
 
 void* Process::getHandleObject(uint64_t handle, HandleType expectedType, uint32_t requiredRights) {
     return sharedState ? sharedState->handleTable.getObject(handle, expectedType, requiredRights) : nullptr;
+}
+
+uint64_t Process::mmapRegionCount() const {
+    uint64_t n = 0;
+    for (VmaRegion* r = sharedState ? sharedState->vmaList : nullptr; r; r = r->next) {
+        n++;
+    }
+    return n;
 }

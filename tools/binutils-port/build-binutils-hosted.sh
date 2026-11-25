@@ -58,8 +58,12 @@ ln -sf x86_64-unknown-instantos-gcc "$BX/x86_64-unknown-instantos-cc" 2>/dev/nul
 # --- configure (cross mode: build != host, so no host binaries are run) ---
 if [ "${RECONFIGURE:-0}" = "1" ] || [ ! -f "$OBJ/Makefile" ]; then
   rm -rf "$OBJ"; mkdir -p "$OBJ"
+  # No lex library: a build host with flex installed would otherwise link ar
+  # and ranlib against its libfl.so.2, which InstantOS lacks (the lexers use
+  # noyywrap, so nothing from libfl is needed). autoconf 2.69 takes the cached
+  # answer, not LEXLIB; make is also given LEXLIB= below.
   ( cd "$OBJ" && PATH="$BX:$PATH" \
-    CC_FOR_BUILD="clang" \
+    CC_FOR_BUILD="clang" ac_cv_lib_lex="none needed" \
     "$SRC/configure" \
       --build=x86_64-linux-gnu \
       --host=x86_64-unknown-instantos \
@@ -73,9 +77,9 @@ if [ "${RECONFIGURE:-0}" = "1" ] || [ ! -f "$OBJ/Makefile" ]; then
 fi
 
 # --- build + stage-install ---
-PATH="$BX:$PATH" make -C "$OBJ" -j"$JOBS" MAKEINFO=true
+PATH="$BX:$PATH" make -C "$OBJ" -j"$JOBS" MAKEINFO=true LEXLIB=
 rm -rf "$STAGE"
-PATH="$BX:$PATH" make -C "$OBJ" MAKEINFO=true DESTDIR="$STAGE" install
+PATH="$BX:$PATH" make -C "$OBJ" MAKEINFO=true LEXLIB= DESTDIR="$STAGE" install
 
 echo "binutils-hosted staged to $STAGE"
 ls "$STAGE/usr/bin" 2>/dev/null || true

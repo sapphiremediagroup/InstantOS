@@ -236,15 +236,13 @@ void AHCIPort::startCmd() {
     port->cmd |= HBA_PxCMD_ST;
 }
 
+// Commands run one at a time under the storage lock, and each has finished
+// (or been stopped by recoverFromError) before the next is built, so slot 0
+// is always free. Asking the HBA (PxSACT | PxCI) was two register reads a
+// command; under a hypervisor each is a VM exit, and nested ones cost
+// hundreds of microseconds.
 int AHCIPort::findCmdSlot() {
-    uint32_t slots = (port->sact | port->ci);
-    for (int i = 0; i < 32; i++) {
-        if ((slots & 1) == 0) {
-            return i;
-        }
-        slots >>= 1;
-    }
-    return -1;
+    return 0;
 }
 
 
@@ -364,8 +362,6 @@ bool AHCIPort::executeCommand(uint8_t cmd, uint64_t lba, uint32_t count, void* b
         return false;
     }
 
-    port->is = (uint32_t)-1;
-
     int slot = findCmdSlot();
     if (slot == -1) return false;
 
@@ -385,7 +381,12 @@ bool AHCIPort::executeCommand(uint8_t cmd, uint64_t lba, uint32_t count, void* b
 
     zeroMemory(cmdtbl, 256);
 
+    // One PRDT entry per 8 KiB (16 sectors). `left` counts down while they are
+    // filled; the FIS below must carry the whole `count`. (It used to take the
+    // counted-down value, so a command over 16 sectors moved only its last
+    // entry's sectors: a 64 KiB write wrote 8 KiB, a read left the rest stale.)
     uint64_t buf = dmaAddress(buffer);
+    uint32_t left = count;
     int i;
     for (i = 0; i < cmdheader->prdtl - 1; i++) {
         cmdtbl->prdt_entry[i].dba = buf & 0xFFFFFFFF;
@@ -393,12 +394,12 @@ bool AHCIPort::executeCommand(uint8_t cmd, uint64_t lba, uint32_t count, void* b
         cmdtbl->prdt_entry[i].dbc = 8 * 1024 - 1;
         cmdtbl->prdt_entry[i].i = 1;
         buf += 8 * 1024;
-        count -= 16;
+        left -= 16;
     }
 
     cmdtbl->prdt_entry[i].dba = buf & 0xFFFFFFFF;
     cmdtbl->prdt_entry[i].dbau = (buf >> 32) & 0xFFFFFFFF;
-    cmdtbl->prdt_entry[i].dbc = (count * 512) - 1;
+    cmdtbl->prdt_entry[i].dbc = (left * 512) - 1;
     cmdtbl->prdt_entry[i].i = 1;
 
     FISRegH2D* cmdfis = (FISRegH2D*)(&cmdtbl->cfis);
@@ -418,24 +419,43 @@ bool AHCIPort::executeCommand(uint8_t cmd, uint64_t lba, uint32_t count, void* b
     cmdfis->countl = count & 0xFF;
     cmdfis->counth = (count >> 8) & 0xFF;
 
-    int spin = 0;
-    while ((port->tfd & (ATA_DEV_BUSY | ATA_DEV_DRQ)) && spin < 1000000) {
-        TLB::pollPending();
-        spin++;
-    }
-    if (spin == 1000000) return false;
+    return issue(slot, cmd, lba, count);
+}
 
-    port->ci = 1 << slot;
-    if (!waitForCompletion(slot, cmd, lba, count)) {
-        return false;
-    }
+// Received-FIS area (AHCI 1.3 4.2.1): the HBA copies the device's FISes here.
+// A PIO Setup FIS (0x5F) lands at 0x20, a D2H Register FIS (0x34) at 0x40;
+// their third byte is the device's status.
+constexpr uint32_t kRfisPioSetup = 0x20;
+constexpr uint32_t kRfisD2H = 0x40;
+constexpr uint8_t kFisTypePioSetup = 0x5F;
+constexpr uint8_t kFisTypeD2H = 0x34;
+constexpr uint8_t kAtaStatusErr = 0x01;
+constexpr uint8_t kAtaStatusDf = 0x20;
 
-    if (port->is & HBA_PxIS_TFES) {
-        recoverFromError();
-        return false;
+// Issues the command built in `slot` and waits for it. A command takes as few
+// register accesses as it can: one write to PxCI, and (normally) one read of
+// it once the device's final FIS has shown up in memory. Under a hypervisor
+// every register access is a VM exit, and under nested virtualization one
+// costs hundreds of microseconds; the old path (clear PxIS, read PxSACT, PxCI
+// and PxTFD, poll PxCI and PxIS in turn, read PxIS again) made about eight a
+// command. The device is checked for BSY/DRQ only after an error recovery:
+// when the last command completed, it is idle.
+bool AHCIPort::issue(int slot, uint8_t cmd, uint64_t lba, uint32_t count) {
+    if (needsIdleCheck) {
+        int spin = 0;
+        while ((port->tfd & (ATA_DEV_BUSY | ATA_DEV_DRQ)) && spin < 1000000) {
+            TLB::pollPending();
+            spin++;
+        }
+        if (spin == 1000000) return false;
+        needsIdleCheck = false;
     }
-
-    return true;
+    volatile uint8_t* rfis = static_cast<volatile uint8_t*>(fisBuffer);
+    rfis[kRfisPioSetup] = 0;
+    rfis[kRfisD2H] = 0;
+    asm volatile("mfence" ::: "memory");   // the marks are cleared before the HBA can write
+    port->ci = 1u << slot;
+    return waitForCompletion(slot, cmd, lba, count);
 }
 
 // Waits for the command in `slot` to finish. Kernel code runs with interrupts
@@ -452,10 +472,39 @@ bool AHCIPort::waitForCompletion(int slot, uint8_t cmd, uint64_t lba, uint32_t c
     g_ahciDebug.regs = port;
     g_ahciDebug.startMs = start ? start : 1;
     g_ahciDebug.commands = g_ahciDebug.commands + 1;
+    volatile uint8_t* rfis = static_cast<volatile uint8_t*>(fisBuffer);
+    uint32_t spins = 0;
+    uint32_t fisWait = 0;   // spins until PxCI is read again once a FIS is in
     while (true) {
         // Storage runs without the big kernel lock (StorageLock), so a TLB
         // shootdown sender may be waiting for this CPU.
         TLB::pollPending();
+        // Wait in memory, not on the registers: the HBA puts the device's
+        // final FIS in the received-FIS area before it clears PxCI. PxCI is
+        // read as soon as one is there (then every 16 spins until it clears),
+        // and every 256 spins regardless, for an HBA that posts none. A PIO
+        // Setup FIS comes before the data, so PxCI stays the word on when the
+        // command is done.
+        const bool d2h = rfis[kRfisD2H] == kFisTypeD2H;
+        if (d2h && (rfis[kRfisD2H + 2] & (kAtaStatusErr | kAtaStatusDf))) {
+            g_ahciDebug.startMs = 0;   // the device reported an error
+            recoverFromError();
+            return false;
+        }
+        const bool fisSeen = d2h || rfis[kRfisPioSetup] == kFisTypePioSetup;
+        const bool periodic = (++spins & 255) == 0;
+        bool look = periodic;
+        if (fisSeen) {
+            if (fisWait == 0) { look = true; fisWait = 16; }
+            else --fisWait;
+        }
+        if (!look) {
+            if (time_get_uptime_ms() <= deadline) {
+                asm volatile("pause");
+                continue;
+            }
+            // out of time: the register checks below decide
+        }
         if ((port->ci & (1u << slot)) == 0) {
             g_ahciDebug.startMs = 0;
             // A slow command (a drive spinning up, read retries) holds this
@@ -467,7 +516,9 @@ bool AHCIPort::waitForCompletion(int slot, uint8_t cmd, uint64_t lba, uint32_t c
             }
             return true;
         }
-        if (port->is & HBA_PxIS_TFES) {
+        // An error leaves PxCI set and raises PxIS.TFES (the D2H FIS check
+        // above normally sees it first).
+        if ((periodic || !fisSeen) && (port->is & HBA_PxIS_TFES)) {
             g_ahciDebug.startMs = 0;
             recoverFromError();
             return false;
@@ -492,6 +543,7 @@ void AHCIPort::recoverFromError() {
     port->serr = (uint32_t)-1;   // clear all SError bits (write-1-to-clear)
     port->is = (uint32_t)-1;     // clear all interrupt status bits
     startCmd();
+    needsIdleCheck = true;       // wait for BSY/DRQ to clear before the next command
 }
 
 bool AHCIPort::read(uint64_t sector, uint32_t count, void* buffer) {
@@ -511,7 +563,6 @@ bool AHCIPort::identify(uint16_t* buffer) {
 bool AHCIPort::flush() {
     if (!commandList) return false;
 
-    port->is = (uint32_t)-1;
     int slot = findCmdSlot();
     if (slot == -1) return false;
 
@@ -530,22 +581,7 @@ bool AHCIPort::flush() {
     cmdfis->command = ATA_CMD_FLUSH_EX;
     cmdfis->device = 1 << 6;
 
-    int spin = 0;
-    while ((port->tfd & (ATA_DEV_BUSY | ATA_DEV_DRQ)) && spin < 1000000) {
-        TLB::pollPending();
-        spin++;
-    }
-    if (spin == 1000000) return false;
-
-    port->ci = 1 << slot;
-    if (!waitForCompletion(slot, ATA_CMD_FLUSH_EX, 0, 0)) {
-        return false;
-    }
-    if (port->is & HBA_PxIS_TFES) {
-        recoverFromError();
-        return false;
-    }
-    return true;
+    return issue(slot, ATA_CMD_FLUSH_EX, 0, 0);
 }
 
 

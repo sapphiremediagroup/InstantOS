@@ -14,6 +14,14 @@
  * real chip. Not modelled: offloads, VLAN, the high-priority queue, counters,
  * jumbo frames, ERI/OCP side effects.
  *
+ * -device rtl8125 is the same model as the 2.5G RTL8125B (10ec:8125, XID 0x641),
+ * as far as the r8169 programming model differs for it: 32-bit IntrMask and
+ * IntrStatus at 0x38/0x3c, the TX doorbell in TxPoll_8125 (0x90, bit 0), a
+ * 64 KiB register window with the MAC backup at 0x19e0 (MAC0_BKP), the PCIe
+ * PHY behind EPHYAR (0x80), IntrMitigate's FIFO-empty bits (0x103) and
+ * ChipCmd.StopReq. It links at 1 Gb/s: the 2.5G advertisement lives in the
+ * PHY's MMD registers, which neither the model nor the driver uses yet.
+ *
  * Copied into hw/net/ by tools/qemu-rtl8168/build-qemu.sh. -device rtl8168.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
@@ -31,6 +39,7 @@
 #include "qom/object.h"
 
 #define TYPE_RTL8168 "rtl8168"
+#define TYPE_RTL8125 "rtl8125"
 OBJECT_DECLARE_SIMPLE_TYPE(RTL8168State, RTL8168)
 
 enum {
@@ -40,6 +49,9 @@ enum {
     R_PMCH = 0x6f, R_ERIDR = 0x70, R_ERIAR = 0x74, R_OCPDR = 0xb0,
     R_GPHY_OCP = 0xb8, R_MCU = 0xd3, R_RXMAXSIZE = 0xda, R_CPLUSCMD = 0xe0,
     R_RDSAR = 0xe4, R_MISC = 0xf0,
+    /* RTL8125 only */
+    R_IMR_8125 = 0x38, R_ISR_8125 = 0x3c, R_EPHYAR = 0x80, R_TXPOLL_8125 = 0x90,
+    R_INTRMITIGATE = 0xe2, R_MAC0_BKP = 0x19e0,
 };
 
 #define CMD_RESET 0x10
@@ -58,6 +70,9 @@ enum {
 #define RX_ACCEPT_BROADCAST 0x08
 
 #define TXCFG_XID_8168H (0x541u << 20)
+#define TXCFG_XID_8125B (0x641u << 20)
+#define MMIO_SIZE_8168 0x1000
+#define MMIO_SIZE_8125 0x10000
 #define TXCFG_EMPTY (1u << 11)
 
 #define MISC_RXDV_GATED (1u << 19)
@@ -98,8 +113,8 @@ struct RTL8168State {
     unsigned tx_index;
     unsigned rx_index;
     uint8_t chipcmd;
-    uint16_t imr;
-    uint16_t isr;
+    uint32_t imr;
+    uint32_t isr;
     uint32_t txconfig;
     uint32_t rxconfig;
     uint8_t cfg9346;
@@ -110,13 +125,17 @@ struct RTL8168State {
     uint32_t eriar;
     uint32_t eri[64];
     uint32_t ocpdr;
-    uint16_t mac_ocp[256];
+    uint16_t mac_ocp[0x8000];   /* indexed by OCP address / 2 */
     uint32_t gphy_ocp;
     uint8_t mcu;
     uint16_t rxmaxsize;
     uint16_t cpluscmd;
     uint32_t misc;
     uint8_t other[256];
+    bool is8125;
+    uint32_t ephyar;
+    uint16_t ephy[64];
+    uint16_t intrmitigate;
 
     uint16_t phy[32];
     bool link_up;          /* PHY has a link (after autonegotiation) */
@@ -139,6 +158,11 @@ static void rtl8168_update_irq(RTL8168State *s)
         pci_set_irq(d, level);
     }
     s->irq_level = level;
+}
+
+static uint32_t rtl8168_xid(RTL8168State *s)
+{
+    return s->is8125 ? TXCFG_XID_8125B : TXCFG_XID_8168H;
 }
 
 static void rtl8168_raise(RTL8168State *s, uint16_t cause)
@@ -239,7 +263,10 @@ static void rtl8168_reset(DeviceState *dev)
     rtl8168_soft_reset(s);
     s->tx_ring = 0;
     s->rx_ring = 0;
-    s->txconfig = TXCFG_XID_8168H | TXCFG_EMPTY;
+    s->txconfig = rtl8168_xid(s) | TXCFG_EMPTY;
+    s->ephyar = 0;
+    memset(s->ephy, 0, sizeof(s->ephy));
+    s->intrmitigate = 0;
     s->rxconfig = 0;
     s->cfg9346 = 0;
     memset(s->config, 0, sizeof(s->config));
@@ -423,6 +450,21 @@ static void rtl8168_link_status_changed(NetClientState *nc)
 
 static uint32_t rtl8168_reg_read(RTL8168State *s, hwaddr addr, unsigned size)
 {
+    if (s->is8125) {
+        switch (addr) {
+        case R_IMR_8125: return s->imr;
+        case R_ISR_8125: return s->isr;
+        case R_TXPOLL_8125: return 0;
+        case R_EPHYAR: return s->ephyar;
+        case R_INTRMITIGATE: return s->intrmitigate | 0x0103;   /* TX/RX FIFOs empty */
+        }
+        if (addr >= R_MAC0_BKP && addr < R_MAC0_BKP + 6) {
+            return s->conf.macaddr.a[addr - R_MAC0_BKP];
+        }
+        if (addr >= 0x3c && addr < 0x40) {
+            return 0;   /* the 32-bit IntrStatus, read by bytes: not expected */
+        }
+    }
     switch (addr) {
     case R_TNPDS: return (uint32_t)s->tx_ring;
     case R_TNPDS + 4: return (uint32_t)(s->tx_ring >> 32);
@@ -484,6 +526,40 @@ static void rtl8168_eri_access(RTL8168State *s, uint32_t value)
 
 static void rtl8168_reg_write(RTL8168State *s, hwaddr addr, uint32_t value, unsigned size)
 {
+    if (s->is8125) {
+        switch (addr) {
+        case R_IMR_8125:
+            s->imr = value;
+            rtl8168_update_irq(s);
+            return;
+        case R_ISR_8125:
+            s->isr &= ~value;
+            rtl8168_update_irq(s);
+            return;
+        case R_TXPOLL_8125:
+            if (value & 1) {
+                rtl8168_transmit(s);
+            }
+            return;
+        case R_EPHYAR: {
+            /* bit 31 set = write (flag drops when done), else read (flag rises) */
+            unsigned reg = (value >> 16) & 0x3f;
+            if (value & (1u << 31)) {
+                s->ephy[reg] = value & 0xffff;
+                s->ephyar = value & ~(1u << 31);
+            } else {
+                s->ephyar = (value & 0x7fff0000) | s->ephy[reg] | (1u << 31);
+            }
+            return;
+        }
+        case R_INTRMITIGATE:
+            s->intrmitigate = value;
+            return;
+        }
+        if (addr >= 0x38 && addr < 0x40) {
+            return;   /* partial access to the 32-bit IMR/ISR: ignored */
+        }
+    }
     switch (addr) {
     case R_TNPDS: s->tx_ring = (s->tx_ring & ~0xffffffffull) | value; s->tx_index = 0; return;
     case R_TNPDS + 4: s->tx_ring = (s->tx_ring & 0xffffffffull) | ((uint64_t)value << 32); return;
@@ -510,7 +586,7 @@ static void rtl8168_reg_write(RTL8168State *s, hwaddr addr, uint32_t value, unsi
         rtl8168_update_irq(s);
         return;
     case R_TXCONFIG:
-        s->txconfig = TXCFG_XID_8168H | TXCFG_EMPTY | (value & 0x0f0ff7ff & ~TXCFG_EMPTY);
+        s->txconfig = rtl8168_xid(s) | TXCFG_EMPTY | (value & 0x0f0ff7ff & ~TXCFG_EMPTY);
         return;
     case R_RXCONFIG: s->rxconfig = value; return;
     case R_CFG9346: s->cfg9346 = value; return;
@@ -529,7 +605,7 @@ static void rtl8168_reg_write(RTL8168State *s, hwaddr addr, uint32_t value, unsi
     case R_OCPDR: {
         /* MAC OCP: address (even) in bits 30:16 as reg << 15. */
         unsigned reg = ((value >> 15) & 0xfffe);
-        unsigned idx = (reg / 2) & 0xff;
+        unsigned idx = (reg / 2) & 0x7fff;
         if (value & (1u << 31)) {
             s->mac_ocp[idx] = value & 0xffff;
         }
@@ -582,8 +658,16 @@ static void rtl8168_reg_write(RTL8168State *s, hwaddr addr, uint32_t value, unsi
 
 /* Registers are 8, 16 or 32 bits wide at their natural offsets; anything else
  * is split into bytes. */
-static bool rtl8168_wide_reg(hwaddr addr, unsigned size)
+static bool rtl8168_wide_reg(RTL8168State *s, hwaddr addr, unsigned size)
 {
+    if (s->is8125) {
+        switch (addr) {
+        case R_IMR_8125: case R_ISR_8125: case R_EPHYAR:
+            return size == 4;
+        case R_TXPOLL_8125: case R_INTRMITIGATE:
+            return size == 2;
+        }
+    }
     switch (addr) {
     case R_TNPDS: case R_TNPDS + 4: case R_RDSAR: case R_RDSAR + 4:
     case R_TXCONFIG: case R_RXCONFIG: case R_PHYAR: case R_ERIDR:
@@ -598,7 +682,7 @@ static bool rtl8168_wide_reg(hwaddr addr, unsigned size)
 static uint64_t rtl8168_mmio_read(void *opaque, hwaddr addr, unsigned size)
 {
     RTL8168State *s = opaque;
-    if (size == 1 || rtl8168_wide_reg(addr, size)) {
+    if (size == 1 || rtl8168_wide_reg(s, addr, size)) {
         return rtl8168_reg_read(s, addr, size);
     }
     uint64_t value = 0;
@@ -611,7 +695,7 @@ static uint64_t rtl8168_mmio_read(void *opaque, hwaddr addr, unsigned size)
 static void rtl8168_mmio_write(void *opaque, hwaddr addr, uint64_t value, unsigned size)
 {
     RTL8168State *s = opaque;
-    if (size == 1 || rtl8168_wide_reg(addr, size)) {
+    if (size == 1 || rtl8168_wide_reg(s, addr, size)) {
         rtl8168_reg_write(s, addr, (uint32_t)value, size);
         return;
     }
@@ -641,9 +725,11 @@ static void rtl8168_realize(PCIDevice *dev, Error **errp)
     RTL8168State *s = RTL8168(dev);
     DeviceState *d = DEVICE(dev);
 
+    s->is8125 = object_dynamic_cast(OBJECT(dev), TYPE_RTL8125) != NULL;
     dev->config[PCI_INTERRUPT_PIN] = 1;
     memory_region_init_io(&s->io, OBJECT(s), &rtl8168_ops, s, "rtl8168-io", 0x100);
-    memory_region_init_io(&s->mmio, OBJECT(s), &rtl8168_ops, s, "rtl8168-mmio", 0x1000);
+    memory_region_init_io(&s->mmio, OBJECT(s), &rtl8168_ops, s, "rtl8168-mmio",
+                          s->is8125 ? MMIO_SIZE_8125 : MMIO_SIZE_8168);
     /* As on the real card: BAR0 I/O ports, BAR2 64-bit registers. */
     pci_register_bar(dev, 0, PCI_BASE_ADDRESS_SPACE_IO, &s->io);
     pci_register_bar(dev, 2, PCI_BASE_ADDRESS_SPACE_MEMORY | PCI_BASE_ADDRESS_MEM_TYPE_64,
@@ -705,9 +791,28 @@ static const TypeInfo rtl8168_info = {
     },
 };
 
+static void rtl8125_class_init(ObjectClass *klass, void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+    PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
+
+    k->device_id = 0x8125;
+    k->subsystem_vendor_id = PCI_VENDOR_ID_REALTEK;
+    k->subsystem_id = 0x0123;
+    k->revision = 0x05;
+    dc->desc = "Realtek RTL8125B 2.5G Ethernet (test model)";
+}
+
+static const TypeInfo rtl8125_info = {
+    .name = TYPE_RTL8125,
+    .parent = TYPE_RTL8168,
+    .class_init = rtl8125_class_init,
+};
+
 static void rtl8168_register_types(void)
 {
     type_register_static(&rtl8168_info);
+    type_register_static(&rtl8125_info);
 }
 
 type_init(rtl8168_register_types)

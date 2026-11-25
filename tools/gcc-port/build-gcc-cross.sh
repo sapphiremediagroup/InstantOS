@@ -3,7 +3,7 @@
 # / mlibc). Assembles an mlibc GCC sysroot, applies the OS port, configures and
 # builds gcc + libgcc against the Step-A binutils cross tools.
 #
-# Native build (fast, wedge-safe); GCC source under /home/sky/gcc-port.
+# Native build (fast, wedge-safe); GCC source under ${GCC_PORT_DIR:-$HOME/gcc-port}.
 #   STOP_AFTER_CONFIGURE=1  validate the port without the long build
 #   LANGS=c,c++             build C++ too (default: c)
 #   RECONFIGURE=1           force reconfigure
@@ -11,7 +11,7 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BUILD_DIR="$REPO/build"
-NATIVE="/home/sky/gcc-port"
+NATIVE="${GCC_PORT_DIR:-$HOME/gcc-port}"
 SRC="$NATIVE/gcc-13.3.0"
 OBJ="$NATIVE/build-cross"
 PREFIX="$NATIVE/gcc-install"

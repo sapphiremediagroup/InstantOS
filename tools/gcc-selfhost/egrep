@@ -1,0 +1,3 @@
+#!/bin/sh
+# GNU grep dropped egrep; configure scripts (libtool's GNU ld check) still call it.
+exec grep -E "$@"

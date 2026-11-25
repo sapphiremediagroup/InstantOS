@@ -1,6 +1,7 @@
 #include <fs/ramfs/ramfs.hpp>
 #include <common/string.hpp>
 #include <memory/heap.hpp>
+#include <memory/shared_pages.hpp>
 #include <time/time.hpp>
 
 namespace {
@@ -140,6 +141,39 @@ VNode* RamFS::getRoot() {
     return rootNode;
 }
 
+// Each lookup or create makes a VNode over a RamFSNode the tree owns: free
+// just the VNode once the VFS lets go of it (it leaked on every /tmp, /etc
+// and /sys path walk).
+void RamFS::releaseNode(VNode* node) {
+    if (!node || node == rootNode) {
+        return;
+    }
+    auto* ramNode = static_cast<RamFSNode*>(node->getData());
+    delete node;
+    if (ramNode && --ramNode->refs == 0 && ramNode->unlinked) {
+        freeNode(ramNode);
+    }
+}
+
+VNode* RamFS::makeVNode(FileSystem* fs, RamFSNode* node, VNodeOps* ops) {
+    auto* vnode = new VNode(fs, node->inode, node->type);
+    if (vnode) {
+        vnode->setData(node);
+        vnode->ops = ops;
+        node->refs++;
+    }
+    return vnode;
+}
+
+SharedPages* RamFS::pagesOf(VNode* node) {
+    if (!node || !node->ops || node->ops->read != nodeRead || node->getType() != FileType::Regular) {
+        return nullptr;
+    }
+    auto* ramNode = static_cast<RamFSNode*>(node->getData());
+    auto* file = ramNode && ramNode->type == FileType::Regular ? static_cast<RamFSFileData*>(ramNode->data) : nullptr;
+    return file ? file->pages : nullptr;
+}
+
 RamFSNode* RamFS::createNode(const char* name, FileType type, uint32_t mode) {
     RamFSNode* node = (RamFSNode*)kmalloc(sizeof(RamFSNode));
     if (!node) return nullptr;
@@ -166,17 +200,20 @@ RamFSNode* RamFS::createNode(const char* name, FileType type, uint32_t mode) {
     node->uid = 0;
     node->gid = 0;
     node->rdev = 0;
+    node->refs = 0;
+    node->unlinked = false;
 
     if (type == FileType::Regular) {
         RamFSFileData* file = (RamFSFileData*)kmalloc(sizeof(RamFSFileData));
-        if (!file) {
+        SharedPages* pages = file ? SharedPages::create() : nullptr;
+        if (!pages) {
+            if (file) kfree(file);
             kfree(node);
             return nullptr;
         }
-        file->data = nullptr;
-        file->size = 0;
-        file->capacity = 0;
+        file->pages = pages;
         file->links = 1;
+        file->nodes = 1;
         file->mode = mode;
         file->atime = now;
         file->mtime = now;
@@ -197,23 +234,37 @@ void RamFS::destroyNode(RamFSNode* node) {
         child = next;
     }
     
+    dropNode(node);
+}
+
+// An open file keeps its memory without a name (shm_open, then shm_unlink; a
+// temporary file): it was freed under its users before.
+void RamFS::dropNode(RamFSNode* node) {
     if (node->type == FileType::Regular) {
         RamFSFileData* file = (RamFSFileData*)node->data;
-        if (file) {
-            if (file->links > 0) {
-                file->links--;
-            }
-            if (file->links == 0) {
-                if (file->data) {
-                    kfree(file->data);
-                }
-                kfree(file);
-            }
+        if (file && file->links > 0) {
+            file->links--;
+        }
+    }
+    node->parent = nullptr;
+    node->firstChild = nullptr;
+    node->nextSibling = nullptr;
+    node->unlinked = true;
+    if (node->refs == 0) {
+        freeNode(node);
+    }
+}
+
+void RamFS::freeNode(RamFSNode* node) {
+    if (node->type == FileType::Regular) {
+        RamFSFileData* file = (RamFSFileData*)node->data;
+        if (file && --file->nodes == 0) {
+            file->pages->releaseFile();
+            kfree(file);
         }
     } else if (node->type == FileType::Symlink && node->data) {
         kfree(node->data);
     }
-    
     kfree(node);
 }
 
@@ -234,20 +285,7 @@ int64_t RamFS::nodeRead(VNode* node, void* buffer, uint64_t size, uint64_t offse
     RamFSFileData* file = (RamFSFileData*)ramNode->data;
     if (!file) return -1;
 
-    if (offset >= file->size) return 0;
-    
-    uint64_t toRead = size;
-    if (offset + toRead > file->size) {
-        toRead = file->size - offset;
-    }
-    
-    if (file->data) {
-        uint8_t* src = (uint8_t*)file->data + offset;
-        uint8_t* dst = (uint8_t*)buffer;
-        for (uint64_t i = 0; i < toRead; i++) {
-            dst[i] = src[i];
-        }
-    }
+    const int64_t toRead = file->pages->read(buffer, size, offset);
 
     file->atime = ramfsNow();
     ramNode->atime = file->atime;
@@ -263,43 +301,17 @@ int64_t RamFS::nodeWrite(VNode* node, const void* buffer, uint64_t size, uint64_
     RamFSFileData* file = (RamFSFileData*)ramNode->data;
     if (!file) return -1;
     
-    uint64_t newSize = offset + size;
-    if (newSize > file->capacity) {
-        // Grow geometrically (by up to 1 MiB at a time): reallocating to the
-        // exact size made a file written in small pieces cost O(n^2) copying,
-        // all of it with interrupts off.
-        const uint64_t step = file->capacity < (1ULL << 20) ? file->capacity : (1ULL << 20);
-        uint64_t capacity = file->capacity + step;
-        if (capacity < newSize) capacity = newSize;
-        capacity = (capacity + 4095) & ~4095ULL;
-        void* newData = kmalloc(capacity);
-        if (!newData) return -1;
-
-        if (file->data) {
-            memcpy(newData, file->data, file->size);
-            kfree(file->data);
-        }
-        file->data = newData;
-        file->capacity = capacity;
-    }
-    if (newSize > file->size) {
-        // A write past the end leaves a hole of zeros.
-        if (offset > file->size) {
-            memset((uint8_t*)file->data + file->size, 0, offset - file->size);
-        }
-        file->size = newSize;
-        ramNode->size = newSize;
-    }
-
-    memcpy((uint8_t*)file->data + offset, buffer, size);
+    const int64_t written = file->pages->write(buffer, size, offset);
+    if (written < 0) return -1;
+    ramNode->size = file->pages->size();
 
     const uint64_t now = ramfsNow();
     file->mtime = now;
     file->ctime = now;
     ramNode->mtime = now;
     ramNode->ctime = now;
-    
-    return size;
+
+    return written;
 }
 
 int RamFS::nodeTruncate(VNode* node, uint64_t size) {
@@ -309,27 +321,8 @@ int RamFS::nodeTruncate(VNode* node, uint64_t size) {
     if (!ramNode || ramNode->type != FileType::Regular) return -1;
     RamFSFileData* file = (RamFSFileData*)ramNode->data;
     if (!file) return -1;
-    if (size == file->size) return 0;
-
-    void* newData = nullptr;
-    if (size != 0) {
-        newData = kmalloc(size);
-        if (!newData) return -1;
-
-        uint8_t* dst = (uint8_t*)newData;
-        uint64_t preserve = file->size < size ? file->size : size;
-        if (file->data) {
-            memcpy(dst, file->data, preserve);
-        }
-        memset(dst + preserve, 0, size - preserve);
-    }
-
-    if (file->data) {
-        kfree(file->data);
-    }
-    file->data = newData;
-    file->size = size;
-    file->capacity = size;
+    if (size == file->pages->size()) return 0;
+    if (const int error = file->pages->resize(size); error != 0) return error;
     ramNode->size = size;
     const uint64_t now = ramfsNow();
     file->mtime = now;
@@ -408,7 +401,7 @@ int RamFS::nodeStat(VNode* node, FileStats* stats) {
     if (!ramNode) return -1;
     
     RamFSFileData* file = ramNode->type == FileType::Regular ? (RamFSFileData*)ramNode->data : nullptr;
-    stats->size = file ? file->size : ramNode->size;
+    stats->size = file ? file->pages->size() : ramNode->size;
     stats->type = ramNode->type;
     stats->mode = file ? file->mode : ramNode->mode;
     stats->inode = ramNode->inode;
@@ -481,10 +474,7 @@ VNode* RamFS::nodeLookup(VNode* node, const char* name) {
     RamFSNode* child = ramNode->firstChild;
     while (child) {
         if (ramfsNameEquals(name, child->name)) {
-            VNode* childNode = new VNode(node->getFS(), child->inode, child->type);
-            childNode->setData(child);
-            childNode->ops = node->ops;
-            return childNode;
+            return makeVNode(node->getFS(), child, node->ops);
         }
         
         child = child->nextSibling;
@@ -512,9 +502,7 @@ int RamFS::nodeCreate(VNode* parent, const char* name, uint32_t mode, VNode** re
     parentNode->mtime = now;
     parentNode->ctime = now;
     
-    VNode* vnode = new VNode(parent->getFS(), newNode->inode, FileType::Regular);
-    vnode->setData(newNode);
-    vnode->ops = parent->ops;
+    VNode* vnode = makeVNode(parent->getFS(), newNode, parent->ops);
     
     *result = vnode;
     return 0;
@@ -556,9 +544,7 @@ int RamFS::nodeMknod(VNode* parent, const char* name, uint32_t mode, uint64_t de
     parentNode->mtime = now;
     parentNode->ctime = now;
 
-    VNode* vnode = new VNode(parent->getFS(), newNode->inode, type);
-    vnode->setData(newNode);
-    vnode->ops = parent->ops;
+    VNode* vnode = makeVNode(parent->getFS(), newNode, parent->ops);
 
     *result = vnode;
     return 0;
@@ -583,9 +569,7 @@ int RamFS::nodeMkdir(VNode* parent, const char* name, uint32_t mode, VNode** res
     parentNode->mtime = now;
     parentNode->ctime = now;
     
-    VNode* vnode = new VNode(parent->getFS(), newNode->inode, FileType::Directory);
-    vnode->setData(newNode);
-    vnode->ops = parent->ops;
+    VNode* vnode = makeVNode(parent->getFS(), newNode, parent->ops);
     
     *result = vnode;
     return 0;
@@ -748,7 +732,12 @@ int RamFS::nodeLink(VNode* oldParent, const char* oldName, VNode* newParent, con
     linkNode->type = FileType::Regular;
     linkNode->inode = source->inode;
     linkNode->mode = file->mode;
-    linkNode->size = file->size;
+    linkNode->size = file->pages->size();
+    linkNode->uid = source->uid;
+    linkNode->gid = source->gid;
+    linkNode->rdev = 0;
+    linkNode->refs = 0;
+    linkNode->unlinked = false;
     linkNode->data = file;
     linkNode->parent = newParentNode;
     linkNode->firstChild = nullptr;
@@ -759,6 +748,7 @@ int RamFS::nodeLink(VNode* oldParent, const char* oldName, VNode* newParent, con
     linkNode->ctime = now;
 
     file->links++;
+    file->nodes++;
     file->ctime = now;
     newParentNode->firstChild = linkNode;
     newParentNode->mtime = now;
@@ -799,9 +789,7 @@ int RamFS::nodeSymlink(VNode* parent, const char* name, const char* target, VNod
     parentNode->mtime = now;
     parentNode->ctime = now;
 
-    VNode* vnode = new VNode(parent->getFS(), newNode->inode, FileType::Symlink);
-    vnode->setData(newNode);
-    vnode->ops = parent->ops;
+    VNode* vnode = makeVNode(parent->getFS(), newNode, parent->ops);
     *result = vnode;
     return 0;
 }

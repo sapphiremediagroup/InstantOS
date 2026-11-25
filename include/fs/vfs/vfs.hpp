@@ -112,6 +112,10 @@ public:
     // Backed by a block device (ext4, FAT32): its operations run under the
     // storage lock instead of the big kernel lock (fs/storage/storage_lock.hpp).
     virtual bool isBlockBacked() const { return false; }
+    // Called by the VFS when it is done with a node this filesystem returned
+    // (from lookup/create/mkdir/...). Filesystems that make a fresh node per
+    // lookup (ext4) free it here; the in-memory ones keep theirs (no-op).
+    virtual void releaseNode(VNode* node) { (void)node; }
     
     const char* getName() { return name; }
     
@@ -162,6 +166,7 @@ public:
     
     int open(const char* path, int flags, FileDescriptor** fd, uint32_t mode = 0666);
     void retain(FileDescriptor* fd);
+    static void releaseNode(VNode* node);   // FileSystem::releaseNode of its owner
     int close(FileDescriptor* fd);
     int64_t read(FileDescriptor* fd, void* buffer, uint64_t size);
     int64_t write(FileDescriptor* fd, const void* buffer, uint64_t size);

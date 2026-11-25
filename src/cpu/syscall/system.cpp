@@ -20,6 +20,7 @@
 #include <fs/storage/storage.hpp>
 #include <fs/storage/storage_lock.hpp>
 #include <fs/ahci/ahci.hpp>
+#include <fs/ext4/ext4.hpp>
 #include <cpu/acpi/acpi.hpp>
 #include <cpuid.h>
 
@@ -219,6 +220,36 @@ uint64_t Syscall::sys_storage_mount() {
     return KernelStorage::mountFat32() == 0 ? 0 : syscall_error(SysErrInvalid);
 }
 
+namespace {
+// Commits the running transaction of every mounted ext4 volume (only the ones
+// due with `onlyDue`). The caller holds the storage lock.
+bool syncExt4Volumes(bool onlyDue) {
+    bool ok = true;
+    for (uint32_t i = 0; i < Ext4FS::mountedCount(); ++i) {
+        if (Ext4FS* fs = Ext4FS::mountedVolume(i)) {
+            ok = fs->sync(onlyDue) == 0 && ok;
+        }
+    }
+    return ok;
+}
+}  // namespace
+
+// The ext4 driver collects metadata in one running transaction for up to
+// Ext4FS::kCommitMs; storage-manager calls this (Due) about once a second so an
+// idle system's last changes reach the disk, and All is sync(2).
+uint64_t Syscall::sys_storage_sync(uint64_t mode) {
+    const auto how = static_cast<StorageSyncMode>(mode);
+    if (how != StorageSyncMode::All && how != StorageSyncMode::Due) {
+        return syscall_error(SysErrInvalid);
+    }
+    StorageLock::Section storage;
+    bool ok = syncExt4Volumes(how == StorageSyncMode::Due);
+    if (how == StorageSyncMode::All) {
+        ok = AHCIPort::flushAll() && ok;   // sync(2): out of the drives' caches too
+    }
+    return ok ? 0 : syscall_error(SysErrIO);
+}
+
 uint64_t Syscall::sys_gettime() {
     return Timer::get().getMilliseconds();
 }
@@ -269,6 +300,9 @@ uint64_t Syscall::sys_reboot(uint64_t mode) {
     Cereal::get().write(how == RebootMode::Restart ? "[power] restarting\n" : "[power] powering off\n");
     {
         StorageLock::Section storage;
+        if (!syncExt4Volumes(false)) {
+            Cereal::get().write("[power] committing an ext4 transaction failed\n");
+        }
         if (!AHCIPort::flushAll()) {
             Cereal::get().write("[power] a disk flush failed\n");
         }

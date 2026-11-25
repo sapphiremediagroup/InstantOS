@@ -1,0 +1,615 @@
+diff --git a/options/internal/generic/threads.cpp b/options/internal/generic/threads.cpp
+index dbb33136..75c3bc4f 100644
+--- a/options/internal/generic/threads.cpp
++++ b/options/internal/generic/threads.cpp
+@@ -12,6 +12,83 @@
+ #include <mlibc/time-helpers.hpp>
+ 
+ extern "C" Tcb *__rtld_allocateTcb();
++extern "C" void __rtld_freeTcb(Tcb *tcb);
++
++namespace {
++
++// What ended threads leave behind. A thread cannot free its own stack and TCB: it needs
++// them until the kernel has taken it off for good, which clears its TCB's tid (and wakes
++// who waits for that). pthread_join() waits and frees; detached threads go on a list that
++// is looked through whenever threads are made. (Without a lock: ending threads that had to
++// wait for one another piled up.) Some stacks are kept for new threads.
++FutexLock stack_lock_;
++Tcb *dead_threads_ = nullptr;
++
++struct CachedStack {
++	void *address;
++	size_t size;
++	size_t guard;
++};
++constexpr size_t max_cached_stacks_ = 16;
++CachedStack cached_stacks_[max_cached_stacks_];
++size_t cached_stack_count_ = 0;
++
++void release_stack(void *address, size_t size, size_t guard) {
++	{
++		auto g = frg::guard(&stack_lock_);
++		if (cached_stack_count_ < max_cached_stacks_) {
++			cached_stacks_[cached_stack_count_++] = {address, size, guard};
++			return;
++		}
++	}
++	mlibc::sysdep<VmUnmap>(reinterpret_cast<char *>(address) - guard, size + guard);
++}
++
++// A stack of this size from the cache, or null.
++void *take_cached_stack(size_t size, size_t guard) {
++	auto g = frg::guard(&stack_lock_);
++	for (size_t i = cached_stack_count_; i--; ) {
++		if (cached_stacks_[i].size == size && cached_stacks_[i].guard == guard) {
++			auto address = cached_stacks_[i].address;
++			cached_stacks_[i] = cached_stacks_[--cached_stack_count_];
++			return address;
++		}
++	}
++	return nullptr;
++}
++
++// The kernel is done with the thread.
++void release_thread(Tcb *tcb) {
++	if (tcb->ownsStack)
++		release_stack(tcb->stackAddr, tcb->stackSize, tcb->guardSize);
++	__rtld_freeTcb(tcb);
++}
++
++void bury_thread(Tcb *tcb) {
++	tcb->nextDead = __atomic_load_n(&dead_threads_, __ATOMIC_RELAXED);
++	while (!__atomic_compare_exchange_n(&dead_threads_, &tcb->nextDead, tcb, true,
++			__ATOMIC_RELEASE, __ATOMIC_RELAXED)) { }
++}
++
++void reap_dead_threads() {
++	// The whole list is taken, and those the kernel still has are put back.
++	Tcb *tcb = __atomic_exchange_n(&dead_threads_, nullptr, __ATOMIC_ACQUIRE);
++	while (tcb) {
++		Tcb *next = tcb->nextDead;
++		if (!__atomic_load_n(&tcb->tid, __ATOMIC_ACQUIRE))
++			release_thread(tcb);
++		else
++			bury_thread(tcb);
++		tcb = next;
++	}
++}
++
++// Tcb::isJoinable.
++constexpr int thread_detached = 0;   // or joined
++constexpr int thread_joinable = 1;
++constexpr int thread_ended = 2;      // and joinable
++
++} // namespace
+ 
+ namespace {
+ 
+@@ -75,6 +152,7 @@ int thread_once(__mlibc_once *once, void (*func) (void)) {
+ }
+ 
+ int thread_create(struct __mlibc_thread_data **__restrict thread, const struct __mlibc_threadattr *__restrict attrp, void *entry, void *__restrict user_arg, bool returns_int) {
++	reap_dead_threads();
+ 	auto new_tcb = __rtld_allocateTcb();
+ 	pid_t tid;
+ 	struct __mlibc_threadattr attr = {};
+@@ -92,14 +170,25 @@ int thread_create(struct __mlibc_thread_data **__restrict thread, const struct _
+ 	// when the stack is allocated. Currently this isn't propagated to the TCB,
+ 	// but it should be.
+ 	void *stack = attr.__mlibc_stackaddr;
++	bool own_stack = !stack;
++	size_t cached_guard = attr.__mlibc_guardsize;
++	bool cached = false;
++	if (own_stack) {
++		stack = take_cached_stack(attr.__mlibc_stacksize, attr.__mlibc_guardsize);
++		cached = stack;
++	}
+ 	if (!IsImplemented<PrepareStack>) {
+ 		MLIBC_MISSING_SYSDEP();
+ 		return ENOSYS;
+ 	}
+ 	int ret = sysdep_or_panic<PrepareStack>(&stack, entry,
+ 			user_arg, new_tcb, &attr.__mlibc_stacksize, &attr.__mlibc_guardsize, &new_tcb->stackAddr);
+-	if (ret)
+-		return ret;
++	if (ret) {
++		__rtld_freeTcb(new_tcb);
++		return EAGAIN;
++	}
++	if (cached)
++		attr.__mlibc_guardsize = cached_guard;
+ 
+ 	if (!IsImplemented<Clone>) {
+ 		MLIBC_MISSING_SYSDEP();
+@@ -107,10 +196,14 @@ int thread_create(struct __mlibc_thread_data **__restrict thread, const struct _
+ 	}
+ 	new_tcb->stackSize = attr.__mlibc_stacksize;
+ 	new_tcb->guardSize = attr.__mlibc_guardsize;
++	new_tcb->ownsStack = own_stack;
+ 	new_tcb->returnValueType = (returns_int) ? TcbThreadReturnValue::Integer : TcbThreadReturnValue::Pointer;
+ 	new_tcb->isJoinable = (attr.__mlibc_detachstate == __MLIBC_THREAD_CREATE_JOINABLE);
+ 	__atomic_store_n(&new_tcb->cancelBits, 0, __ATOMIC_RELAXED);
+-	sysdep_or_panic<Clone>(new_tcb, &tid, stack);
++	if (sysdep_or_panic<Clone>(new_tcb, &tid, stack)) {
++		release_thread(new_tcb);
++		return EAGAIN;
++	}
+ 	*thread = reinterpret_cast<struct __mlibc_thread_data *>(new_tcb);
+ 
+ 	__atomic_store_n(&new_tcb->tid, tid, __ATOMIC_RELAXED);
+@@ -119,21 +212,28 @@ int thread_create(struct __mlibc_thread_data **__restrict thread, const struct _
+ 	return 0;
+ }
+ 
++// The signal of a deferred cancellation may have come and gone before the wait, which
++// it then does not end.
++static bool cancel_pending() {
++	return tcb_cancelled(__atomic_load_n(&mlibc::get_current_tcb()->cancelBits, __ATOMIC_RELAXED));
++}
++
+ int thread_join(struct __mlibc_thread_data *thread, void *ret) {
+ 	auto tcb = reinterpret_cast<Tcb *>(thread);
+ 
+-	if(!tcb->isJoinable) {
++	if (tcb == mlibc::get_current_tcb())
++		return EDEADLK;
++
++	if (__atomic_load_n(&tcb->isJoinable, __ATOMIC_ACQUIRE) == thread_detached) {
+ 		mlibc::infoLogger() << "mlibc: pthread_join() called on a detached thread" << frg::endlog;
+ 		return EINVAL;
+ 	}
+ 
+-	if (!__atomic_load_n(&tcb->isJoinable, __ATOMIC_ACQUIRE))
+-		return EINVAL;
+-
+ 	mlibc::thread_testcancel();
+ 
+-	while (!__atomic_load_n(&tcb->didExit, __ATOMIC_ACQUIRE)) {
+-		if (int e = sysdep<FutexWait>(&tcb->didExit, 0, nullptr); e == EINTR)
++	// The kernel clears the tid when the thread is gone.
++	while (auto tid = __atomic_load_n(&tcb->tid, __ATOMIC_ACQUIRE)) {
++		if (cancel_pending() || sysdep<FutexWait>(&tcb->tid, tid, nullptr) == EINTR)
+ 			mlibc::thread_testcancel();
+ 	}
+ 
+@@ -142,22 +242,26 @@ int thread_join(struct __mlibc_thread_data *thread, void *ret) {
+ 	else if(ret && tcb->returnValueType == TcbThreadReturnValue::Integer)
+ 		*reinterpret_cast<int *>(ret) = tcb->returnValue.integer;
+ 
+-	// FIXME: destroy tcb here, currently we leak it
++	release_thread(tcb);
+ 
+ 	return 0;
+ }
+ 
+ int thread_detach(struct __mlibc_thread_data *thread) {
+ 	auto tcb = reinterpret_cast<Tcb *>(thread);
+-	if (!__atomic_load_n(&tcb->isJoinable, __ATOMIC_RELAXED))
+-		return EINVAL;
++	int expected = thread_joinable;
++	if (__atomic_compare_exchange_n(&tcb->isJoinable, &expected, thread_detached, false, __ATOMIC_ACQ_REL,
++				__ATOMIC_ACQUIRE))
++		return 0;
+ 
+-	int expected = 1;
+-	if(!__atomic_compare_exchange_n(&tcb->isJoinable, &expected, 0, false, __ATOMIC_RELEASE,
+-				__ATOMIC_RELAXED))
+-		return EINVAL;
++	// It has ended already and leaves its memory to us.
++	if (expected == thread_ended && __atomic_compare_exchange_n(&tcb->isJoinable, &expected, thread_detached,
++				false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
++		bury_thread(tcb);
++		return 0;
++	}
+ 
+-	return 0;
++	return EINVAL;
+ }
+ 
+ namespace {
+@@ -201,9 +305,13 @@ __attribute__ ((__noreturn__)) void thread_exit(thread_exit_return ret_val) {
+ 	self->returnValue = ret_val;
+ 
+ 	__atomic_store_n(&self->didExit, 1, __ATOMIC_RELEASE);
+-	sysdep<FutexWake>(&self->didExit, true);
+ 
+-	// TODO: clean up thread resources when we are detached.
++	// A detached thread's memory goes to whoever looks next; a joinable one's to who joins
++	// or detaches it. Not before the kernel, at the end of ThreadExit, clears the tid.
++	int expected = thread_joinable;
++	if (!__atomic_compare_exchange_n(&self->isJoinable, &expected, thread_ended, false, __ATOMIC_ACQ_REL,
++				__ATOMIC_ACQUIRE))
++		bury_thread(self);
+ 
+ 	// TODO: do exit(0) when we're the only thread instead
+ 	mlibc::do_exit();
+@@ -266,11 +374,15 @@ int thread_mutex_destroy(struct __mlibc_mutex *mutex) {
+ int thread_mutex_timedlock(struct __mlibc_mutex *mutex, const struct timespec *__restrict abstime, clockid_t clockid) {
+ 	unsigned int this_tid = mlibc::this_tid();
+ 	unsigned int expected = 0;
++	// Unlocking wakes one waiter, so whoever has waited takes the mutex with the
++	// waiters bit set: there may be others. Without contention no unlock has to
++	// make a syscall.
++	unsigned int taken = this_tid;
+ 	while(true) {
+ 		if(!expected) {
+ 			// Try to take the mutex here.
+ 			if(__atomic_compare_exchange_n(&mutex->__mlibc_state,
+-					&expected, this_tid | mutex_waiters_bit, false, __ATOMIC_ACQUIRE, __ATOMIC_ACQUIRE)) {
++					&expected, taken, false, __ATOMIC_ACQUIRE, __ATOMIC_ACQUIRE)) {
+ 				__ensure(!mutex->__mlibc_recursion);
+ 				mutex->__mlibc_recursion = 1;
+ 				return 0;
+@@ -315,6 +427,7 @@ int thread_mutex_timedlock(struct __mlibc_mutex *mutex, const struct timespec *_
+ 
+ 				// Opportunistically try to take the lock after we wake up.
+ 				expected = 0;
++				taken = this_tid | mutex_waiters_bit;
+ 			}else{
+ 				// Otherwise we have to set the waiters flag first.
+ 				unsigned int desired = expected | mutex_waiters_bit;
+@@ -356,32 +469,30 @@ int thread_mutex_trylock(struct __mlibc_mutex *mutex) {
+ }
+ 
+ int thread_mutex_unlock(struct __mlibc_mutex *mutex) {
++	// Error checking and recursive mutexes say so when another thread's (or nobody's)
++	// mutex is unlocked, before anything of it changes.
++	if ((mutex->__mlibc_flags & (mutexErrorCheck | mutexRecursive))
++			&& (__atomic_load_n(&mutex->__mlibc_state, __ATOMIC_RELAXED) & mutex_owner_mask) != mlibc::this_tid())
++		return EPERM;
++
+ 	// Decrement the recursion level and unlock if we hit zero.
+ 	__ensure(mutex->__mlibc_recursion);
+ 	if(--mutex->__mlibc_recursion)
+ 		return 0;
+ 
+-	auto flags = mutex->__mlibc_flags;
+-
+ 	// Reset the mutex to the unlocked state.
+ 	auto state = __atomic_exchange_n(&mutex->__mlibc_state, 0, __ATOMIC_RELEASE);
+ 
+ 	// After this point the mutex is unlocked, and therefore we cannot access its contents as it
+ 	// may have been destroyed by another thread.
+ 
+-	unsigned int this_tid = mlibc::this_tid();
+-	if ((flags & mutexErrorCheck) && (state & mutex_owner_mask) != this_tid)
+-		return EPERM;
+-
+-	if ((flags & mutexErrorCheck) && !(state & mutex_owner_mask))
+-		return EINVAL;
+-
+-	__ensure((state & mutex_owner_mask) == this_tid);
++	// The owner of a normal mutex is not checked: after fork() the child's thread
++	// has another id than the one that locked it (in an atfork handler, say).
+ 
+ 	if(state & mutex_waiters_bit) {
+ 		// Wake the futex if there were waiters. Since the mutex might not exist at this location
+ 		// anymore, we must conservatively ignore EACCES and EINVAL which may occur as a result.
+-		int e = mlibc::sysdep<FutexWake>((int *)&mutex->__mlibc_state, true);
++		int e = mlibc::sysdep<FutexWake>((int *)&mutex->__mlibc_state, false);
+ 		__ensure(e >= 0 || e == EACCES || e == EINVAL);
+ 	}
+ 
+@@ -427,12 +538,39 @@ int thread_cond_init(struct __mlibc_cond *__restrict cond, const struct __mlibc_
+ 	return 0;
+ }
+ 
+-int thread_cond_destroy(struct __mlibc_cond *) {
++// __mlibc_flags counts the waiters above its low byte, so that a signal nobody waits
++// for makes no syscall. A waiter is counted before it reads the sequence number and
++// gives up the mutex, a signal raises the number before it looks at the count.
++static constexpr unsigned int cond_destroy_bit = 1u << 7;
++static constexpr unsigned int cond_one_waiter = 1u << 8;
++
++// The waiter's last access to the condition variable.
++static void thread_cond_leave(struct __mlibc_cond *cond) {
++	auto flags = __atomic_fetch_sub(&cond->__mlibc_flags, cond_one_waiter, __ATOMIC_SEQ_CST);
++	if ((flags & cond_destroy_bit) && flags < 2 * cond_one_waiter)
++		mlibc::sysdep<FutexWake>((int *)&cond->__mlibc_flags, true);
++}
++
++// The waiters just woken may still have to look at it: wait for them to leave. Only for
++// a while, as nobody may destroy it while threads are blocked on it, yet some do at exit.
++int thread_cond_destroy(struct __mlibc_cond *cond) {
++	auto flags = __atomic_load_n(&cond->__mlibc_flags, __ATOMIC_SEQ_CST);
++	for (int i = 0; i < 100 && flags >= cond_one_waiter; i++) {
++		flags = __atomic_or_fetch(&cond->__mlibc_flags, cond_destroy_bit, __ATOMIC_SEQ_CST);
++		if (flags < cond_one_waiter)
++			break;
++		struct timespec timeout{0, 10'000'000};
++		mlibc::sysdep<FutexWait>((int *)&cond->__mlibc_flags, flags, &timeout);
++		flags = __atomic_load_n(&cond->__mlibc_flags, __ATOMIC_SEQ_CST);
++	}
++	__atomic_and_fetch(&cond->__mlibc_flags, ~cond_destroy_bit, __ATOMIC_RELAXED);
+ 	return 0;
+ }
+ 
+ int thread_cond_signal(struct __mlibc_cond *cond) {
+-	__atomic_fetch_add(&cond->__mlibc_seq, 1, __ATOMIC_RELEASE);
++	__atomic_fetch_add(&cond->__mlibc_seq, 1, __ATOMIC_SEQ_CST);
++	if (__atomic_load_n(&cond->__mlibc_flags, __ATOMIC_SEQ_CST) < cond_one_waiter)
++		return 0;
+ 	if(int e = mlibc::sysdep<FutexWake>((int *)&cond->__mlibc_seq, false); e)
+ 		__ensure(!"sys_futex_wake() failed");
+ 
+@@ -440,7 +578,9 @@ int thread_cond_signal(struct __mlibc_cond *cond) {
+ }
+ 
+ int thread_cond_broadcast(struct __mlibc_cond *cond) {
+-	__atomic_fetch_add(&cond->__mlibc_seq, 1, __ATOMIC_RELEASE);
++	__atomic_fetch_add(&cond->__mlibc_seq, 1, __ATOMIC_SEQ_CST);
++	if (__atomic_load_n(&cond->__mlibc_flags, __ATOMIC_SEQ_CST) < cond_one_waiter)
++		return 0;
+ 	if(int e = mlibc::sysdep<FutexWake>((int *)&cond->__mlibc_seq, true); e)
+ 		__ensure(!"sys_futex_wake() failed");
+ 
+@@ -455,7 +595,8 @@ int thread_cond_timedwait(struct __mlibc_cond *__restrict cond, __mlibc_mutex *_
+ 	if (abstime && (abstime->tv_nsec < 0 || abstime->tv_nsec >= nanos_per_second))
+ 		return EINVAL;
+ 
+-	auto seq = __atomic_load_n(&cond->__mlibc_seq, __ATOMIC_ACQUIRE);
++	__atomic_fetch_add(&cond->__mlibc_flags, cond_one_waiter, __ATOMIC_SEQ_CST);
++	auto seq = __atomic_load_n(&cond->__mlibc_seq, __ATOMIC_SEQ_CST);
+ 
+ 	// TODO: handle locking errors and cancellation properly.
+ 	while (true) {
+@@ -468,18 +609,31 @@ int thread_cond_timedwait(struct __mlibc_cond *__restrict cond, __mlibc_mutex *_
+ 			// pthread_cond_timedwait accepts an *absolute time*.
+ 			struct timespec timeout;
+ 			if (!mlibc::time_absolute_to_relative(clockid, abstime, &timeout)) {
++				thread_cond_leave(cond);
+ 				if (thread_mutex_lock(mutex))
+ 					__ensure(!"Failed to lock the mutex");
+ 				return EINVAL;
+ 			} else if (timeout.tv_sec == 0 && timeout.tv_nsec == 0) {
++				thread_cond_leave(cond);
+ 				if (thread_mutex_lock(mutex))
+ 					__ensure(!"Failed to lock the mutex");
+ 				return ETIMEDOUT;
+ 			}
+ 
+-			e = sysdep<FutexWait>((int *)&cond->__mlibc_seq, seq, &timeout);
++			e = cancel_pending() ? EINTR : sysdep<FutexWait>((int *)&cond->__mlibc_seq, seq, &timeout);
+ 		} else {
+-			e = sysdep<FutexWait>((int *)&cond->__mlibc_seq, seq, nullptr);
++			e = cancel_pending() ? EINTR : sysdep<FutexWait>((int *)&cond->__mlibc_seq, seq, nullptr);
++		}
++
++		// Nothing of the condition variable is touched from here on, unless the wait
++		// goes on: once woken, another thread may destroy it.
++		auto cur_seq = __atomic_load_n(&cond->__mlibc_seq, __ATOMIC_ACQUIRE);
++		bool woken = e == EAGAIN || (e == 0 && cur_seq != seq);
++		if (woken || e == ETIMEDOUT) {
++			thread_cond_leave(cond);
++			if (thread_mutex_lock(mutex))
++				__ensure(!"Failed to lock the mutex");
++			return woken ? 0 : ETIMEDOUT;
+ 		}
+ 
+ 		if (thread_mutex_lock(mutex))
+@@ -494,20 +648,13 @@ int thread_cond_timedwait(struct __mlibc_cond *__restrict cond, __mlibc_mutex *_
+ 		//      whether to go to sleep again or to return 0, but we do the former
+ 		//      to match other libcs.
+ 		//   4. e == ETIMEDOUT: this should only happen if abstime is set.
+-		if (e == 0) {
+-			auto cur_seq = __atomic_load_n(&cond->__mlibc_seq, __ATOMIC_ACQUIRE);
+-			if (cur_seq > seq)
+-				return 0;
+-		} else if (e == EAGAIN) {
+-			__ensure(__atomic_load_n(&cond->__mlibc_seq, __ATOMIC_ACQUIRE) > seq);
+-			return 0;
+-		} else if (e == EINTR) {
++		//   (The first two and the last were handled above.)
++		if (e == EINTR) {
++			// A cancelled thread does not come back: it must not be counted.
++			thread_cond_leave(cond);
+ 			mlibc::thread_testcancel();
+-			continue;
+-		} else if (e == ETIMEDOUT) {
+-			__ensure(abstime);
+-			return ETIMEDOUT;
+-		} else {
++			__atomic_fetch_add(&cond->__mlibc_flags, cond_one_waiter, __ATOMIC_SEQ_CST);
++		} else if (e) {
+ 			mlibc::panicLogger() << "sys_futex_wait() failed with error " << e << frg::endlog;
+ 		}
+ 	}
+diff --git a/options/internal/include/mlibc/lock.hpp b/options/internal/include/mlibc/lock.hpp
+index f4477411..d910291c 100644
+--- a/options/internal/include/mlibc/lock.hpp
++++ b/options/internal/include/mlibc/lock.hpp
+@@ -26,12 +26,15 @@ struct alignas(4) FutexLockImpl {
+ 	void lock() {
+ 		unsigned int this_tid = mlibc::this_tid();
+ 		unsigned int expected = 0;
++		// unlock() wakes one waiter, so whoever has waited takes the lock with the
++		// waiters bit set: there may be others.
++		unsigned int taken = this_tid;
+ 
+ 		while(true) {
+ 			if(!expected) {
+ 				// Try to take the mutex here.
+ 				if(__atomic_compare_exchange_n(&_state,
+-						&expected, this_tid, false, __ATOMIC_ACQUIRE, __ATOMIC_ACQUIRE)) {
++						&expected, taken, false, __ATOMIC_ACQUIRE, __ATOMIC_ACQUIRE)) {
+ 					if constexpr (Recursive) {
+ 						__ensure(!_recursion);
+ 						_recursion = 1;
+@@ -60,6 +63,7 @@ struct alignas(4) FutexLockImpl {
+ 
+ 					// Opportunistically try to take the lock after we wake up.
+ 					expected = 0;
++					taken = this_tid | waitersBit;
+ 				}else{
+ 					// Otherwise we have to set the waiters flag first.
+ 					unsigned int desired = expected | waitersBit;
+@@ -114,7 +118,7 @@ struct alignas(4) FutexLockImpl {
+ 		if(state & waitersBit) {
+ 			// Wake the futex if there were waiters. Since the mutex might not exist at this location
+ 			// anymore, we must conservatively ignore EACCES and EINVAL which may occur as a result.
+-			int e = mlibc::sysdep<FutexWake>((int *)&_state, true);
++			int e = mlibc::sysdep<FutexWake>((int *)&_state, false);
+ 			__ensure(e >= 0 || e == EACCES || e == EINVAL);
+ 		}
+ 	}
+diff --git a/options/internal/include/mlibc/tcb.hpp b/options/internal/include/mlibc/tcb.hpp
+index 6004728e..fe005fa4 100644
+--- a/options/internal/include/mlibc/tcb.hpp
++++ b/options/internal/include/mlibc/tcb.hpp
+@@ -144,6 +144,13 @@ struct Tcb {
+ 	void *stackAddr;
+ 	size_t guardSize;
+ 
++	// Where the memory of the TCB and the TLS before it begins (what __rtld_freeTcb()
++	// frees), whether the stack is ours to free, and the next of the detached threads
++	// that have ended.
++	void *allocation;
++	bool ownsStack;
++	Tcb *nextDead;
++
+ 	inline void invokeThreadFunc(void *entry, void *user_arg) {
+ 		if(returnValueType == TcbThreadReturnValue::Pointer) {
+ 			auto func = reinterpret_cast<void *(*)(void *)>(entry);
+diff --git a/options/posix/generic/pthread.cpp b/options/posix/generic/pthread.cpp
+index 67380f57..917fffc9 100644
+--- a/options/posix/generic/pthread.cpp
++++ b/options/posix/generic/pthread.cpp
+@@ -430,9 +430,13 @@ namespace {
+ 		ucontext_t *uctx = static_cast<ucontext_t*>(ucontext);
+ 		// The function could be called from other signals, or from another
+ 		// process, in which case we should do nothing.
++		// InstantOS: nothing says whether the thread is in a cancellable syscall, so a
++		// deferred cancellation takes place at the next explicit cancellation point (the
++		// waits look again after EINTR).
+ 		if (signal != SIGCANCEL || info->si_pid != getpid() ||
+-				info->si_code != SI_TKILL)
++				info->si_code != SI_TKILL) {
+ 			return;
++		}
+ 
+ 		auto tcb = mlibc::get_current_tcb();
+ 		int old_value = __atomic_load_n(&tcb->cancelBits, __ATOMIC_RELAXED);
+@@ -454,6 +458,8 @@ namespace {
+ 		 * The mlibc::sys_before_cancellable_syscall sysdep should return 1 when the
+ 		 * program counter is between the 'canellable_syscall' and 'end_cancellable_syscall' label.
+ 		 */
++		if (!(old_value & tcbCancelAsyncBit) && !mlibc::IsImplemented<BeforeCancellableSyscall>)
++			return;
+ 		if (!(old_value & tcbCancelAsyncBit) &&
+ 				mlibc::IsImplemented<BeforeCancellableSyscall> && !mlibc::sysdep_or_enosys<BeforeCancellableSyscall>(uctx))
+ 			return;
+diff --git a/options/posix/generic/semaphore.cpp b/options/posix/generic/semaphore.cpp
+index 6158c1fe..983ee13f 100644
+--- a/options/posix/generic/semaphore.cpp
++++ b/options/posix/generic/semaphore.cpp
+@@ -10,11 +10,8 @@ static constexpr unsigned int semaphoreHasWaiters = static_cast<uint32_t>(1 << 3
+ static constexpr unsigned int semaphoreCountMask = static_cast<uint32_t>(1 << 31) - 1;
+ 
+ int sem_init(sem_t *sem, int pshared, unsigned int initial_count) {
+-	if (pshared) {
+-		mlibc::infoLogger() << "mlibc: shared semaphores are unsuppored" << frg::endlog;
+-		errno = ENOSYS;
+-		return -1;
+-	}
++	// Between processes it must lie in memory they share: futexes there work.
++	(void)pshared;
+ 
+ 	if (initial_count > SEM_VALUE_MAX) {
+ 		errno = EINVAL;
+@@ -125,8 +122,9 @@ int sem_post(sem_t *sem) {
+ 			break;
+ 	}
+ 
++	// One: the bit stays set, so the next post wakes the next.
+ 	if (state & semaphoreHasWaiters)
+-		if (int e = mlibc::sysdep<FutexWake>((int *)&sem->__mlibc_count, true); e)
++		if (int e = mlibc::sysdep<FutexWake>((int *)&sem->__mlibc_count, false); e)
+ 			__ensure(!"sys_futex_wake() failed");
+ 
+ 	return 0;
+@@ -142,9 +140,9 @@ int sem_close(sem_t *) {
+ 	return -1;
+ }
+ 
+-int sem_getvalue(sem_t *, int *) {
+-	errno = ENOSYS;
+-	return -1;
++int sem_getvalue(sem_t *__restrict sem, int *__restrict value) {
++	*value = static_cast<int>(__atomic_load_n(&sem->__mlibc_count, __ATOMIC_RELAXED) & semaphoreCountMask);
++	return 0;
+ }
+ 
+ int sem_unlink(const char *) {
+@@ -156,7 +154,8 @@ int sem_trywait(sem_t *sem) {
+ 	while (true) {
+ 		auto state = __atomic_load_n(&sem->__mlibc_count, __ATOMIC_ACQUIRE);
+ 
+-		if ((state & semaphoreHasWaiters) || !state) {
++		// The waiters bit may be set with something left to take.
++		if (!(state & semaphoreCountMask)) {
+ 			errno = EAGAIN;
+ 			return -1;
+ 		}
+diff --git a/options/rtld/generic/linker.cpp b/options/rtld/generic/linker.cpp
+index 8e9c9a88..b599bbd1 100644
+--- a/options/rtld/generic/linker.cpp
++++ b/options/rtld/generic/linker.cpp
+@@ -1425,6 +1425,9 @@ Tcb *allocateTcb() {
+ 
+ 	Tcb *tcb_ptr = new ((char *)tcbAddress) Tcb;
+ 	tcb_ptr->selfPointer = tcb_ptr;
++	tcb_ptr->allocation = reinterpret_cast<void *>(allocation);
++	tcb_ptr->ownsStack = false;
++	tcb_ptr->nextDead = nullptr;
+ 
+ 	tcb_ptr->stackCanary = __stack_chk_guard;
+ 	tcb_ptr->cancelBits = tcbCancelEnableBit;
+@@ -1450,6 +1453,20 @@ Tcb *allocateTcb() {
+ 	return tcb_ptr;
+ }
+ 
++// Frees what allocateTcb() and accessDtv() allocated for a thread that is gone.
++void freeTcb(Tcb *tcb) {
++	auto start = reinterpret_cast<char *>(tcb->allocation);
++	for(size_t i = 0; i < tcb->dtvSize; ++i) {
++		auto p = reinterpret_cast<char *>(tcb->dtvPointers[i]);
++		// TLS of the initial model lies in the allocation itself.
++		if(p && !(p >= start && p <= reinterpret_cast<char *>(tcb)))
++			getAllocator().free(p);
++	}
++	frg::destruct_n(getAllocator(), tcb->dtvPointers, tcb->dtvSize);
++	frg::destruct(getAllocator(), tcb->localKeys);
++	getAllocator().free(start);
++}
++
+ void *accessDtv(SharedObject *object) {
+ 	Tcb *tcb_ptr = mlibc::get_current_tcb();
+ 
+diff --git a/options/rtld/generic/linker.hpp b/options/rtld/generic/linker.hpp
+index e6336bd9..b40e7c89 100644
+--- a/options/rtld/generic/linker.hpp
++++ b/options/rtld/generic/linker.hpp
+@@ -351,6 +351,7 @@ extern frg::manual_box<FutexLock> runtimeTlsMapLock;
+ extern frg::manual_box<RuntimeTlsMap> runtimeTlsMap;
+ 
+ Tcb *allocateTcb();
++void freeTcb(Tcb *tcb);
+ void initTlsObjects(Tcb *tcb, const frg::vector<SharedObject *, MemoryAllocator> &objects, bool checkInitialized);
+ void *accessDtv(SharedObject *object);
+ // Tries to access the DTV, if not allocated, or object doesn't have
+diff --git a/options/rtld/generic/main.cpp b/options/rtld/generic/main.cpp
+index bf54bcba..f0d8fbbc 100644
+--- a/options/rtld/generic/main.cpp
++++ b/options/rtld/generic/main.cpp
+@@ -228,6 +228,10 @@ extern "C" void *lazyRelocate(SharedObject *object, unsigned int rel_index) {
+ 	return (void *)p->virtualAddress();
+ }
+ 
++extern "C" [[ gnu::visibility("default") ]] void __rtld_freeTcb(Tcb *tcb) {
++	freeTcb(tcb);
++}
++
+ extern "C" [[ gnu::visibility("default") ]] void *__rtld_allocateTcb() {
+ 	auto tcb = allocateTcb();
+ 	initTlsObjects(tcb, globalScope->_objects, false);

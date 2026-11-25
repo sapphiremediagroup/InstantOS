@@ -5,12 +5,19 @@
 #include <memory/vmm.hpp>
 #include <common/string.hpp>
 #include <fs/vfs/vfs.hpp>
+#include <cpu/syscall/shm.hpp>
 #include <cpu/syscall/user_mapping.hpp>
+#include <memory/shared_pages.hpp>
 
 namespace {
 uint64_t pageFlagsForProtection(uint64_t prot, bool defaultReadWrite) {
     if (prot == 0 && defaultReadWrite) {
         prot = MemoryProtRead | MemoryProtWrite;
+    }
+    if (prot & MemoryProtNone) {
+        // A page that is there keeps its frame, read-only (the kernel takes a
+        // leaf without UserSuper for its own).
+        return Present | UserSuper | NoExecute;
     }
 
     uint64_t flags = Present;
@@ -143,8 +150,9 @@ uint64_t Syscall::sys_mmap_file(uint64_t argsPtr) {
     const uint64_t offset = args.offset;
 
     // An anonymous request carries no backing file: fall back to the plain
-    // demand-paged path (keeps a single code path for AnonAllocate/MAP_ANON).
-    if (flags & kMapAnonymous) {
+    // demand-paged path (keeps a single code path for AnonAllocate/MAP_ANON),
+    // unless it is shared: then fork's children get the same memory.
+    if ((flags & kMapAnonymous) && !(flags & kMapShared)) {
         return sys_mmap(addr, length, prot);
     }
 
@@ -161,13 +169,41 @@ uint64_t Syscall::sys_mmap_file(uint64_t argsPtr) {
     if (!current) return syscall_error(SysErrInvalid);
 
     // Resolve the backing file handle (must be an open file in this process).
-    FileDescriptor* file = current->getFD(args.fd);
-    if (!file) return syscall_error(SysErrBadFile);
+    const bool anonymous = (flags & kMapAnonymous) != 0;
+    FileDescriptor* file = anonymous ? nullptr : current->getFD(args.fd);
+    if (!file && !anonymous) return syscall_error(SysErrBadFile);
 
     // Compute how many bytes are available from `offset`; pages beyond this are
     // zero-filled on fault and are never written back (EOF semantics).
     uint64_t fileLength = 0;
-    VNode* node = file->getNode();
+    VNode* node = file ? file->getNode() : nullptr;
+
+    // Memory that is the same in every process that maps it: a memfd or RamFS
+    // file mapped MAP_SHARED, or anonymous shared memory (a new object).
+    SharedPages* pagesObject = nullptr;
+    if (flags & kMapShared) {
+        if (anonymous) {
+            if (length > SharedPages::kMaxSize) return syscall_error(SysErrNoMemory);
+            pagesObject = SharedPages::create(aligned_length);
+            if (!pagesObject) return syscall_error(SysErrNoMemory);
+        } else if ((pagesObject = sharedPagesOf(node)) != nullptr) {
+            if (offset >= SharedPages::kMaxSize || aligned_length > SharedPages::kMaxSize - offset) {
+                return syscall_error(SysErrInvalid);
+            }
+            if (prot & MemoryProtWrite) {
+                if (!current->getFD(args.fd, HandleRightWrite)) return syscall_error(SysErrAccess);
+                if (!sharedPagesMayWrite(node)) return syscall_error(SysErrPermission);
+            }
+            pagesObject->retainFile();   // until the region holds it
+        }
+    }
+    struct DropPages {
+        SharedPages* pages;
+        ~DropPages() {
+            if (pages) pages->releaseFile();
+        }
+    } dropPages{pagesObject};
+
     if (node && node->ops && node->ops->stat) {
         FileStats st{};
         if (node->ops->stat(node, &st) == 0 && st.size > offset) {
@@ -196,6 +232,14 @@ uint64_t Syscall::sys_mmap_file(uint64_t argsPtr) {
         for (size_t i = 0; i < pages; i++) {
             asm volatile("invlpg (%0)" : : "r"(virt + i * PAGE_SIZE) : "memory");
         }
+    }
+
+    if (pagesObject) {
+        // Its pages are mapped as they are touched (Process::handleDemandFault).
+        if (!current->mmapAddObjectRegion(virt, aligned_length, prot, pagesObject, anonymous ? 0 : offset)) {
+            return syscall_error(SysErrNoMemory);
+        }
+        return virt;
     }
 
     // A GPU buffer object (mmap on /dev/dri/renderD128 at a GEM_MMAP_OFFSET
@@ -270,7 +314,14 @@ uint64_t Syscall::sys_mprotect(uint64_t addr, uint64_t length, uint64_t prot) {
         // Break any copy-on-write share first so raising write permission never
         // makes a shared frame writable in place.
         VMM::HandleCowFault(pageTable, va);
-        VMM::ProtectPageIn(pageTable, va, leafFlags);
+        // A shared page stays one (munmap must not free its frame), and keeps
+        // its caching.
+        uint64_t flags = leafFlags;
+        const uint64_t entry = VMM::LeafEntryIn(pageTable, va);
+        if (entry & kSharedFrame) {
+            flags |= kSharedFrame | (entry & (WriteCombine | CacheDisab));
+        }
+        VMM::ProtectPageIn(pageTable, va, flags);
         asm volatile("invlpg (%0)" : : "r"(va) : "memory");
     }
 

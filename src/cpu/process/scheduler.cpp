@@ -259,6 +259,8 @@ bool Scheduler::tickIsNoop(InterruptFrame* frame) {
     // Its affinity no longer includes this CPU: the scheduler has to move it.
     if (!running->mayRunOn(cpu->cpuIndex)) return false;
     if (running->killPending()) return false;
+    // A signal to deliver before it goes back to user mode.
+    if (running->signalMayBeDeliverable()) return false;
     // Still runnable and nothing else to run: it keeps the CPU. Killed or
     // blocked from another CPU: the scheduler has to take it off.
     return running->getState() == ProcessState::Running;
@@ -287,6 +289,11 @@ void Scheduler::kickIdleCpu(Process* proc) {
         PerCPUData* cpu = SMP::cpu(i);
         if (!cpu || cpu == self || !proc->mayRunOn(i)) continue;
         if (cpu->currentProcess && cpu->currentProcess == cpu->idleProcess) {
+            // One already kicked stays idle until it gets the big kernel lock,
+            // which the caller holds. If every idle CPU has been kicked, each
+            // looks at the queue after clearing its flag (both sides exchange,
+            // a full barrier), so it sees what was queued before.
+            if (__atomic_exchange_n(&cpu->idleKicked, 1U, __ATOMIC_SEQ_CST) != 0) continue;
             SMP::sendReschedule(cpu);
             return;
         }
@@ -479,7 +486,11 @@ void Scheduler::reapTerminated() {
             }
             delete process;
             // A dead main thread waits for its threads before wait() sees it.
+            // Its files were still shared with them when it died: they are
+            // closed with the last one, so a pipe's reader gets its EOF (it may
+            // be the parent, which waits only after that).
             if (leader && leader->getState() == ProcessState::Terminated) {
+                if (!hasOtherThreads(leader)) leader->closeFilesOnExit();
                 wakeParentOf(leader);
             }
         } else {
@@ -639,6 +650,10 @@ void Scheduler::schedule(InterruptFrame* frame) {
         oldProcess->getContext()->r9 = frame->r9;
         oldProcess->getContext()->r10 = frame->r10;
         oldProcess->getContext()->r11 = frame->r11;
+        oldProcess->getContext()->r12 = frame->r12;
+        oldProcess->getContext()->r13 = frame->r13;
+        oldProcess->getContext()->r14 = frame->r14;
+        oldProcess->getContext()->r15 = frame->r15;
         
         oldProcess->setValidUserState(true);
         
@@ -726,6 +741,10 @@ void Scheduler::schedule(InterruptFrame* frame) {
         frame->r9 = nextProcess->getContext()->r9;
         frame->r10 = nextProcess->getContext()->r10;
         frame->r11 = nextProcess->getContext()->r11;
+        frame->r12 = nextProcess->getContext()->r12;
+        frame->r13 = nextProcess->getContext()->r13;
+        frame->r14 = nextProcess->getContext()->r14;
+        frame->r15 = nextProcess->getContext()->r15;
         
         Syscall::get().setKernelStack(nextProcess->getKernelStack());
         
@@ -790,9 +809,14 @@ void Scheduler::wakeParentOf(Process* process) {
         return;
     }
 
-    Process* parent = getProcessByPID(process->getParentPID());
-    if (parent && parent->getState() == ProcessState::Blocked) {
-        wakeProcess(parent);
+    wakeThreadsOf(process->getParentPID());
+}
+
+void Scheduler::wakeThreadsOf(uint32_t pid) {
+    for (Process* p = allProcessesHead; p; p = p->allNext) {
+        if (p->getGroupPID() == pid && p->getState() == ProcessState::Blocked) {
+            wakeProcess(p);
+        }
     }
 }
 
@@ -833,10 +857,12 @@ void Scheduler::onProcessTerminated(Process* process) {
     if (parentPid != 0) {
         Process* parent = getProcessByPID(parentPid);
         if (parent && parent->getState() != ProcessState::Terminated) {
-            parent->sendSignal(SIGCHLD);
-            if (parent->getState() == ProcessState::Blocked) {
-                wakeProcess(parent);
-            }
+            const int sig = process->termSignal;
+            const SignalInfo info{sig ? CLD_KILLED : CLD_EXITED,
+                                  static_cast<int32_t>(process->getPID()), process->getUID(),
+                                  sig ? sig : (process->getExitCode() & 0xFF), 0};
+            parent->sendSignal(SIGCHLD, &info);
+            wakeThreadsOf(parentPid);
         }
     }
 }
@@ -862,7 +888,9 @@ void Scheduler::wakeAllBlockedProcesses() {
     Process* process = allProcessesHead;
     while (process) {
         if (process->getState() == ProcessState::Blocked) {
-            if (process->isSleeping() && !process->wakesOnEvents() &&
+            // A plain sleep, or a futex wait (which may have no deadline), is
+            // not for I/O to end.
+            if ((process->isSleeping() || process->futex.queued) && !process->wakesOnEvents() &&
                 !process->sleepDeadlineReached(nowMs)) {
                 process = process->allNext;
                 continue;
@@ -891,12 +919,12 @@ bool Scheduler::killSiblingThreads(Process* proc) {
     return remaining;
 }
 
-void Scheduler::exitThreadGroup(Process* caller, int code) {
+void Scheduler::exitThreadGroup(Process* caller, int code, int signal) {
     if (caller->isThread()) {
         for (Process* p = allProcessesHead; p; p = p->allNext) {
             if (!p->isThread() && p->sharesStateWith(caller) &&
                 p->getState() != ProcessState::Terminated) {
-                p->requestExit(code);
+                p->requestExit(code, signal);
                 kickCpuRunning(p);
             }
         }

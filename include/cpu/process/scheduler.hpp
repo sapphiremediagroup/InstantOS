@@ -31,6 +31,8 @@ public:
     void yield();
     void wakeProcess(Process* process);
     void wakeParentOf(Process* process);
+    // Wakes every blocked thread of process `pid` (any may be in wait()).
+    void wakeThreadsOf(uint32_t pid);
     // Centralized end-of-life bookkeeping for a terminated process: reparents
     // its children, and notifies/wakes its parent (SIGCHLD + unblock a waiter).
     // Idempotent and safe to call on any termination path. Does NOT free the
@@ -45,7 +47,10 @@ public:
     // exit() or a fatal fault in any thread ends the whole process: the main
     // thread (if `caller` is not it) dies with `code` as the process's exit
     // status, every other thread by SIGKILL. Does not wait.
-    void exitThreadGroup(Process* caller, int code);
+    // `signal`: the process dies of it (0: it exits with `code`).
+    void exitThreadGroup(Process* caller, int code, int signal = 0);
+    // Interrupts the CPU running `proc` (not this one) so it acts on a signal now.
+    void kickCpuRunning(Process* proc);
 
     uint32_t allocatePID();
 
@@ -82,8 +87,6 @@ private:
     bool isBusyOnAnyCpu(Process* proc);
     // Another Process (thread) still shares proc's address space.
     bool hasOtherThreads(Process* proc);
-    // Reschedule IPI to whichever other CPU is running proc.
-    void kickCpuRunning(Process* proc);
     // Wakes one idle CPU that may run `proc` (reschedule IPI) after it was queued.
     void kickIdleCpu(Process* proc);
     // Parks the process whose kernel stack this CPU is about to iretq from.

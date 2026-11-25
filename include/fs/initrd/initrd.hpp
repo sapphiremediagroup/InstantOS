@@ -37,6 +37,18 @@ private:
     static const char* nodePathPrefix(VNode* node);
     static bool splitImmediateChild(const char* prefix, const char* fullPath, char* childName, bool* isDirectory);
     static VNode* createDirectoryNode(InitrdFS* fs, const char* prefix);
+    VNode* fileNode(uint32_t index);
+    VNode* directoryNode(const char* prefix);
+
+    // Lookups hand out these cached nodes (the VFS releases what lookup gives
+    // it, and releaseNode does nothing here). A fresh node per lookup leaked
+    // ~0.8 KB of kernel heap per exec of a /bin or /lib program.
+    struct CachedDirectory {
+        CachedDirectory* next;
+        VNode* node;   // its data is the prefix it owns
+    };
+    VNode** fileNodes = nullptr;   // header->fileCount entries, made on first lookup
+    CachedDirectory* directories = nullptr;
 
     void* data;
     size_t dataSize;

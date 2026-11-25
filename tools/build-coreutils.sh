@@ -66,7 +66,7 @@ ac_cv_func_chown_works=yes
 ac_cv_func_setvbuf_reversed=no
 gl_cv_func_fnmatch_posix=yes
 ac_cv_func_fork_works=yes
-ac_cv_func_strerror_r_char_p=no
+ac_cv_func_strerror_r_char_p=yes
 gl_cv_func_getcwd_path_max=yes
 gl_cv_func_getcwd_abort_bug=no
 ac_cv_func_getgroups_works=yes
@@ -79,6 +79,9 @@ gl_cv_func_stat_file_slash=yes
 gl_cv_func_lstat_dereferences_slashed_symlink=yes
 gl_cv_func_unlink_honors_slashes=yes
 gl_cv_func_utimensat_works=yes
+# mlibc's fchmodat works; gnulib's replacement needs O_PATH + /proc (see
+# build-gnu-tool.sh).
+gl_cv_func_fchmodat_works=yes
 gl_cv_func_futimens_works=yes
 gl_cv_func_select_supports0=yes
 ac_cv_header_utmp_h=no

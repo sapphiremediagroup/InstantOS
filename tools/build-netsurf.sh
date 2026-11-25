@@ -2,13 +2,14 @@
 # Cross-build the NetSurf framebuffer browser against the InstantOS mlibc sysroot.
 #
 # Uses the NetSurf buildsystem (TARGET=framebuffer) with a minimal feature set:
-# http(s) through libcurl + mbedTLS (CA bundle /etc/ssl/certs/ca-certificates.crt),
+# http(s) through libcurl + OpenSSL (CA bundle /etc/ssl/certs/ca-certificates.crt;
+# with WITH_OPENSSL NetSurf checks certificates itself and shows them),
 # no JS (duktape), internal bitmap font, our 'instant' libnsfb surface backend.
 # Links against the NetSurf core libs (build-netsurf-libs.sh) and the image
 # stack (zlib/png/jpeg). Rerun cmake afterwards to bundle /bin/nsfb.
 #
 # Prerequisites: build-mlibc.sh, build-zlib.sh, build-libpng.sh, build-libjpeg.sh,
-#                build-mbedtls.sh, build-libcurl.sh, build-netsurf-libs.sh
+#                build-openssl.sh, build-libcurl.sh, build-netsurf-libs.sh
 #                (host: gperf, bison, flex, and libpng headers for a build tool)
 set -euo pipefail
 
@@ -55,6 +56,9 @@ apply_patch_once "$SRC_DIR" "$PORT_DIR/patches/netsurf-fetch.patch"
 apply_patch_once "$SRC_DIR" "$PORT_DIR/patches/netsurf-config-mmap.patch"
 apply_patch_once "$SRC_DIR" "$PORT_DIR/patches/netsurf-cabundle.patch"
 apply_patch_once "$SRC_DIR" "$PORT_DIR/patches/netsurf-textinput.patch"
+# An https:// URL whose host is an IP address: NetSurf looked for it among the
+# certificate's DNS names and refused every such certificate.
+apply_patch_once "$SRC_DIR" "$PORT_DIR/patches/netsurf-ip-certificate.patch"
 
 # pkg-config must find our cross .pc files and NOTHING from the host. Point it
 # exclusively at the NetSurf+mlibc sysroots.
@@ -76,7 +80,7 @@ make \
   PREFIX="$NS_ROOT" \
   Q= \
   NETSURF_USE_CURL=YES \
-  NETSURF_USE_OPENSSL=NO \
+  NETSURF_USE_OPENSSL=YES \
   NETSURF_USE_DUKTAPE=NO \
   NETSURF_USE_UTF8PROC=NO \
   NETSURF_USE_JPEGXL=NO \

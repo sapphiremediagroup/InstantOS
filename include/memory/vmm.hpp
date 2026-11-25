@@ -60,6 +60,10 @@ public:
     static uint64_t InitDirectMap();
     static uint64_t DirectMapBase();                 // 0 until InitDirectMap succeeds
     static uint64_t PhysToVirt(uint64_t phys);       // phys -> direct-map VA (identity if no map)
+    // Page tables that had to go below PMM::KERNEL_HIGH_ALLOC_MIN (allocTable).
+    static inline uint64_t lowPageTables = 0;
+    // Page-table frames allocated and not yet freed (leak accounting, [mem]).
+    static inline int64_t liveTables = 0;
 
     static void MapPage(uint64_t virtualAddr, uint64_t physAddr, uint64_t flags);
     static void UnmapPage(uint64_t virtualAddr);

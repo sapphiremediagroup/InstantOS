@@ -37,6 +37,9 @@
 #include <drivers/hid/i2c_hid.hpp>
 #include <drivers/usb/ohci.hpp>
 #include <drivers/usb/xhci.hpp>
+#include <drivers/modules/module_loader.hpp>
+#include <boot/boot_config.hpp>
+#include <fs/partition/disk_registry.hpp>
 #include <interrupts/keyboard.hpp>
 #include <interrupts/timer.hpp>
 #include <drivers/net/net_device.hpp>
@@ -743,6 +746,7 @@ static void runInputProbeOnly() {
 // okie wife also has to lock in what is wife doing geography i what was this writing gramar vocabulary i see good luck cutie, i belive in you :heart: thank you my love kisses kisses love youi love you too my magic man
 extern "C" void InstantOS(BootInfo* bootInfo) {
     runtimeBase = bootInfo->kernelBase;
+    BootConfig::initialize(bootInfo);
     asm("cli");
     if (!bootInfo->framebuffer.base || bootInfo->framebuffer.format == PixelFormat::BltOnly) {
         while(1) {
@@ -752,7 +756,8 @@ extern "C" void InstantOS(BootInfo* bootInfo) {
     int totalMemory = bootInfo->memoryMap.totalBytes / (1024 * 1024);
 
     
-    iFramebuffer fb(&bootInfo->framebuffer);
+    // Static, not on the firmware's stack: the console keeps this pointer.
+    static iFramebuffer fb(&bootInfo->framebuffer);
     Console::get().initialize(&fb);
     Console::get().setBackgroundColor(0);
     Console::get().setTextColor(0xFFFFFF);
@@ -775,6 +780,25 @@ extern "C" void InstantOS(BootInfo* bootInfo) {
         }
     }
     memory_init_acceleration();
+    // Pick each routine's fastest implementation on this machine (the string
+    // instructions on real CPUs, the SIMD loops under TCG), then check the picks.
+    {
+        MemAccelChoice choice[3];
+        memory_calibrate_acceleration(choice);
+        for (const MemAccelChoice& c : choice) {
+            Console::get().drawText("[mem] ");
+            Console::get().drawText(c.routine);
+            Console::get().drawText(": ");
+            Console::get().drawText(c.picked);
+            Console::get().drawText(" (4 KiB, cycles: rep ");
+            Console::get().drawNumber(static_cast<int64_t>(c.cycles[0]));
+            Console::get().drawText(" sse2 ");
+            Console::get().drawNumber(static_cast<int64_t>(c.cycles[1]));
+            Console::get().drawText(" avx2 ");
+            Console::get().drawNumber(static_cast<int64_t>(c.cycles[2]));
+            Console::get().drawText(")\n");
+        }
+    }
     if (!memory_validate_acceleration()) {
         Console::get().drawText("Memory acceleration: [ ");
         Console::get().setTextColor(0xFF0000);
@@ -790,6 +814,18 @@ extern "C" void InstantOS(BootInfo* bootInfo) {
 #endif
     
     PMM::Initialize(bootInfo->memoryMap, bootInfo->kernelBase, bootInfo->kernelSize);
+    // The boot CPU still runs on the stack the firmware gave iboot, and keeps
+    // it for good (this frame never returns). That stack is EfiBootServicesData,
+    // which iboot hands the PMM as free memory, so without this the PMM gave its
+    // frames out once memory filled up (P7.1, 5 GiB) and the boot CPU's frames
+    // were overwritten. OVMF's stack is 128 KiB; the margin costs ~1 MiB.
+    {
+        uint64_t rsp = 0;
+        asm volatile("mov %%rsp, %0" : "=r"(rsp));
+        constexpr uint64_t kBelow = 1024 * 1024, kAbove = 256 * 1024;
+        const uint64_t start = (rsp > kBelow ? rsp - kBelow : 0) & ~(PMM::PAGE_SIZE - 1);
+        PMM::ReserveRange(start, (rsp + kAbove) - start);
+    }
     if (bootInfo->framebuffer.base && bootInfo->framebuffer.size) {
         PMM::ReserveRange(bootInfo->framebuffer.base, bootInfo->framebuffer.size);
     }
@@ -1026,7 +1062,51 @@ extern "C" void InstantOS(BootInfo* bootInfo) {
         bool wholeDisk = false;
         bool foundInstantOS = false;
         int chosenPort = -1;
-        for (int index = 0; index < controller->getPortCount() && !foundInstantOS; ++index) {
+        uint64_t rootPartStart = 0;
+        bool liveSystem = false;   // root=none: the installer's live system
+        // iboot's root=<partition GUID> (iboot.cfg or a Limine cmdline) names
+        // the partition: an installed system. It must still be an InstantOS
+        // partition; when no disk has it, the rule below picks one.
+        if (BootConfig::text()[0] != 0) {
+            Cereal::get().write("[boot] config: ");
+            Cereal::get().write(BootConfig::text());
+            Cereal::get().write("\n");
+        }
+        char rootText[64];
+        uint8_t rootGuid[16];
+        if (BootConfig::get("root", rootText, sizeof(rootText))) {
+            if (strcmp(rootText, "none") == 0) {
+                liveSystem = true;
+                Cereal::get().write("[storage] root=none: a live system, no disk mounted\n");
+            } else if (!gptParseGuid(rootText, rootGuid)) {
+                Cereal::get().write("[storage] root= is not a GUID, ignored\n");
+            } else {
+                for (int index = 0; index < controller->getPortCount() && !foundInstantOS; ++index) {
+                    AHCIPort* candidatePort = controller->getPort(index);
+                    if (!candidatePort || !candidatePort->isActive()) {
+                        continue;
+                    }
+                    SATABlockDevice* disk = new SATABlockDevice(candidatePort);
+                    uint64_t partStart = 0;
+                    uint64_t partLength = 0;
+                    const GptSearch search = gptFindPartitionByGuid(disk, rootGuid, &partStart, &partLength);
+                    if (search == GptSearch::Found) {
+                        fsDevice = new PartitionBlockDevice(disk, partStart, partLength);
+                        device = disk;
+                        chosenPort = index;
+                        rootPartStart = partStart;
+                        foundInstantOS = true;
+                        Cereal::get().write("[storage] root= partition found\n");
+                    } else if (search == GptSearch::NotInstantOS) {
+                        Cereal::get().write("[storage] root= names a partition that is not InstantOS's: not mounted\n");
+                    }
+                }
+                if (!foundInstantOS) {
+                    Cereal::get().write("[storage] root= partition not found, using the first InstantOS partition\n");
+                }
+            }
+        }
+        for (int index = 0; index < controller->getPortCount() && !foundInstantOS && !liveSystem; ++index) {
             AHCIPort* candidatePort = controller->getPort(index);
             if (!candidatePort || !candidatePort->isActive()) {
                 continue;
@@ -1056,8 +1136,11 @@ extern "C" void InstantOS(BootInfo* bootInfo) {
             }
             device = disk;
             chosenPort = index;
+            rootPartStart = wholeDisk ? 0 : partStart;
         }
         instantOSDisk = foundInstantOS;
+        // Every disk's partitions, for instant-install and /dev/diskNpM.
+        DiskRegistry::scan(controller, device ? chosenPort : -1, rootPartStart);
         if (device) {
             KernelStorage::setDevice("ahci0", device, device->getSize(), 512, true, true);
             Console::get().drawText(foundInstantOS ? "[storage] InstantOS partition on port "
@@ -1075,7 +1158,20 @@ extern "C" void InstantOS(BootInfo* bootInfo) {
                 Console::get().drawText(mountResult == 0 ? "OK" : "FAIL");
                 Console::get().setTextColor(0xFFFFFF);
                 Console::get().drawText(" ]\n");
-                if (mountResult == 0) {
+                // A replay rewrites metadata: anything another system wrote to
+                // the same blocks since (Windows' Ext2Fsd) would be undone.
+                if (_ext4.replayedTransactions() != 0) {
+                    Console::get().drawText("[ext4] journal replayed: transactions=");
+                    Console::get().drawNumber(_ext4.replayedTransactions());
+                    Console::get().drawText(" blocks=");
+                    Console::get().drawNumber(_ext4.replayedBlocks());
+                    Console::get().drawText("\n");
+                } else {
+                    Console::get().drawText("[ext4] journal clean\n");
+                }
+                // Not on a real disk's InstantOS partition (an installed
+                // system): the test writes files at the root.
+                if (mountResult == 0 && !instantOSDisk) {
                     ext4RunSelfTest();
                 }
             } else if (fsDevice && !wholeDisk) {
@@ -1118,6 +1214,16 @@ extern "C" void InstantOS(BootInfo* bootInfo) {
         Console::get().drawText(" ]\n");
     }
     
+    // An installed system (instant-install wrote /.installed on its root) has
+    // its own /bin, /lib, /include and /netsurf: the initrd's are not mounted
+    // over them. The initrd is still loaded, as the rescue system (a boot
+    // without root=) and for /etc/ssl.
+    FileStats installedStats = {};
+    const bool installedRoot = VFS::get().stat("/.installed", &installedStats) == 0;
+    if (installedRoot) {
+        Cereal::get().write("[boot] installed system: /bin and /lib from the root partition\n");
+    }
+
     if (bootInfo->initrdBase && bootInfo->initrdSize) {
         Console::get().drawText("Mounting initrdfs...\n");
 
@@ -1126,7 +1232,7 @@ extern "C" void InstantOS(BootInfo* bootInfo) {
             bootInfo->initrdSize,
             "bin"
         );
-        int mountResult = VFS::get().mount(&binInitrdfs, "/bin");
+        int mountResult = installedRoot ? 0 : VFS::get().mount(&binInitrdfs, "/bin");
         Console::get().drawText("InitrdFS at /bin: [ ");
         Console::get().setTextColor(mountResult == 0 ? 0x49ceee : 0xFF0000);
         Console::get().drawText(mountResult == 0 ? "OK" : "FAIL");
@@ -1139,7 +1245,7 @@ extern "C" void InstantOS(BootInfo* bootInfo) {
                 bootInfo->initrdSize,
                 "lib"
             );
-            int libMountResult = VFS::get().mount(&libInitrdfs, "/lib");
+            int libMountResult = installedRoot ? 0 : VFS::get().mount(&libInitrdfs, "/lib");
             Console::get().drawText("InitrdFS at /lib: [ ");
             Console::get().setTextColor(libMountResult == 0 ? 0x49ceee : 0xFF0000);
             Console::get().drawText(libMountResult == 0 ? "OK" : "FAIL");
@@ -1153,7 +1259,7 @@ extern "C" void InstantOS(BootInfo* bootInfo) {
                 bootInfo->initrdSize,
                 "include"
             );
-            int includeMountResult = VFS::get().mount(&includeInitrdfs, "/include");
+            int includeMountResult = installedRoot ? 0 : VFS::get().mount(&includeInitrdfs, "/include");
             Console::get().drawText("InitrdFS at /include: [ ");
             Console::get().setTextColor(includeMountResult == 0 ? 0x49ceee : 0xFF0000);
             Console::get().drawText(includeMountResult == 0 ? "OK" : "FAIL");
@@ -1170,7 +1276,7 @@ extern "C" void InstantOS(BootInfo* bootInfo) {
                 bootInfo->initrdSize,
                 "netsurf"
             );
-            int netsurfMountResult = VFS::get().mount(&netsurfInitrdfs, "/netsurf");
+            int netsurfMountResult = installedRoot ? 0 : VFS::get().mount(&netsurfInitrdfs, "/netsurf");
             Console::get().drawText("InitrdFS at /netsurf: [ ");
             Console::get().setTextColor(netsurfMountResult == 0 ? 0x49ceee : 0xFF0000);
             Console::get().drawText(netsurfMountResult == 0 ? "OK" : "FAIL");
@@ -1186,6 +1292,13 @@ extern "C" void InstantOS(BootInfo* bootInfo) {
             Console::get().drawText(tmpMountResult == 0 ? "OK" : "FAIL");
             Console::get().setTextColor(0xFFFFFF);
             Console::get().drawText(" ]\n");
+
+            // shm_open's files: memory that processes share (RamFS files are
+            // SharedPages, so mapping one MAP_SHARED is the memory itself).
+            static RamFS shmfs;
+            if (VFS::get().mount(&shmfs, "/dev/shm") == 0) {
+                VFS::get().chmod("/dev/shm", 01777);
+            }
 
             // A small in-memory /etc holding the user/group databases so libc's
             // getpwuid()/getgrgid() resolve numeric ids to names (id, whoami,
@@ -1295,6 +1408,11 @@ extern "C" void InstantOS(BootInfo* bootInfo) {
 
 
             if (libMountResult == 0) {
+                // Driver modules for the devices present, before anything
+                // asks for a NIC (docs/idrv.md): the root disk's /drivers
+                // first, so a module there replaces the initrd's of that name.
+                ModuleLoader::loadBootModules("/drivers");
+                ModuleLoader::loadBootModules("/lib/drivers");
                 Debug::initializeKernelSymbols();
                 // graphics-compositor takes over the framebuffer, so login starts it after authentication.
                 launchInitrdService("/bin/input-manager");

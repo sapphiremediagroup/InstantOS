@@ -51,11 +51,17 @@ TITLE_BAR = 40
 
 
 class Qmp:
+    """QEMU's QMP on a Unix socket, or on tcp:HOST:PORT (Windows' QEMU)."""
+
     def __init__(self, path):
-        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         for _ in range(100):
             try:
-                self.sock.connect(path)
+                if path.startswith("tcp:"):
+                    host, port = path[4:].rsplit(":", 1)
+                    self.sock = socket.create_connection((host, int(port)))
+                else:
+                    self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    self.sock.connect(path)
                 break
             except OSError:
                 time.sleep(0.1)
@@ -330,6 +336,34 @@ class Drive:
         self.check(got, "Home, End, Left and Delete edit the address", "requests: %s" %
                    [r[1] for r in self.requests()][-3:])
 
+        # 8. Bad certificates: NetSurf connects, and sends no request.
+        self.bad_certificates(content, ww)
+
+        # 9. ... and a good one still works afterwards.
+        self.go(content, ww, "https://10.0.2.2:%d/ns/after" % self.args.https_port)
+        self.check(self.wait(lambda: self.fetched("/ns/after"), 60), "a good certificate is still accepted")
+
+    def go(self, content, ww, url):
+        self.click(content[0] + ww // 2, content[1] + 15)
+        self.qmp.keys("ctrl", "u"); time.sleep(0.3)
+        self.type_text(url)
+        self.qmp.keys("ret")
+
+    def bad_certificates(self, content, ww):
+        def log():
+            with open(self.args.bad_log) as f:
+                return f.read().split("\n")
+        for kind, port in zip(("untrusted", "wrongname", "expired", "selfsigned"),
+                              self.args.bad_ports.split(",")):
+            self.go(content, ww, "https://10.0.2.2:%s/bad-%s" % (port, kind))
+            connected = self.wait(lambda: any(l.startswith(kind + " connect") for l in log()), 60)
+            time.sleep(12)   # a request, if it sent one, would be here by now
+            self.shot("bad-" + kind)
+            sent = [l for l in log() if l.startswith(kind + " REQUEST")]
+            ended = [l for l in log() if l.startswith(kind + " refused") or l.startswith(kind + " closed")]
+            self.check(connected and ended and not sent, "a bad certificate is refused: %s" % kind,
+                       "; ".join([l for l in log() if l.startswith(kind)]))
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -338,6 +372,8 @@ def main():
     ap.add_argument("--request-log", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--https-port", type=int, required=True)
+    ap.add_argument("--bad-ports", required=True, help="bad_https.py's ports")
+    ap.add_argument("--bad-log", required=True, help="bad_https.py's log")
     ap.add_argument("--boot-timeout", type=int, default=300)
     args = ap.parse_args()
     drive = Drive(args)

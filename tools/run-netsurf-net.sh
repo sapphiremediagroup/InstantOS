@@ -106,4 +106,4 @@ set -e
 echo "=== serial tail ==="
 tail -60 "$LOG" 2>/dev/null
 echo "=== fetch/tls/dns markers ==="
-grep -aiE "curl|fetch|http|https|ssl|tls|mbedtls|cert|dns|resolve|connect|10\.0\.2|NSERROR|fetcherror|UnacceptableType|launcher" "$LOG" 2>/dev/null | tail -40
+grep -aiE "curl|fetch|http|https|ssl|tls|openssl|cert|dns|resolve|connect|10\.0\.2|NSERROR|fetcherror|UnacceptableType|launcher" "$LOG" 2>/dev/null | tail -40

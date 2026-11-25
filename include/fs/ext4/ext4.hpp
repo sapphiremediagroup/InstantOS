@@ -335,10 +335,19 @@ public:
     int unmount() override;
     VNode* getRoot() override;
     bool isBlockBacked() const override { return true; }
+    // Every lookup makes a fresh node (makeVNode); the root is kept.
+    void releaseNode(VNode* node) override;
 
     // Cheap probe: returns true if `device` starts with a valid ext2/3/4
     // superblock (magic + sane geometry). Used by boot-time FS detection.
     static bool probe(BlockDevice* device);
+
+    // Reload a node's cached inode fields from the inode table. Each open and
+    // each path lookup makes its own Ext4Node, so another process may have
+    // changed the inode (a directory grown by a create, a file appended to)
+    // since this copy was made; every op calls this first, under the storage
+    // lock, or it would write the stale copy back (lost directory entries).
+    void refreshNode(Ext4Node* node);
 
     // VNodeOps entry points (read-only in phase 1).
     static int nodeOpen(VNode* node, int flags);
@@ -383,13 +392,36 @@ public:
     bool resolveInodeBlock(uint32_t inodeNum, uint64_t logicalBlock, uint64_t* physOut);
 
     // --- write-side journaling transaction control (used by the write ops) ---
-    void jBegin();     // open a transaction (no-op unless write-journaling is enabled)
-    int  jCommit();    // journal + checkpoint the transaction (0 on success)
-    void jAbort();     // discard the transaction (resync in-memory superblock)
+    // Every write op runs between jBegin() and jCommit()/jAbort(), but the ops
+    // share one running transaction, as Linux's JBD2 does: their metadata
+    // blocks collect in memory (a block dirtied by many ops is held once) and
+    // the transaction is committed (journal, then checkpoint) once it is
+    // kCommitMs old, nearly full, or on sync(). A crash loses at most the last
+    // uncommitted second of metadata, never consistency. File data is written
+    // straight to its blocks (ordered mode), before the metadata that points
+    // at it is committed.
+    void jBegin();     // an op starts (no-op unless write-journaling is enabled)
+    int  jCommit();    // an op ended; commits the running transaction if it is due
+    void jAbort();     // an op failed; its changes so far stay in the transaction
     bool journalWriteEnabled() const { return jWriteEnabled; }
-    // Test hook: when set, jCommit journals+commits but skips checkpointing,
-    // simulating a crash after commit (leaves a dirty journal for recovery).
+    // Commits the running transaction (only one at least kCommitMs old when
+    // onlyDue). 0 on success, also when nothing was pending.
+    int sync(bool onlyDue = false);
+    static constexpr uint64_t kCommitMs = 1000;
+    uint64_t commitCount() const { return jCommits; }   // transactions written so far
+    // What the mount replayed from a dirty journal (0: it was clean).
+    uint32_t replayedTransactions() const { return replayedTransactions_; }
+    uint32_t replayedBlocks() const { return replayedBlocks_; }
+    // Mounted ext4 volumes, for a system-wide sync (StorageSync, reboot).
+    static uint32_t mountedCount();
+    static Ext4FS* mountedVolume(uint32_t index);
+    // Test hook: when set, the next commit journals+commits but skips
+    // checkpointing, simulating a crash after commit (leaves a dirty journal for
+    // recovery); an op ending while it is set commits at once.
     void setJournalSkipCheckpoint(bool v) { jSkipCheckpoint = v; }
+    // Test hook: the next block search starts at the volume's start (first
+    // fit), so blocks freed a moment ago are found first.
+    void resetAllocationGoal() { allocGoalGroup = 0; allocGoalBit = 0; }
 
 private:
     // --- block / structure I/O ---
@@ -424,7 +456,10 @@ private:
     bool flushSuperblock();
     bool flushGroupDesc(uint32_t group, const Ext4GroupDesc* gd);
     uint64_t groupBlockCount(uint32_t group) const;  // data blocks in a group
-    uint64_t allocBlock();                 // physical block (zeroed) or 0
+    // A free physical block, or 0. `zero` fills it with zeros as metadata (for
+    // indirect blocks); otherwise the caller writes all of it. Searches on from
+    // the last allocation, so a file's blocks come out contiguous.
+    uint64_t allocBlock(bool zero = false);
     uint32_t allocInode(bool isDir);       // inode number or 0
     void freeBlockNum(uint64_t block);
     void freeInodeNum(uint32_t inodeNum, bool isDir);
@@ -467,9 +502,24 @@ private:
     void freeBlockCache();
 
     uint8_t* jTxnFind(uint64_t block);    // buffered dirty block, or nullptr
-    uint8_t* jTxnBlock(uint64_t block);   // find-or-load a dirty block (for writing)
+    // Find-or-add a dirty block for writing; `load` reads its current contents
+    // (a caller about to overwrite all of it passes false).
+    uint8_t* jTxnBlock(uint64_t block, bool load = true);
+    void jTxnDrop(uint64_t block);        // forget a buffered block (reused for file data)
+    void jTxnReset();                     // free every buffered block
+    uint32_t jTxnCapacity() const;        // blocks one transaction may hold
+    void jOpen();                         // start a new running transaction
+    bool jCommitDue() const;
+    int jCommitRunning();                 // journal + checkpoint the running transaction
     int jCheckpoint();                    // write dirty blocks to final locations
     bool journalLoadGeometry();           // cache journal layout at mount
+    bool setRecoverFlag(bool on);         // RECOVER in the on-disk superblock (one sector)
+
+    // Coalesced writes: blocks added in order of physical address go out as one
+    // device write per contiguous run (up to kRunBytes).
+    bool runAdd(uint64_t phys, const uint8_t* data);
+    bool runFlush();
+    static constexpr uint32_t kRunBytes = 64 * 1024;
 
     BlockDevice* device;
     VNode* rootNode;
@@ -497,15 +547,34 @@ private:
     bool writable;
     bool mounted;
 
+    // Where the next block search starts (the last allocation's group and bit).
+    uint32_t allocGoalGroup = 0;
+    uint64_t allocGoalBit = 0;
+
+    // Staging buffer for runAdd/runFlush (kRunBytes, allocated at mount).
+    uint8_t* runBuf = nullptr;
+    uint64_t runStart = 0;    // physical block of the run's first block
+    uint32_t runCount = 0;    // blocks staged
+
     // write-side journaling state
     static constexpr int kJTxnCap = 256;   // max dirty blocks per transaction
+    static constexpr int kJHashSize = 512; // open-addressing index over jBlockNum
+    uint32_t replayedTransactions_ = 0;
+    uint32_t replayedBlocks_ = 0;
     bool jWriteEnabled;      // journal present, writable, and a simple (uncsummed) format
     bool jActive;            // a transaction is currently open
     bool jSkipCheckpoint;    // test hook: commit but do not checkpoint
-    bool jOverflow;          // transaction exceeded kJTxnCap
+    bool jOverflow;          // a dirty block could not be buffered (out of memory)
     int jCount;              // number of buffered dirty blocks
+    uint64_t jOpenedMs = 0;  // uptime when the running transaction began
+    uint64_t jCommits = 0;   // transactions committed (or written through)
     uint64_t jBlockNum[kJTxnCap];
     uint8_t* jBlockBuf[kJTxnCap];
+    int16_t jHash[kJHashSize];   // index + 1 into jBlockNum, 0 = empty
+    // Scratch kept here rather than on the 16 KiB kernel stack the write ops
+    // already run deep in: the checkpoint's address order, one sector.
+    int16_t jOrder[kJTxnCap];
+    uint8_t sectorBuf[512];
     Ext4Node jNode;          // journal inode (for resolving journal blocks)
     uint32_t jFirst;         // journal s_first (first log block)
     uint32_t jMaxlen;        // journal s_maxlen

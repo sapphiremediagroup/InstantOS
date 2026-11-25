@@ -55,6 +55,12 @@ public:
     static void initializeExtendedState(void* state);
     static void saveExtendedState(void* state);
     static void restoreExtendedState(const void* state);
+    // Bytes saveExtendedState writes (the XSAVE area, or FXSAVE's 512).
+    static uint32_t extendedStateSize();
+    // Makes an image from user memory (sigreturn) one restoreExtendedState
+    // cannot fault on: reserved MXCSR bits, unknown XSAVE components and the
+    // header's reserved bytes cleared.
+    static void sanitizeExtendedState(void* state);
 
 private:
     static CPUFeatures features;

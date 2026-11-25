@@ -42,13 +42,14 @@ public:
 
     // Physical floor for kernel-internal allocations (heap arenas, page-table
     // frames) that the kernel dereferences through the LOW IDENTITY MAP. A
-    // non-PIE (ET_EXEC) user image loads at 0x400000 and may span up to
-    // MAX_USER_ELF_SIZE; while such an image is the active address space, it
-    // shadows the identity VA of any physical frame inside that window, so a
-    // kernel identity access there hits the user image instead. Keeping kernel
+    // non-PIE (ET_EXEC) user image loads at 0x400000 and may reach up to this
+    // address (the exec loader refuses one that goes further); while such an
+    // image is the active address space, it shadows the identity VA of any
+    // physical frame inside that window, so a kernel identity access there
+    // hits the user image instead. Keeping kernel
     // metadata above the window makes identity dereferences correct regardless
-    // of which user address space is live. (256 MiB matches the exec loader's
-    // MAX_USER_ELF_SIZE; 0x400000 is the conventional ET_EXEC base.)
+    // of which user address space is live. (0x400000 is the conventional
+    // ET_EXEC base; 256 MiB covers any real program's text and data.)
     static constexpr uint64_t KERNEL_HIGH_ALLOC_MIN = 0x400000ULL + (256ULL * 1024 * 1024);
 
     // Like AllocFrames(), but only returns a contiguous block whose physical

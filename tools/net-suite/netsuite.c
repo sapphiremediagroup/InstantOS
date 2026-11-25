@@ -853,7 +853,7 @@ static void test_tools(void){
 #define HTTPS "https://10.0.2.2:" STR(HTTPS_PORT)
 #define TEST_CA "--cacert /etc/ssl/test-ca.pem "
 static void test_tls(void){
-    section("HTTPS (curl + mbedTLS)");
+    section("HTTPS (curl)");
     tool("curl -sS " TEST_CA HTTPS "/hello",0,NEED("hello from the host"),"https:// verified against the test CA (IP in the certificate)");
     tool("curl -sS " TEST_CA "--resolve web.test:" STR(HTTPS_PORT) ":10.0.2.2 https://web.test:" STR(HTTPS_PORT) "/hello",0,
          NEED("hello from the host"),"https:// to a DNS name in the certificate");
@@ -1063,6 +1063,18 @@ static void test_kernel_log(void){
     if(h>=0) t_close(h);
     check(got>0&&contains(log,(u64)got,"[net] dhcp: 10.0.2.15"),"dmesg prints it");
     SC1(N_UNLINK,"/tmp/klog");
+    // Driver modules (docs/idrv.md): with QEMU_NIC=pcnet the NIC's driver is
+    // one, loaded at boot; otherwise pcnet.idrv finds no card.
+    tool("lsmod -v; echo rc=$?",0,NEED("rc=0"),"lsmod runs");
+    struct NetConfig nc; get_config(&nc,0,0);
+    if(sstreq(nc.device,"pcnet")){
+        tool("lsmod",0,NEED("pcnet","/lib/drivers/pcnet.idrv"),"lsmod lists the PCnet module");
+        tool("modload /lib/drivers/pcnet.idrv; echo rc=$?",0,NEED("already loaded","rc=1"),
+             "modload of a loaded module says so");
+    } else {
+        tool("modload /lib/drivers/pcnet.idrv; echo rc=$?",0,NEED("no device","rc=1"),
+             "modload of pcnet without a PCnet card says so");
+    }
 #endif
 }
 

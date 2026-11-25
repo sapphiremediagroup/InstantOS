@@ -3,9 +3,10 @@
 # mlibc PIE with libcurl built in statically, installed to build/curl/curl.
 # CMake bundles it as /bin/curl when it exists (rerun cmake after building).
 #
-# TLS: with mbedTLS in the mlibc sysroot (tools/build-mbedtls.sh) curl speaks
-# https://, otherwise it is built --without-ssl and does http:// only. zlib
-# (tools/build-zlib.sh) is used for --compressed when present.
+# TLS: with OpenSSL in the mlibc sysroot (tools/build-openssl.sh) curl speaks
+# https:// through the shared libssl.so.3/libcrypto.so.3 in /lib/mlibc. Without
+# it (or with CURL_TLS=none) it is built --without-ssl and does http:// only.
+# zlib (tools/build-zlib.sh) is used for --compressed when present.
 #
 # Prerequisites: tools/build-mlibc.sh
 set -euo pipefail
@@ -13,9 +14,10 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="${BUILD_DIR:-$ROOT/build}"
 MLIBC_ROOT="${MLIBC_ROOT:-$BUILD_DIR/mlibc-root}"
-CURL_VERSION="${CURL_VERSION:-curl-8.11.1}"
+CURL_VERSION="${CURL_VERSION:-curl-8.23.0}"
+CURL_SHA256="${CURL_SHA256:-8dadd7d2536a314f982ad05a651b713f426bf7d02cc2c76cffb9796f2218e6c5}"
 CURL_URL="${CURL_URL:-https://curl.se/download/${CURL_VERSION}.tar.xz}"
-WORK_DIR="${WORK_DIR:-$BUILD_DIR/curl-port}"
+WORK_DIR="${WORK_DIR:-$HOME/curl-port}"
 SRC_DIR="$WORK_DIR/$CURL_VERSION"
 OBJ_DIR="$WORK_DIR/cli-build"
 OUT_DIR="${OUT_DIR:-$BUILD_DIR/curl}"
@@ -31,10 +33,16 @@ fi
 TLS_ARGS=(--without-ssl)
 LIBS="-lc"
 TLS_NAME="none (http only)"
-if [ -f "$MLIBC_ROOT/lib/libmbedtls.a" ]; then
-  TLS_ARGS=(--with-mbedtls="$MLIBC_ROOT" --without-ca-path --with-ca-bundle=/etc/ssl/certs/ca-certificates.crt)
-  LIBS="-lmbedtls -lmbedx509 -lmbedcrypto $LIBS"
-  TLS_NAME="mbedTLS"
+if [ -z "${CURL_TLS:-}" ]; then
+  if [ -f "$MLIBC_ROOT/lib/libssl.so.3" ]; then CURL_TLS=openssl; else CURL_TLS=none; fi
+fi
+if [ "$CURL_TLS" = openssl ]; then
+  [ -f "$MLIBC_ROOT/lib/libssl.so.3" ] || { echo "OpenSSL is not in the sysroot (tools/build-openssl.sh)" >&2; exit 2; }
+  TLS_ARGS=(--with-openssl="$MLIBC_ROOT" --without-ca-path --with-ca-bundle=/etc/ssl/certs/ca-certificates.crt)
+  LIBS="-lssl -lcrypto $LIBS"
+  TLS_NAME="OpenSSL"
+  # Only the sysroot's .pc files: the host's would name the host's OpenSSL.
+  export PKG_CONFIG_LIBDIR="$MLIBC_ROOT/lib/pkgconfig" PKG_CONFIG_PATH=
 fi
 ZLIB_ARGS=(--without-zlib)
 if [ -f "$MLIBC_ROOT/lib/libz.a" ]; then
@@ -43,17 +51,18 @@ if [ -f "$MLIBC_ROOT/lib/libz.a" ]; then
 fi
 
 TARGET_CFLAGS="--target=x86_64-unknown-elf -ffreestanding -fPIE -fno-stack-protector -O2 -nostdlibinc -isystem $MLIBC_ROOT/include -I$MLIBC_ROOT/include -D_GNU_SOURCE"
-[ "$TLS_NAME" = "mbedTLS" ] && TARGET_CFLAGS="$TARGET_CFLAGS -DMBEDTLS_CONFIG_FILE='<instantos_mbedtls_config.h>'"
 TARGET_LDFLAGS="--target=x86_64-unknown-elf -pie -nostdlib -fuse-ld=lld -L$MLIBC_ROOT/lib -Wl,--dynamic-linker,/lib/mlibc/ld-instantos.so -Wl,-rpath,/lib/mlibc"
 # crt1.o only for the executable: libtool refuses it for the library.
 BIN_LDFLAGS="$TARGET_LDFLAGS $MLIBC_ROOT/lib/crt1.o"
 
 mkdir -p "$WORK_DIR"
-if [ ! -d "$SRC_DIR" ]; then
+if [ ! -f "$WORK_DIR/$CURL_VERSION.tar.xz" ]; then
   printf 'fetching %s\n' "$CURL_URL"
-  curl -sL "$CURL_URL" -o "$WORK_DIR/$CURL_VERSION.tar.xz"
-  tar -C "$WORK_DIR" -xf "$WORK_DIR/$CURL_VERSION.tar.xz"
+  curl -fsSL "$CURL_URL" -o "$WORK_DIR/$CURL_VERSION.tar.xz"
 fi
+echo "$CURL_SHA256  $WORK_DIR/$CURL_VERSION.tar.xz" | sha256sum -c --quiet - || {
+  echo "$CURL_VERSION.tar.xz does not have the pinned checksum: not building it" >&2; exit 1; }
+[ -d "$SRC_DIR" ] || tar -C "$WORK_DIR" -xf "$WORK_DIR/$CURL_VERSION.tar.xz"
 
 rm -rf "$OBJ_DIR"
 mkdir -p "$OBJ_DIR"
@@ -96,13 +105,13 @@ CFLAGS="$TARGET_CFLAGS" CPPFLAGS="$TARGET_CFLAGS" LDFLAGS="$TARGET_LDFLAGS" LIBS
   "${TLS_ARGS[@]}" \
   "${ZLIB_ARGS[@]}" \
   --without-libpsl --without-libidn2 --without-brotli --without-zstd \
-  --without-nghttp2 --without-ngtcp2 --without-librtmp \
+  --without-nghttp2 --without-ngtcp2 \
   --disable-ldap --disable-ldaps --disable-ftp --disable-tftp --disable-telnet \
   --disable-dict --disable-gopher --disable-smtp --disable-pop3 --disable-imap \
-  --disable-smb --disable-rtsp --disable-mqtt --disable-manual \
+  --disable-rtsp --disable-mqtt --disable-manual \
   --disable-threaded-resolver --disable-ares --disable-unix-sockets \
   --disable-ipv6 --disable-docs \
-  --enable-http --enable-file --enable-proxy --enable-ipv4 > configure.log 2>&1 || {
+  --enable-http --enable-file --enable-proxy > configure.log 2>&1 || {
     tail -40 configure.log >&2; exit 1; }
 
 make -C lib -j"$(nproc)" >make.log 2>&1 || { tail -40 make.log >&2; exit 1; }
@@ -110,4 +119,7 @@ make -C src -j"$(nproc)" curl LDFLAGS="$BIN_LDFLAGS" >>make.log 2>&1 || { tail -
 
 mkdir -p "$OUT_DIR"
 cp src/curl "$OUT_DIR/curl"
+if [ "$TLS_NAME" = "OpenSSL" ]; then
+  llvm-readelf -d src/curl | grep -q "NEEDED.*libssl.so.3" || { echo "curl does not link libssl.so.3" >&2; exit 1; }
+fi
 printf 'curl built: %s (TLS: %s)\n' "$OUT_DIR/curl" "$TLS_NAME"

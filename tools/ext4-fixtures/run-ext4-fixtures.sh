@@ -36,14 +36,14 @@ printf 'running ext4 read/write tests\n'
 
 # The read/write tests mutate the writable images; confirm the on-disk result
 # is consistent according to the reference implementation.
-for img in ext2w.img ext4w.img ext4c.img ext4j.img ext4j2.img ext4fuzz.img ext4fuzzc.img ext4hw.img; do
+for img in ext2w.img ext4w.img ext4c.img ext4j.img ext4j2.img ext4fuzz.img ext4fuzzc.img ext4fuzzj.img ext4hw.img; do
   printf 'e2fsck -fn %s\n' "$img"
   e2fsck -fn "$BUILD_DIR/$img"
 done
 
 # Journal cross-checks: Linux must be able to replay the journals the driver
 # wrote (crafted recovery journal + write-side transactions) and end consistent.
-for img in ext4j_dirty.img ext4j2_dirty.img; do
+for img in ext4j_dirty.img ext4j2_dirty.img ext4fuzzj_crash.img; do
   if [ -f "$BUILD_DIR/$img" ]; then
     printf 'e2fsck -fy %s (journal replay cross-check)\n' "$img"
     e2fsck -fy "$BUILD_DIR/$img"

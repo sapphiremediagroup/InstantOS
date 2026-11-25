@@ -7,6 +7,8 @@
 #include <graphics/intel_gen9.hpp>
 #include <cpu/cpuid.hpp>
 #include <memory/vmm.hpp>
+#include <memory/pmm.hpp>
+#include <memory/heap.hpp>
 #include <cpu/cereal/cereal.hpp>
 #include <cpu/klock.hpp>
 #include <cpu/tlb.hpp>
@@ -14,10 +16,12 @@
 #include <cpu/percpu.hpp>
 #include <cpu/apic/irqs.hpp>
 #include <time/tsc_timer.hpp>
+#include <interrupts/timer.hpp>
 
 Interrupt *interruptHandlers[256] = {nullptr};
 
 extern unsigned long long runtimeBase;
+static void serialExceptionDump(InterruptFrame* frame, uint64_t runtimeBase);
 
 static void printPageWalk(uint64_t addr) {
     auto* pml4 = VMM::GetAddressSpace();
@@ -88,6 +92,35 @@ void printStackTrace(uint64_t rbp, uint64_t rip) {
         rbp = next_rbp;
         depth++;
     }
+}
+
+// On the way back to user mode from an interrupt or exception: pending
+// signals are acted on now (a handler frame, or the default action), so they
+// reach a program that makes no syscalls. Returns the vector state to load:
+// that of the process the frame now returns to (the scheduler may have
+// switched to another one by rewriting the frame), whose user state is in
+// its userFpuState (saved when it entered the kernel).
+static FPUState* deliverOnReturnToUser(InterruptFrame* frame, FPUState* fpuSave) {
+    if (frame->cs != kUserCodeSelector) {
+        return fpuSave;
+    }
+    for (int guard = 0; guard < 4; ++guard) {
+        Process* current = Scheduler::get().getCurrentProcess();
+        if (!current || current->getPriority() == ProcessPriority::Idle) {
+            return fpuSave;
+        }
+        if (current->deliverSignalsToFrame(frame)) {
+            return current->userFpuState;
+        }
+        // It died: run something else (the frame becomes that process's, or
+        // this CPU leaves through a context switch and never comes back).
+        Scheduler::get().schedule(frame);
+        if (frame->cs != kUserCodeSelector) {
+            return fpuSave;
+        }
+    }
+    Process* current = Scheduler::get().getCurrentProcess();
+    return current ? current->userFpuState : fpuSave;
 }
 
 static void handleException(InterruptFrame* frame) {
@@ -173,12 +206,49 @@ static void handleException(InterruptFrame* frame) {
     if (frame->cs == 0x23) {
         Process* current = Scheduler::get().getCurrentProcess();
 
+        // The signal Linux raises for this exception; a handler for it runs
+        // instead of the process dying.
+        int faultSignal = SIGSEGV;
+        SignalInfo faultInfo{SI_KERNEL, 0, 0, 0, 0};
+        switch (frame->interrupt) {
+        case 0:  faultSignal = SIGFPE;  faultInfo = {1 /*FPE_INTDIV*/, 0, 0, 0, frame->rip}; break;
+        case 1:  faultSignal = SIGTRAP; faultInfo = {2 /*TRAP_TRACE*/, 0, 0, 0, frame->rip}; break;
+        case 3:  faultSignal = SIGTRAP; break;
+        case 6:  faultSignal = SIGILL;  faultInfo = {2 /*ILL_ILLOPN*/, 0, 0, 0, frame->rip}; break;
+        case 11: case 12: faultSignal = SIGBUS; break;
+        case 14: {
+            uint64_t cr2;
+            asm volatile("mov %%cr2, %0" : "=r"(cr2));
+            // ACCERR only for a page of the program's (the kernel's identity
+            // map of low memory is present too, but not the program's).
+            const uint64_t leaf = current ? VMM::LeafEntryIn(current->getPageTable(), cr2) : 0;
+            const bool mapped = (leaf & Present) && (leaf & UserSuper);
+            faultInfo = {mapped ? 2 /*SEGV_ACCERR*/ : 1 /*SEGV_MAPERR*/, 0, 0, 0, cr2};
+            break;
+        }
+        case 16: case 19: faultSignal = SIGFPE; faultInfo = {7 /*FPE_FLTINV*/, 0, 0, 0, frame->rip}; break;
+        case 17: faultSignal = SIGBUS;  faultInfo = {1 /*BUS_ADRALN*/, 0, 0, 0, frame->rip}; break;
+        default: break;
+        }
+        if (current && current->takeFaultSignal(frame, faultSignal, faultInfo)) {
+            return;
+        }
+
         if (current) {
-            if (current->userFpuState) {
-                CPU::saveExtendedState(current->userFpuState);
-            }
+            // exceptionHandler saved the program's vector registers into
+            // userFpuState on entry; saving them again here would take the
+            // kernel's values instead.
             Console::get().drawText("User process crash.\n");
             Debug::printCurrentProcessSummary();
+            Console::get().drawText("free memory: ");
+            Console::get().drawNumber(static_cast<int64_t>(PMM::FreeMemory() / (1024 * 1024)));
+            Console::get().drawText(" MiB, heap arenas ");
+            Console::get().drawNumber(heap_arena_count());
+            Console::get().drawText(" (low ");
+            Console::get().drawNumber(heap_low_arena_count());
+            Console::get().drawText("), low page tables ");
+            Console::get().drawNumber(static_cast<int64_t>(VMM::lowPageTables));
+            Console::get().drawText("\n");
             const char* exception_name = (frame->interrupt < 32) ? exception_names[frame->interrupt] : "Unknown Exception";
             Console::get().drawText("exception: ");
             Console::get().drawText(exception_name);
@@ -218,12 +288,13 @@ static void handleException(InterruptFrame* frame) {
         }
 
         if (current) {
-            const int code = 128 + ((frame->interrupt == 0x0E) ? SIGSEGV : SIGTERM);
+            const int code = 128 + faultSignal;
             // A crash in any thread takes the whole process down.
             if (current->isThread()) {
-                Scheduler::get().exitThreadGroup(current, code);
+                Scheduler::get().exitThreadGroup(current, code, faultSignal);
             }
             current->setExitCode(code);
+            current->termSignal = faultSignal;
             current->closeFilesOnExit();
             current->setState(ProcessState::Terminated);
             current->setValidUserState(false);
@@ -231,8 +302,30 @@ static void handleException(InterruptFrame* frame) {
         }
         return;
     }
-    // A kernel exception's report is drawn into the firmware's framebuffer.
+    // A fault while this CPU was already reporting one (e.g. in the console's
+    // drawing code): say so on the serial port alone and stop, rather than
+    // recursing until the stack overflows.
+    static volatile uint32_t reporting[SMP::kMaxCPUs];
+    const uint32_t reportCpu = currentCpuIndex() % SMP::kMaxCPUs;
+    if (reporting[reportCpu]++ != 0) {
+        Console::get().releaseLockHeldByThisCpu();
+        serialExceptionDump(frame, runtimeBase);
+        Cereal::get().write("\n[exception] another fault while reporting one, vector ");
+        Cereal::get().write(frame->interrupt == 0x0E ? "0x0e" : (frame->interrupt == 0x0D ? "0x0d" : "?"));
+        Cereal::get().write("\n");
+        Console::get().drawText("\t- nested RIP: ");
+        Console::get().drawHex(frame->rip);
+        Console::get().drawText("\n");
+        asm volatile("cli");
+        while (true) asm volatile("hlt");
+    }
+    serialExceptionDump(frame, runtimeBase);
+    // A kernel exception's report is drawn into the firmware's framebuffer,
+    // unless this CPU faulted inside the console (then serial and log only).
     Debug::takeScreenForReport();
+    if (Console::get().releaseLockHeldByThisCpu()) {
+        Cereal::get().write("\n[exception] faulted while holding the console lock\n");
+    }
     const char* exception_name = (frame->interrupt < 32) ? exception_names[frame->interrupt] : "Unknown";
     Console::get().drawText(exception_name);
     Console::get().drawText("\n\t- Interrupt: ");
@@ -276,9 +369,87 @@ static void handleException(InterruptFrame* frame) {
     while(1);
 }
 
+// The essentials of a kernel exception, straight to the serial port and the
+// log before anything else: the console's drawing can fault too (a corrupted
+// framebuffer object), and then the report below never gets past its first
+// character.
+static void serialHex(const char* label, uint64_t value) {
+    char buf[20];
+    for (int i = 0; i < 16; ++i) {
+        const uint32_t d = static_cast<uint32_t>(value >> (60 - 4 * i)) & 0xF;
+        buf[i] = static_cast<char>(d < 10 ? '0' + d : 'a' + d - 10);
+    }
+    buf[16] = 0;
+    Cereal::get().write(label);
+    Cereal::get().write(buf);
+}
+
+static void serialExceptionDump(InterruptFrame* frame, uint64_t runtimeBase) {
+    uint64_t cr2 = 0, cr3 = 0;
+    asm volatile("mov %%cr2, %0" : "=r"(cr2));
+    asm volatile("mov %%cr3, %0" : "=r"(cr3));
+    Cereal::get().write("\n[exception] kernel");
+    serialHex(" vector=", frame->interrupt);
+    serialHex(" err=", frame->errCode);
+    serialHex(" cpu=", currentCpuIndex());
+    serialHex("\n[exception] rip=", frame->rip);
+    serialHex(" map=", frame->rip - runtimeBase + 0x140000000ULL);
+    serialHex(" cr2=", cr2);
+    serialHex(" cr3=", cr3);
+    serialHex("\n[exception] rsp=", frame->rsp);
+    serialHex(" rbp=", frame->rbp);
+    serialHex(" rflags=", frame->rflags);
+    serialHex("\n[exception] rax=", frame->rax);
+    serialHex(" rbx=", frame->rbx);
+    serialHex(" rcx=", frame->rcx);
+    serialHex(" rdx=", frame->rdx);
+    serialHex("\n[exception] rsi=", frame->rsi);
+    serialHex(" rdi=", frame->rdi);
+    serialHex(" r8=", frame->r8);
+    serialHex(" r9=", frame->r9);
+    serialHex(" r10=", frame->r10);
+    serialHex(" r11=", frame->r11);
+    Process* current = Scheduler::get().getCurrentProcess();
+    if (current) {
+        serialHex("\n[exception] pid=", current->getPID());
+    }
+    // Frame-pointer walk (the kernel keeps frame pointers), as map addresses.
+    Cereal::get().write("\n[exception] stack:");
+    uint64_t rbp = frame->rbp;
+    for (int i = 0; i < 16 && rbp && (rbp & 7) == 0; ++i) {
+        if (!VMM::IsMapped(rbp) || !VMM::IsMapped(rbp + 8)) break;
+        const uint64_t ret = reinterpret_cast<uint64_t*>(rbp)[1];
+        serialHex(" ", ret >= runtimeBase ? ret - runtimeBase + 0x140000000ULL : ret);
+        const uint64_t next = reinterpret_cast<uint64_t*>(rbp)[0];
+        if (next <= rbp) break;
+        rbp = next;
+    }
+    Cereal::get().write("\n");
+}
+
 // Exceptions take the big kernel lock like any kernel entry. A fault inside the
 // kernel (e.g. demand paging a user buffer during a syscall) nests on the lock
 // this CPU already holds.
+// Extended (FPU/SSE/AVX) state must be preserved around IRQ and exception
+// handlers because kernel code freely uses vector registers (the SIMD
+// memcpy/memset in common/string.cpp, and whatever the compiler emits: the
+// kernel is built with SSE allowed). For a *user-mode* entry we save into the
+// process's userFpuState, as the syscall path does. For a *kernel-mode* entry
+// there is no process area to borrow, so we save into a small nesting-indexed
+// scratch pool. Without this, an IRQ landing inside kernel code that has live
+// XMM/YMM (e.g. a kernel thread doing floating-point pixel math) is silently
+// corrupted, and so was a program whose page fault read a file-backed page
+// (ext4's memcpy took xmm0-3; the suite's "page faults keep the program's SSE
+// registers"), or a kernel memcpy whose store faulted. IRQ gates run with IF=0
+// so nesting is normally absent; the depth index keeps this correct even if a
+// handler re-enables interrupts or faults. The scratch pool is shared by all
+// CPUs: IRQ and exception handlers run only under the big kernel lock.
+namespace {
+constexpr int kMaxKernelIrqFpuDepth = 4;
+alignas(64) FPUState kernelIrqFpuScratch[kMaxKernelIrqFpuDepth];
+int kernelIrqFpuDepth = 0;
+}  // namespace
+
 extern "C" void exceptionHandler(InterruptFrame* frame) {
     // The watchdog's NMI (cpu/watchdog.hpp): record where this CPU was and go
     // straight back, taking no lock (this CPU may be the one stuck holding it).
@@ -286,7 +457,28 @@ extern "C" void exceptionHandler(InterruptFrame* frame) {
         return;
     }
     KernelLock::enter(KernelLock::kSiteException + (frame->interrupt & 0xFF));
+    const bool fromUser = (frame->cs & 3) == 3;
+    FPUState* fpuSave = nullptr;
+    if (fromUser) {
+        Process* current = Scheduler::get().getCurrentProcess();
+        fpuSave = current ? current->userFpuState : nullptr;
+    } else {
+        if (kernelIrqFpuDepth < kMaxKernelIrqFpuDepth) {
+            fpuSave = &kernelIrqFpuScratch[kernelIrqFpuDepth];
+        }
+        ++kernelIrqFpuDepth;  // increment even when over cap to balance the decrement
+    }
+    if (fpuSave) {
+        CPU::saveExtendedState(fpuSave);
+    }
     handleException(frame);
+    fpuSave = deliverOnReturnToUser(frame, fpuSave);
+    if (fpuSave) {
+        CPU::restoreExtendedState(fpuSave);
+    }
+    if (!fromUser) {
+        --kernelIrqFpuDepth;
+    }
     KernelLock::leave();
 }
 
@@ -296,22 +488,6 @@ void ISR::registerIRQ(uint8_t vector, Interrupt* handler) {
     interruptHandlers[vector] = handler;
     handler->initialize();
 }
-
-// Extended (FPU/SSE/AVX) state must be preserved around IRQ handlers because
-// handlers freely use vector registers (e.g. the SIMD memcpy/memset in
-// common/string.cpp). For a *user-mode* interruption we save into the
-// interrupted process's userFpuState. For a *kernel-mode* interruption there is
-// no process area to borrow, so we save into a small nesting-indexed scratch
-// pool. Without this, an IRQ landing inside kernel code that has live XMM/YMM
-// (e.g. a kernel thread doing floating-point pixel math) is silently corrupted.
-// IRQ gates run with IF=0 so nesting is normally absent; the depth index keeps
-// this correct even if a handler re-enables interrupts. The scratch pool is
-// shared by all CPUs: handleIrq runs only under the big kernel lock.
-namespace {
-constexpr int kMaxKernelIrqFpuDepth = 4;
-alignas(64) FPUState kernelIrqFpuScratch[kMaxKernelIrqFpuDepth];
-int kernelIrqFpuDepth = 0;
-}  // namespace
 
 static void handleIrq(InterruptFrame* frame);
 
@@ -328,6 +504,10 @@ extern "C" void irqHandler(InterruptFrame* frame) {
     if (frame->interrupt == VECTOR_TLB_SHOOTDOWN) {
         TLB::handleIpi();
         return;
+    }
+    // Before looking at the ready queues (see Scheduler::kickIdleCpu).
+    if (frame->interrupt == VECTOR_RESCHEDULE) {
+        __atomic_exchange_n(&getPerCPU()->idleKicked, 0U, __ATOMIC_SEQ_CST);
     }
     const uint32_t site = KernelLock::kSiteIrq + (frame->interrupt & 0xFF);
     // Scheduler ticks are frequent and usually change nothing; taking the lock
@@ -391,6 +571,7 @@ static void handleIrq(InterruptFrame* frame) {
         LAPIC::get().sendEOI();
     }
 
+    fpuSave = deliverOnReturnToUser(frame, fpuSave);
     if (fpuSave) {
         CPU::restoreExtendedState(fpuSave);
     }

@@ -4,6 +4,8 @@
 # on the "[ostest] SCORE ..." line from tools/os-testsuite/runner.c.
 #
 #   QEMU_SMP=1|2|4   CPU count to boot with (default 1)
+#   QEMU_WIN=1       Windows' QEMU with WHPX instead of WSL's with TCG
+#   QEMU_SHOW=1      with QEMU_WIN: a window on the Windows desktop to watch
 #   SKIP_BUILD=1     reuse the existing ISO/disk instead of rebuilding
 #   SKIP_CMAKE=1     passed through: only repack runner.c, skip the kernel build
 #
@@ -24,6 +26,10 @@ QEMU_TIMEOUT="${QEMU_TIMEOUT:-900}"
 QEMU_ACCEL="${QEMU_ACCEL:-tcg}"
 # The NIC, e.g. QEMU_NIC=e1000 or QEMU_NIC=virtio-net-pci,vectors=0 (no MSI-X).
 QEMU_NIC="${QEMU_NIC:-virtio-net-pci,disable-legacy=on,disable-modern=off}"
+# A USB NIC needs its controller first: QEMU_NIC=usb-net gets an xHCI here.
+case "$QEMU_NIC" in
+  usb-*) QEMU_USB="${QEMU_USB:--device qemu-xhci,id=xhci}" ;;
+esac
 # The backend behind the NIC's netdev "net0" (split on spaces); the network
 # suite puts a hub there to add a fake host beside slirp.
 QEMU_NETDEV="${QEMU_NETDEV:--netdev user,id=net0}"
@@ -46,6 +52,30 @@ OVMF_VARS="$OUT_DIR/OVMF_VARS.fd"
 cp "$OVMF_VARS_TEMPLATE" "$OVMF_VARS"
 
 rm -f "$LOG"
+# QEMU_WIN=1: Windows' QEMU with WHPX (from WSL), which is much faster than TCG.
+# The NIC and its netdev (QEMU_NETDEV) are passed as on Linux; host-side
+# helpers that join it (the net suite's link relay, QMP) must run on Windows.
+if [ "${QEMU_WIN:-0}" = 1 ]; then
+  QEMU_ACCEL=whpx
+  QEMU_DIR="${QEMU_DIR:-/mnt/c/Program Files/qemu}"
+  win() { printf '%s\\%s' "$(wslpath -w "$(dirname "$1")")" "$(basename "$1")"; }
+  cp "$QEMU_DIR/share/edk2-i386-vars.fd" "$OVMF_VARS"; chmod u+w "$OVMF_VARS"
+  rm -f "$OUT_DIR/qemu.pid"
+  "$QEMU_DIR/qemu-system-x86_64.exe" \
+    -drive "if=pflash,format=raw,readonly=on,file=$(win "$QEMU_DIR/share/edk2-x86_64-code.fd")" \
+    -drive "if=pflash,format=raw,file=$(win "$OVMF_VARS")" \
+    -drive "file=$(win "$ISO"),media=cdrom" \
+    -device ich9-ahci,id=ahci -drive "id=ahci_disk,file=$(win "$RUN_DISK"),if=none,format=raw" \
+    -device ide-hd,drive=ahci_disk,bus=ahci.0 \
+    -device "$QEMU_NIC,netdev=net0" $QEMU_NETDEV \
+    -accel whpx,kernel-irqchip=off -vga std -m 1G -smp "$QEMU_SMP" \
+    -display "$([ "${QEMU_SHOW:-0}" = 1 ] && echo gtk || echo none)" -monitor none -pidfile "$(win "$OUT_DIR/qemu.pid")" \
+    -serial "file:$(win "$LOG")" -no-shutdown -no-reboot ${QEMU_EXTRA_ARGS:-} &
+  stop_qemu() {
+    [ -f "$OUT_DIR/qemu.pid" ] && taskkill.exe /PID "$(tr -dc 0-9 < "$OUT_DIR/qemu.pid")" /F >/dev/null 2>&1 || true
+    kill "$qemu_pid" 2>/dev/null || true
+  }
+else
 "$QEMU" \
   -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
   -drive "if=pflash,format=raw,file=$OVMF_VARS" \
@@ -53,14 +83,17 @@ rm -f "$LOG"
   -device ich9-ahci,id=ahci \
   -drive "id=ahci_disk,file=$RUN_DISK,if=none,format=raw" \
   -device ide-hd,drive=ahci_disk,bus=ahci.0 \
+  ${QEMU_USB:-} \
   -device "$QEMU_NIC,netdev=net0" \
   $QEMU_NETDEV \
   -accel "$QEMU_ACCEL" -cpu max,+tsc -m 1G -smp "$QEMU_SMP" \
   -display none -monitor none \
   -serial "file:$LOG" -no-shutdown -no-reboot \
   ${QEMU_EXTRA_ARGS:-} &
+  stop_qemu() { kill "$qemu_pid" 2>/dev/null || true; }
+fi
 qemu_pid=$!
-trap 'kill "$qemu_pid" 2>/dev/null || true' EXIT
+trap stop_qemu EXIT
 
 # The runner sleeps forever after END, so stop QEMU as soon as it appears.
 start=$SECONDS
@@ -71,7 +104,7 @@ while kill -0 "$qemu_pid" 2>/dev/null; do
   sleep 2
 done
 [ "$result" = timeout ] && ! kill -0 "$qemu_pid" 2>/dev/null && result=qemu-exited
-kill "$qemu_pid" 2>/dev/null || true
+stop_qemu
 wait "$qemu_pid" 2>/dev/null || true
 elapsed=$((SECONDS - start))
 

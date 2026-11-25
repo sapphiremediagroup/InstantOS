@@ -12,8 +12,8 @@ LD="${LD:-ld.lld}"
 MLIBC_ROOT="${MLIBC_ROOT:-$BUILD_DIR/mlibc-root}"
 GP_DIR="$ROOT/tools/gcc-port"
 BX="$BUILD_DIR/binutils-cross/bin"
-GXX_CROSS="${GXX_CROSS:-/home/sky/gcc-port/gcc-install/bin/x86_64-unknown-instantos-g++}"
-CXXLIB="${CXXLIB:-/home/sky/gcc-port/gcc-install/x86_64-unknown-instantos/lib}"
+GXX_CROSS="${GXX_CROSS:-${GCC_PORT_DIR:-$HOME/gcc-port}/gcc-install/bin/x86_64-unknown-instantos-g++}"
+CXXLIB="${CXXLIB:-${GCC_PORT_DIR:-$HOME/gcc-port}/gcc-install/x86_64-unknown-instantos/lib}"
 
 [ -f "$MLIBC_ROOT/lib/libc.so" ] || { echo "mlibc missing" >&2; exit 2; }
 [ -x "$GXX_CROSS" ] || { echo "cross g++ missing; build gcc with LANGS=c,c++" >&2; exit 2; }

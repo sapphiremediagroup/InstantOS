@@ -1147,6 +1147,9 @@ bool xhci_control_transfer(XHCIControllerState& state, XHCISlotState& slot, cons
 bool bring_up_connected_port(XHCIControllerState& state, uint8_t portIndex);
 bool enumerate_device(XHCIControllerState& state, const XHCIEnumerationTarget& target);
 bool enumerate_hub(XHCIControllerState& state, XHCISlotState& hubSlot);
+bool usbnet_owns_slot(const XHCIControllerState& state, uint8_t slotId);
+void usbnet_transfer_event(XHCIControllerState& state, const XHCITransferRequestBlock& event, uint32_t endpointId,
+                           uint32_t code);
 
 void portsc_write(XHCIControllerState& state, uint8_t portIndex, uint32_t status, uint32_t setBits, uint32_t clearChangeBits) {
     const uint32_t value = (status & XHCI_PORTSC_PRESERVE_MASK) |
@@ -1286,6 +1289,9 @@ void drain_events(XHCIControllerState& state) {
                 XHCISlotState& slot = state.slots[slotId];
                 const uint32_t code = trb_completion_code(event);
                 const uint32_t endpointId = (event.control >> XHCI_TRB_ENDPOINT_ID_SHIFT) & 0x1F;
+                if (endpointId != 1 && usbnet_owns_slot(state, slotId)) {
+                    usbnet_transfer_event(state, event, endpointId, code);
+                }
                 // The status stage's event ends a control transfer; so does an
                 // error on any of its TRBs (a STALL in the data stage points
                 // at the data TRB, and nothing more comes: ep0 is halted).
@@ -2446,6 +2452,609 @@ bool enumerate_hub(XHCIControllerState& state, XHCISlotState& hubSlot) {
     return foundChild;
 }
 
+// ---------------------------------------------------------------------------
+// USB Ethernet: CDC-ECM (the class QEMU's usb-net, many RTL8153 adapters, and
+// docks offer). One adapter, on whichever controller finds it first. Each
+// Ethernet frame is one bulk transfer (a zero-length packet ends a frame that
+// fills its last packet); the notification endpoint reports the cable.
+// src/drivers/net/usb_net.cpp is the NetDevice over it; the stack polls it on
+// every tick, since the xHCI interrupt handler must not wake anyone.
+// ---------------------------------------------------------------------------
+
+constexpr uint8_t USB_DESCRIPTOR_STRING = 0x03;
+constexpr uint8_t USB_DESCRIPTOR_CS_INTERFACE = 0x24;
+constexpr uint8_t USB_CLASS_COMM = 0x02;
+constexpr uint8_t USB_CLASS_CDC_DATA = 0x0A;
+constexpr uint8_t USB_CDC_SUBCLASS_ETHERNET = 0x06;
+constexpr uint8_t USB_CDC_UNION_TYPE = 0x06;
+constexpr uint8_t USB_CDC_ETHERNET_TYPE = 0x0F;
+constexpr uint8_t USB_CDC_NOTIFY_NETWORK_CONNECTION = 0x00;
+constexpr uint8_t USB_CDC_SET_ETHERNET_PACKET_FILTER = 0x43;
+constexpr uint16_t USB_CDC_PACKET_TYPE_ALL_MULTICAST = 1 << 1;
+constexpr uint16_t USB_CDC_PACKET_TYPE_DIRECTED = 1 << 2;
+constexpr uint16_t USB_CDC_PACKET_TYPE_BROADCAST = 1 << 3;
+constexpr uint8_t USB_REQUEST_SET_INTERFACE = 0x0B;
+constexpr uint8_t USB_ENDPOINT_TYPE_BULK = 0x02;
+constexpr uint8_t XHCI_ENDPOINT_TYPE_BULK_OUT = 2;
+constexpr uint8_t XHCI_ENDPOINT_TYPE_BULK_IN = 6;
+constexpr uint32_t XHCI_COMPLETION_SHORT_PACKET = 13;
+constexpr uint32_t XHCI_COMPLETION_STOPPED = 26;
+constexpr uint32_t XHCI_COMPLETION_STOPPED_LENGTH_INVALID = 27;
+constexpr uint32_t XHCI_TRANSFER_EVENT_LENGTH_MASK = 0xFFFFFF;
+
+constexpr uint32_t USBNET_RX_BUFFERS = 32;
+constexpr uint32_t USBNET_TX_BUFFERS = 64;
+constexpr uint32_t USBNET_BUFFER_BYTES = 2048;
+constexpr uint32_t USBNET_NOTIFY_BYTES = 16;
+
+// A transfer ring of the 256-TRB kind every endpoint here uses, a link TRB in
+// its last entry.
+struct XHCIRing {
+    XHCITransferRequestBlock* trbs;
+    uint64_t phys;
+    uint32_t enqueue;
+    bool cycle;
+};
+
+bool ring_allocate(XHCIRing& ring) {
+    ring.trbs = reinterpret_cast<XHCITransferRequestBlock*>(
+        alloc_dma_pages(pages_for_bytes(XHCI_TRANSFER_RING_TRBS * sizeof(XHCITransferRequestBlock)), ring.phys));
+    ring.enqueue = 0;
+    ring.cycle = true;
+    if (!ring.trbs) {
+        return false;
+    }
+    auto& link = ring.trbs[XHCI_TRANSFER_RING_TRBS - 1];
+    link.parameter = ring.phys;
+    link.status = 0;
+    link.control = (XHCI_TRB_TYPE_LINK << XHCI_TRB_TYPE_SHIFT) | XHCI_LINK_TOGGLE_CYCLE;
+    return true;
+}
+
+uint64_t ring_trb_phys(const XHCIRing& ring, uint32_t index) {
+    return ring.phys + static_cast<uint64_t>(index) * sizeof(XHCITransferRequestBlock);
+}
+
+// Writes the TRB with the producer's cycle bit and returns its index.
+uint32_t ring_enqueue(XHCIRing& ring, XHCITransferRequestBlock trb) {
+    const uint32_t index = ring.enqueue;
+    trb.control = (trb.control & ~XHCI_TRB_CYCLE) | (ring.cycle ? XHCI_TRB_CYCLE : 0);
+    ring.trbs[index] = trb;
+    if (index + 1 >= XHCI_TRANSFER_RING_TRBS - 1) {
+        auto& link = ring.trbs[XHCI_TRANSFER_RING_TRBS - 1];
+        link.parameter = ring.phys;
+        link.status = 0;
+        asm volatile("" ::: "memory");
+        link.control = (XHCI_TRB_TYPE_LINK << XHCI_TRB_TYPE_SHIFT) | XHCI_LINK_TOGGLE_CYCLE |
+            (ring.cycle ? XHCI_TRB_CYCLE : 0);
+        ring.enqueue = 0;
+        ring.cycle = !ring.cycle;
+    } else {
+        ring.enqueue = index + 1;
+    }
+    return index;
+}
+
+// The TRB index an event points at, or UINT32_MAX when it is not this ring's.
+uint32_t ring_index_of(const XHCIRing& ring, uint64_t trbPhys) {
+    if (trbPhys < ring.phys) {
+        return UINT32_MAX;
+    }
+    const uint64_t index = (trbPhys - ring.phys) / sizeof(XHCITransferRequestBlock);
+    return index < XHCI_TRANSFER_RING_TRBS - 1 ? static_cast<uint32_t>(index) : UINT32_MAX;
+}
+
+struct UsbEcmFunction {
+    uint8_t configValue;
+    uint8_t controlInterface;
+    uint8_t dataInterface;
+    uint8_t dataAlternate;
+    uint8_t inAddress;
+    uint8_t outAddress;
+    uint16_t inMaxPacket;
+    uint16_t outMaxPacket;
+    uint8_t notifyAddress;
+    uint16_t notifyMaxPacket;
+    uint8_t notifyInterval;
+    uint8_t macStringIndex;
+    uint16_t maxSegment;
+};
+
+enum class UsbNetBuffer : uint8_t { Free, Posted, Ready };
+
+struct UsbNetState {
+    bool ready;
+    bool linkUp;
+    bool rxNeedsRecovery;
+    bool txNeedsRecovery;
+    XHCIControllerState* controller;
+    uint8_t slotId;
+    uint8_t inDci;
+    uint8_t outDci;
+    uint8_t notifyDci;
+    uint16_t outMaxPacket;
+    uint16_t vendor;
+    uint16_t product;
+    uint8_t mac[6];
+    uint8_t controlInterface;
+    XHCIRing rxRing;
+    XHCIRing txRing;
+    XHCIRing notifyRing;
+    uint8_t* rxBuffers;
+    uint64_t rxBuffersPhys;
+    uint8_t* txBuffers;
+    uint64_t txBuffersPhys;
+    uint8_t* notifyBuffer;
+    uint64_t notifyBufferPhys;
+    uint64_t pendingNotifyPhys;
+    bool notifyPending;
+    UsbNetBuffer rxState[USBNET_RX_BUFFERS];
+    uint8_t rxTrbBuffer[XHCI_TRANSFER_RING_TRBS];   // which buffer each RX TRB fills
+    bool txTrbIsFrame[XHCI_TRANSFER_RING_TRBS];     // false for a zero-length packet
+    uint8_t readyBuffer[USBNET_RX_BUFFERS];         // completed frames, oldest first
+    uint16_t readyLength[USBNET_RX_BUFFERS];
+    uint32_t readyHead;
+    uint32_t readyCount;
+    uint32_t txNext;
+    uint32_t txInFlight;
+    uint32_t rxErrors;
+    uint32_t txErrors;
+};
+
+UsbNetState g_usbnet = {};
+
+bool get_descriptor_at(XHCIControllerState& state, XHCISlotState& slot, uint8_t type, uint8_t index,
+                       uint16_t languageId, uint16_t length, void* out) {
+    UsbSetupPacket setup = {};
+    setup.requestType = 0x80;
+    setup.request = USB_REQUEST_GET_DESCRIPTOR;
+    setup.value = static_cast<uint16_t>((type << 8) | index);
+    setup.index = languageId;
+    setup.length = length;
+    return xhci_control_transfer(state, slot, setup, out, length);
+}
+
+// Finds a CDC Ethernet function in one configuration: the communication
+// interface (class 2, subclass 6) with its Ethernet functional descriptor and
+// notification endpoint, and the data interface's alternate setting with a
+// bulk IN and a bulk OUT endpoint (the Union descriptor names it).
+bool parse_ecm_configuration(const uint8_t* d, uint16_t total, UsbEcmFunction& out) {
+    out = {};
+    out.configValue = d[5];
+    out.maxSegment = 1514;
+    bool haveControl = false;
+    bool haveUnion = false;
+    bool inControl = false;
+    bool inData = false;
+    uint8_t currentInterface = 0;
+    uint8_t currentAlternate = 0;
+    uint8_t inAddress = 0;
+    uint8_t outAddress = 0;
+    uint16_t inMax = 0;
+    uint16_t outMax = 0;
+    for (uint16_t offset = 0; offset + 2 <= total;) {
+        const uint8_t len = d[offset];
+        const uint8_t type = d[offset + 1];
+        if (len < 2 || offset + len > total) {
+            break;
+        }
+        if (type == USB_DESCRIPTOR_INTERFACE && len >= 9) {
+            if (inData && inAddress && outAddress) {
+                break;   // the previous data alternate setting had both
+            }
+            currentInterface = d[offset + 2];
+            currentAlternate = d[offset + 3];
+            const uint8_t cls = d[offset + 5];
+            const uint8_t sub = d[offset + 6];
+            inControl = cls == USB_CLASS_COMM && sub == USB_CDC_SUBCLASS_ETHERNET && !haveControl;
+            if (inControl) {
+                haveControl = true;
+                out.controlInterface = currentInterface;
+            }
+            inData = haveControl && cls == USB_CLASS_CDC_DATA &&
+                (!haveUnion || currentInterface == out.dataInterface);
+            inAddress = outAddress = 0;
+        } else if (type == USB_DESCRIPTOR_CS_INTERFACE && len >= 3 && inControl) {
+            const uint8_t subtype = d[offset + 2];
+            if (subtype == USB_CDC_UNION_TYPE && len >= 5) {
+                haveUnion = true;
+                out.dataInterface = d[offset + 4];
+            } else if (subtype == USB_CDC_ETHERNET_TYPE && len >= 13) {
+                out.macStringIndex = d[offset + 3];
+                out.maxSegment = static_cast<uint16_t>(d[offset + 8] | (d[offset + 9] << 8));
+            }
+        } else if (type == USB_DESCRIPTOR_ENDPOINT && len >= 7) {
+            const uint8_t address = d[offset + 2];
+            const uint8_t kind = d[offset + 3] & 0x3;
+            const uint16_t maxPacket = static_cast<uint16_t>((d[offset + 4] | (d[offset + 5] << 8)) & 0x7FF);
+            if (inControl && kind == USB_ENDPOINT_TYPE_INTERRUPT && (address & USB_ENDPOINT_IN)) {
+                out.notifyAddress = address;
+                out.notifyMaxPacket = maxPacket;
+                out.notifyInterval = d[offset + 6];
+            } else if (inData && kind == USB_ENDPOINT_TYPE_BULK) {
+                if (address & USB_ENDPOINT_IN) {
+                    inAddress = address;
+                    inMax = maxPacket;
+                } else {
+                    outAddress = address;
+                    outMax = maxPacket;
+                }
+            }
+        }
+        offset = static_cast<uint16_t>(offset + len);
+    }
+    if (!(inData && inAddress && outAddress && inMax && outMax)) {
+        return false;
+    }
+    out.dataInterface = currentInterface;
+    out.dataAlternate = currentAlternate;
+    out.inAddress = inAddress;
+    out.outAddress = outAddress;
+    out.inMaxPacket = inMax;
+    out.outMaxPacket = outMax;
+    return true;
+}
+
+uint8_t hex_digit_value(uint16_t c) {
+    if (c >= '0' && c <= '9') return static_cast<uint8_t>(c - '0');
+    if (c >= 'a' && c <= 'f') return static_cast<uint8_t>(c - 'a' + 10);
+    if (c >= 'A' && c <= 'F') return static_cast<uint8_t>(c - 'A' + 10);
+    return 0xFF;
+}
+
+// iMACAddress is a string of 12 hex digits (UTF-16LE).
+bool read_ecm_mac(XHCIControllerState& state, XHCISlotState& slot, uint8_t stringIndex, uint8_t mac[6]) {
+    if (stringIndex == 0) {
+        return false;
+    }
+    uint8_t languages[4] = {};
+    uint16_t languageId = 0x0409;
+    if (get_descriptor_at(state, slot, USB_DESCRIPTOR_STRING, 0, 0, sizeof(languages), languages) &&
+        languages[0] >= 4) {
+        languageId = static_cast<uint16_t>(languages[2] | (languages[3] << 8));
+    }
+    uint8_t text[2 + 24] = {};
+    if (!get_descriptor_at(state, slot, USB_DESCRIPTOR_STRING, stringIndex, languageId, sizeof(text), text) ||
+        text[0] < sizeof(text)) {
+        return false;
+    }
+    for (int i = 0; i < 6; ++i) {
+        const uint8_t high = hex_digit_value(static_cast<uint16_t>(text[2 + i * 4] | (text[3 + i * 4] << 8)));
+        const uint8_t low = hex_digit_value(static_cast<uint16_t>(text[4 + i * 4] | (text[5 + i * 4] << 8)));
+        if (high > 15 || low > 15) {
+            return false;
+        }
+        mac[i] = static_cast<uint8_t>((high << 4) | low);
+    }
+    return true;
+}
+
+void usbnet_post_rx(XHCIControllerState& state, uint32_t buffer) {
+    UsbNetState& net = g_usbnet;
+    XHCITransferRequestBlock trb = {};
+    trb.parameter = net.rxBuffersPhys + static_cast<uint64_t>(buffer) * USBNET_BUFFER_BYTES;
+    trb.status = USBNET_BUFFER_BYTES;
+    trb.control = (XHCI_TRB_TYPE_NORMAL << XHCI_TRB_TYPE_SHIFT) | XHCI_TRB_ISP | XHCI_TRB_IOC;
+    const uint32_t index = ring_enqueue(net.rxRing, trb);
+    net.rxTrbBuffer[index] = static_cast<uint8_t>(buffer);
+    net.rxState[buffer] = UsbNetBuffer::Posted;
+    asm volatile("" ::: "memory");
+    mmio_write32(state.doorbellBase, net.slotId * 4, net.inDci);
+}
+
+void usbnet_submit_notify(XHCIControllerState& state) {
+    UsbNetState& net = g_usbnet;
+    if (!net.notifyDci || net.notifyPending) {
+        return;
+    }
+    memset(net.notifyBuffer, 0, USBNET_NOTIFY_BYTES);
+    XHCITransferRequestBlock trb = {};
+    trb.parameter = net.notifyBufferPhys;
+    trb.status = USBNET_NOTIFY_BYTES;
+    trb.control = (XHCI_TRB_TYPE_NORMAL << XHCI_TRB_TYPE_SHIFT) | XHCI_TRB_ISP | XHCI_TRB_IOC;
+    net.pendingNotifyPhys = ring_trb_phys(net.notifyRing, ring_enqueue(net.notifyRing, trb));
+    net.notifyPending = true;
+    asm volatile("" ::: "memory");
+    mmio_write32(state.doorbellBase, net.slotId * 4, net.notifyDci);
+}
+
+bool usbnet_error_halts(uint32_t code) {
+    return code != XHCI_COMPLETION_SUCCESS && code != XHCI_COMPLETION_SHORT_PACKET &&
+        code != XHCI_COMPLETION_STOPPED && code != XHCI_COMPLETION_STOPPED_LENGTH_INVALID;
+}
+
+// From drain_events: no commands here (they drain the event ring themselves),
+// only ring bookkeeping and resubmission.
+void usbnet_transfer_event(XHCIControllerState& state, const XHCITransferRequestBlock& event, uint32_t endpointId,
+                           uint32_t code) {
+    UsbNetState& net = g_usbnet;
+    const uint64_t trbPhys = event_trb_pointer(event);
+    if (endpointId == net.inDci) {
+        const uint32_t index = ring_index_of(net.rxRing, trbPhys);
+        if (index == UINT32_MAX) {
+            return;
+        }
+        const uint32_t buffer = net.rxTrbBuffer[index];
+        if (buffer >= USBNET_RX_BUFFERS || net.rxState[buffer] != UsbNetBuffer::Posted) {
+            return;
+        }
+        if (usbnet_error_halts(code)) {
+            net.rxState[buffer] = UsbNetBuffer::Free;
+            if (net.rxErrors++ < 8) {
+                log_str("[usb:net] receive cc=");
+                log_dec(code);
+                log_str("(");
+                log_str(completion_code_name(code));
+                log_str(")\n");
+            }
+            net.rxNeedsRecovery = true;
+            return;
+        }
+        const uint32_t residual = event.status & XHCI_TRANSFER_EVENT_LENGTH_MASK;
+        const uint32_t length = residual < USBNET_BUFFER_BYTES ? USBNET_BUFFER_BYTES - residual : 0;
+        if (length == 0 || net.readyCount >= USBNET_RX_BUFFERS) {
+            usbnet_post_rx(state, buffer);   // a zero-length packet ending a frame
+            return;
+        }
+        const uint32_t slot = (net.readyHead + net.readyCount) % USBNET_RX_BUFFERS;
+        net.readyBuffer[slot] = static_cast<uint8_t>(buffer);
+        net.readyLength[slot] = static_cast<uint16_t>(length);
+        ++net.readyCount;
+        net.rxState[buffer] = UsbNetBuffer::Ready;
+    } else if (endpointId == net.outDci) {
+        const uint32_t index = ring_index_of(net.txRing, trbPhys);
+        if (index == UINT32_MAX) {
+            return;
+        }
+        if (usbnet_error_halts(code)) {
+            if (net.txErrors++ < 8) {
+                log_str("[usb:net] transmit cc=");
+                log_dec(code);
+                log_str("(");
+                log_str(completion_code_name(code));
+                log_str(")\n");
+            }
+            net.txNeedsRecovery = true;
+        }
+        if (net.txTrbIsFrame[index] && net.txInFlight > 0) {
+            --net.txInFlight;
+        }
+    } else if (endpointId == net.notifyDci && net.notifyPending && trbPhys == net.pendingNotifyPhys) {
+        net.notifyPending = false;
+        const uint32_t residual = event.status & XHCI_TRANSFER_EVENT_LENGTH_MASK;
+        if (!usbnet_error_halts(code) && residual <= USBNET_NOTIFY_BYTES - 8 &&
+            net.notifyBuffer[0] == 0xA1 && net.notifyBuffer[1] == USB_CDC_NOTIFY_NETWORK_CONNECTION) {
+            const bool up = (net.notifyBuffer[2] | (net.notifyBuffer[3] << 8)) != 0;
+            if (up != net.linkUp) {
+                net.linkUp = up;
+                log_str(up ? "[usb:net] link up\n" : "[usb:net] link down\n");
+            }
+        }
+        if (usbnet_error_halts(code)) {
+            return;   // a halted notification endpoint: the link stays as it was
+        }
+        usbnet_submit_notify(state);
+    }
+}
+
+// A halted bulk endpoint: Reset Endpoint, then move its dequeue pointer past
+// what was queued (those transfers are lost), as Linux's xhci does.
+void usbnet_recover(XHCIControllerState& state, uint8_t dci, XHCIRing& ring) {
+    const bool reset = command_reset_endpoint(state, g_usbnet.slotId, dci, false) ||
+        command_stop_endpoint(state, g_usbnet.slotId, dci, false);
+    const bool moved = command_set_tr_dequeue(state, g_usbnet.slotId, dci,
+                                              ring_trb_phys(ring, ring.enqueue), ring.cycle);
+    log_str("[usb:net] endpoint ");
+    log_dec(dci);
+    log_str(reset && moved ? " recovered\n" : " could not be recovered\n");
+}
+
+void usbnet_service_recovery() {
+    UsbNetState& net = g_usbnet;
+    XHCIControllerState& state = *net.controller;
+    if (net.rxNeedsRecovery) {
+        net.rxNeedsRecovery = false;
+        usbnet_recover(state, net.inDci, net.rxRing);
+        for (uint32_t i = 0; i < USBNET_RX_BUFFERS; ++i) {
+            if (net.rxState[i] != UsbNetBuffer::Ready) {
+                usbnet_post_rx(state, i);
+            }
+        }
+    }
+    if (net.txNeedsRecovery) {
+        net.txNeedsRecovery = false;
+        usbnet_recover(state, net.outDci, net.txRing);
+        net.txInFlight = 0;
+    }
+}
+
+bool usbnet_events_waiting(const XHCIControllerState& state) {
+    const XHCITransferRequestBlock& event = state.eventRing[state.eventDequeue];
+    return ((event.control & XHCI_TRB_CYCLE) != 0) == state.eventCycle;
+}
+
+void log_mac(const uint8_t mac[6]) {
+    static constexpr char digits[] = "0123456789abcdef";
+    char text[18];
+    for (int i = 0; i < 6; ++i) {
+        text[i * 3] = digits[mac[i] >> 4];
+        text[i * 3 + 1] = digits[mac[i] & 0xF];
+        text[i * 3 + 2] = i == 5 ? '\0' : ':';
+    }
+    log_str(text);
+}
+
+// Brings up a CDC-ECM function found in one of the device's configurations.
+// 1: it is the adapter now; 0: no ECM function (the caller carries on);
+// -1: there was one but it failed.
+int setup_usb_ethernet(XHCIControllerState& state, XHCISlotState& slot, uint8_t configCount,
+                       uint16_t vendor, uint16_t product) {
+    if (g_usbnet.ready || configCount == 0) {
+        return 0;
+    }
+    static uint8_t config[XHCI_MAX_CONFIG_DESCRIPTOR_BYTES];
+    UsbEcmFunction ecm = {};
+    bool found = false;
+    for (uint8_t index = 0; index < configCount && index < 8 && !found; ++index) {
+        uint8_t header[9] = {};
+        if (!get_descriptor_at(state, slot, USB_DESCRIPTOR_CONFIGURATION, index, 0, sizeof(header), header)) {
+            continue;
+        }
+        uint16_t total = static_cast<uint16_t>(header[2] | (header[3] << 8));
+        if (total < sizeof(header)) {
+            continue;
+        }
+        if (total > sizeof(config)) {
+            total = sizeof(config);
+        }
+        memset(config, 0, sizeof(config));
+        if (get_descriptor_at(state, slot, USB_DESCRIPTOR_CONFIGURATION, index, 0, total, config)) {
+            found = parse_ecm_configuration(config, total, ecm);
+        }
+    }
+    if (!found) {
+        return 0;
+    }
+
+    UsbNetState& net = g_usbnet;
+    net = {};
+    net.controller = &state;
+    net.slotId = slot.slotId;
+    net.vendor = vendor;
+    net.product = product;
+    net.controlInterface = ecm.controlInterface;
+    net.inDci = endpoint_dci(ecm.inAddress);
+    net.outDci = endpoint_dci(ecm.outAddress);
+    net.notifyDci = ecm.notifyAddress ? endpoint_dci(ecm.notifyAddress) : 0;
+    net.outMaxPacket = ecm.outMaxPacket;
+
+    log_str("[usb:net] cdc-ecm slot=");
+    log_dec(slot.slotId);
+    log_str(" config=");
+    log_dec(ecm.configValue);
+    log_str(" data-if=");
+    log_dec(ecm.dataInterface);
+    log_str(" alt=");
+    log_dec(ecm.dataAlternate);
+    log_str(" in=");
+    log_hex(ecm.inAddress);
+    log_str("/");
+    log_dec(ecm.inMaxPacket);
+    log_str(" out=");
+    log_hex(ecm.outAddress);
+    log_str("/");
+    log_dec(ecm.outMaxPacket);
+    log_str("\n");
+
+    if (!set_configuration(state, slot, ecm.configValue)) {
+        log_str("[usb:net] set configuration failed\n");
+        return -1;
+    }
+    slot.configured = true;
+
+    net.rxBuffers = reinterpret_cast<uint8_t*>(
+        alloc_dma_pages(pages_for_bytes(USBNET_RX_BUFFERS * USBNET_BUFFER_BYTES), net.rxBuffersPhys));
+    net.txBuffers = reinterpret_cast<uint8_t*>(
+        alloc_dma_pages(pages_for_bytes(USBNET_TX_BUFFERS * USBNET_BUFFER_BYTES), net.txBuffersPhys));
+    net.notifyBuffer = reinterpret_cast<uint8_t*>(alloc_dma_pages(1, net.notifyBufferPhys));
+    if (!net.rxBuffers || !net.txBuffers || !net.notifyBuffer || !ring_allocate(net.rxRing) ||
+        !ring_allocate(net.txRing) || (net.notifyDci && !ring_allocate(net.notifyRing))) {
+        log_str("[usb:net] allocation failed\n");
+        return -1;
+    }
+
+    // One Configure Endpoint for the bulk pair (and the notification endpoint).
+    memset(slot.inputContext, 0, slot.inputContextPages * PMM::PAGE_SIZE);
+    auto* control = input_control_context(state, slot);
+    control[1] = (1U << 0) | (1U << net.inDci) | (1U << net.outDci) | (net.notifyDci ? (1U << net.notifyDci) : 0);
+    uint8_t maxDci = net.inDci > net.outDci ? net.inDci : net.outDci;
+    if (net.notifyDci > maxDci) {
+        maxDci = net.notifyDci;
+    }
+    populate_slot_context(state, slot, maxDci);
+    auto bulk = [&](uint8_t dci, uint8_t xhciType, uint16_t maxPacket, const XHCIRing& ring) {
+        auto* endpoint = input_endpoint_context(state, slot, dci);
+        memset(endpoint, 0, state.contextSize);
+        endpoint[1] = (3U << 1) | (static_cast<uint32_t>(xhciType) << 3) | (static_cast<uint32_t>(maxPacket) << 16);
+        endpoint[2] = static_cast<uint32_t>(ring.phys | 1U);
+        endpoint[3] = static_cast<uint32_t>(ring.phys >> 32);
+        endpoint[4] = 1024;   // average TRB length
+    };
+    bulk(net.inDci, XHCI_ENDPOINT_TYPE_BULK_IN, ecm.inMaxPacket, net.rxRing);
+    bulk(net.outDci, XHCI_ENDPOINT_TYPE_BULK_OUT, ecm.outMaxPacket, net.txRing);
+    if (net.notifyDci) {
+        auto* endpoint = input_endpoint_context(state, slot, net.notifyDci);
+        memset(endpoint, 0, state.contextSize);
+        const uint16_t maxPacket = ecm.notifyMaxPacket ? ecm.notifyMaxPacket : 16;
+        endpoint[0] = static_cast<uint32_t>(xhci_interrupt_interval(slot.speedId,
+                                                                    ecm.notifyInterval ? ecm.notifyInterval : 32)) << 16;
+        endpoint[1] = (3U << 1) | (static_cast<uint32_t>(XHCI_ENDPOINT_TYPE_INTERRUPT_IN) << 3) |
+            (static_cast<uint32_t>(maxPacket) << 16);
+        endpoint[2] = static_cast<uint32_t>(net.notifyRing.phys | 1U);
+        endpoint[3] = static_cast<uint32_t>(net.notifyRing.phys >> 32);
+        endpoint[4] = maxPacket;
+    }
+    if (!command_configure_endpoint(state, slot.slotId, slot.inputContextPhys, false)) {
+        log_str("[usb:net] configure endpoint failed\n");
+        return -1;
+    }
+
+    // The data interface's alternate setting with the endpoints (0 has none).
+    UsbSetupPacket setup = {};
+    setup.requestType = 0x01;
+    setup.request = USB_REQUEST_SET_INTERFACE;
+    setup.value = ecm.dataAlternate;
+    setup.index = ecm.dataInterface;
+    if (!xhci_control_transfer(state, slot, setup, nullptr, 0)) {
+        log_str("[usb:net] set interface failed\n");
+        return -1;
+    }
+
+    if (!read_ecm_mac(state, slot, ecm.macStringIndex, net.mac)) {
+        // A locally administered address from the device's ids.
+        net.mac[0] = 0x02;
+        net.mac[1] = 0x55;
+        net.mac[2] = static_cast<uint8_t>(vendor >> 8);
+        net.mac[3] = static_cast<uint8_t>(vendor);
+        net.mac[4] = static_cast<uint8_t>(product >> 8);
+        net.mac[5] = static_cast<uint8_t>(product);
+        log_str("[usb:net] no MAC address string, using a made-up one\n");
+    }
+
+    setup = {};
+    setup.requestType = 0x21;
+    setup.request = USB_CDC_SET_ETHERNET_PACKET_FILTER;
+    setup.value = USB_CDC_PACKET_TYPE_DIRECTED | USB_CDC_PACKET_TYPE_BROADCAST | USB_CDC_PACKET_TYPE_ALL_MULTICAST;
+    setup.index = ecm.controlInterface;
+    if (!xhci_control_transfer(state, slot, setup, nullptr, 0)) {
+        log_str("[usb:net] set packet filter failed (ignored)\n");
+    }
+
+    // Without a notification endpoint nothing reports the cable: assume one.
+    net.linkUp = net.notifyDci == 0;
+    net.ready = true;
+    for (uint32_t i = 0; i < USBNET_RX_BUFFERS; ++i) {
+        usbnet_post_rx(state, i);
+    }
+    usbnet_submit_notify(state);
+    slot.usable = true;
+
+    log_str("[usb:net] cdc-ecm ready vid=");
+    log_hex(vendor);
+    log_str(" pid=");
+    log_hex(product);
+    log_str(" MAC ");
+    log_mac(net.mac);
+    log_str(" max segment ");
+    log_dec(ecm.maxSegment);
+    log_str("\n");
+    return 1;
+}
+
+bool usbnet_owns_slot(const XHCIControllerState& state, uint8_t slotId) {
+    return g_usbnet.ready && g_usbnet.controller == &state && g_usbnet.slotId == slotId;
+}
+
 bool enumerate_device(XHCIControllerState& state, const XHCIEnumerationTarget& target) {
     const uint8_t portId = target.rootPortId ? target.rootPortId : target.portId;
     const uint8_t speedId = target.speedId;
@@ -2504,6 +3113,9 @@ bool enumerate_device(XHCIControllerState& state, const XHCIEnumerationTarget& t
     }
     log_enumeration_stage(state, portId, slotId, "device-descriptor");
     const uint8_t deviceClass = descriptor[4];
+    const uint16_t vendorId = static_cast<uint16_t>(descriptor[8] | (descriptor[9] << 8));
+    const uint16_t productId = static_cast<uint16_t>(descriptor[10] | (descriptor[11] << 8));
+    const uint8_t configCount = descriptor[17];
 
     log_str("[usb:xhci] device slot=");
     log_dec(slotId);
@@ -2654,6 +3266,21 @@ bool enumerate_device(XHCIControllerState& state, const XHCIEnumerationTarget& t
         }
 
         offset += len;
+    }
+
+    // A device with no keyboard, mouse or hub may be a USB Ethernet adapter,
+    // in any of its configurations (QEMU's usb-net and RTL8153s keep CDC-ECM
+    // in the second).
+    if (!foundKeyboardEndpoint && !foundMouseEndpoint && !deviceIsHub && reportKeyboardCandidateCount == 0) {
+        const int ethernet = setup_usb_ethernet(state, slot, configCount, vendorId, productId);
+        if (ethernet != 0) {
+            if (ethernet < 0) {
+                log_enumeration_failure(state, portId, slotId, "usb-ethernet");
+                return false;
+            }
+            log_enumeration_stage(state, portId, slotId, "usb-ethernet");
+            return true;
+        }
     }
 
     if (!set_configuration(state, slot, configValue)) {
@@ -3425,3 +4052,95 @@ void XHCIController::handleInterrupt() {
         handle_controller_interrupt(g_controllers[i]);
     }
 }
+
+// USB Ethernet for src/drivers/net/usb_net.cpp (under the big kernel lock, as
+// the rest of this driver; never called from inside drain_events).
+namespace usbnet {
+
+namespace {
+void poll_events() {
+    XHCIControllerState& state = *g_usbnet.controller;
+    if (usbnet_events_waiting(state)) {
+        handle_controller_interrupt(state);
+    }
+}
+}
+
+bool present() {
+    return g_usbnet.ready;
+}
+
+bool linkUp() {
+    return g_usbnet.ready && g_usbnet.linkUp;
+}
+
+void macAddress(uint8_t mac[6]) {
+    memcpy(mac, g_usbnet.mac, 6);
+}
+
+uint16_t vendorId() {
+    return g_usbnet.vendor;
+}
+
+uint16_t productId() {
+    return g_usbnet.product;
+}
+
+bool send(const void* data, size_t length) {
+    UsbNetState& net = g_usbnet;
+    if (!net.ready || !data || length == 0 || length > USBNET_BUFFER_BYTES) {
+        return false;
+    }
+    usbnet_service_recovery();
+    if (net.txInFlight >= USBNET_TX_BUFFERS) {
+        poll_events();
+        if (net.txInFlight >= USBNET_TX_BUFFERS) {
+            return false;
+        }
+    }
+    // Transfers complete in order, so the oldest buffer is free again.
+    const uint32_t buffer = net.txNext;
+    const uint64_t phys = net.txBuffersPhys + static_cast<uint64_t>(buffer) * USBNET_BUFFER_BYTES;
+    memcpy(net.txBuffers + static_cast<size_t>(buffer) * USBNET_BUFFER_BYTES, data, length);
+
+    XHCITransferRequestBlock trb = {};
+    trb.parameter = phys;
+    trb.status = static_cast<uint32_t>(length);
+    trb.control = (XHCI_TRB_TYPE_NORMAL << XHCI_TRB_TYPE_SHIFT) | XHCI_TRB_IOC;
+    net.txTrbIsFrame[ring_enqueue(net.txRing, trb)] = true;
+    if (length % net.outMaxPacket == 0) {
+        // A frame that fills its last packet ends with a zero-length one.
+        trb.status = 0;
+        trb.control = XHCI_TRB_TYPE_NORMAL << XHCI_TRB_TYPE_SHIFT;
+        net.txTrbIsFrame[ring_enqueue(net.txRing, trb)] = false;
+    }
+    ++net.txInFlight;
+    net.txNext = (buffer + 1) % USBNET_TX_BUFFERS;
+    asm volatile("" ::: "memory");
+    mmio_write32(net.controller->doorbellBase, net.slotId * 4, net.outDci);
+    return true;
+}
+
+int receive(void* buffer, size_t maxLength) {
+    UsbNetState& net = g_usbnet;
+    if (!net.ready || !buffer || maxLength == 0) {
+        return -1;
+    }
+    usbnet_service_recovery();
+    if (net.readyCount == 0) {
+        poll_events();
+        if (net.readyCount == 0) {
+            return -1;
+        }
+    }
+    const uint32_t rxBuffer = net.readyBuffer[net.readyHead];
+    const size_t length = net.readyLength[net.readyHead];
+    net.readyHead = (net.readyHead + 1) % USBNET_RX_BUFFERS;
+    --net.readyCount;
+    const size_t copied = length < maxLength ? length : maxLength;
+    memcpy(buffer, net.rxBuffers + static_cast<size_t>(rxBuffer) * USBNET_BUFFER_BYTES, copied);
+    usbnet_post_rx(*net.controller, rxBuffer);
+    return static_cast<int>(copied);
+}
+
+}  // namespace usbnet

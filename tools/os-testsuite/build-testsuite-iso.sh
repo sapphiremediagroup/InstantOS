@@ -24,7 +24,7 @@ mkdir -p "$OUT_DIR"
 # a full cmake dependency rescan on the /mnt/c 9p mount is slow).
 if [ "${SKIP_CMAKE:-0}" != "1" ]; then
   cmake --build "$BUILD_DIR" --target INSTANTOS.EFI BOOTX64.EFI mkInitrd_proj ld-instantos \
-        input-manager storage-manager process-manager network-manager font-manager session-manager
+        input-manager storage-manager process-manager network-manager font-manager session-manager         idrv_modules
 fi
 
 compile_freestanding() { # <src> <out>
@@ -37,8 +37,12 @@ compile_freestanding() { # <src> <out>
     -pie -e _start --dynamic-linker /lib/ld-instantos.so -o "$out" "$out.o"
 }
 # RUNNER_SRC swaps in another /bin/login test program (tools/run-net-suite.sh).
-compile_freestanding "${RUNNER_SRC:-$SRC_DIR/runner.c}" "$OUT_DIR/runner"
-compile_freestanding "$SRC_DIR/helper.c" "$OUT_DIR/ostest-helper"
+# RUNNER_BIN/HELPER_BIN take programs already built elsewhere instead (P7.3: by
+# the stage3 gcc in-OS, tools/gcc-selfhost/run-world-suite.sh).
+if [ -n "${RUNNER_BIN:-}" ]; then cp "$RUNNER_BIN" "$OUT_DIR/runner"
+else compile_freestanding "${RUNNER_SRC:-$SRC_DIR/runner.c}" "$OUT_DIR/runner"; fi
+if [ -n "${HELPER_BIN:-}" ]; then cp "$HELPER_BIN" "$OUT_DIR/ostest-helper"
+else compile_freestanding "$SRC_DIR/helper.c" "$OUT_DIR/ostest-helper"; fi
 # PROBE=1 swaps in a tiny thread_create diagnostic as /bin/login.
 if [ "${PROBE:-0}" = "1" ]; then compile_freestanding "$SRC_DIR/threadprobe.c" "$OUT_DIR/runner"; echo "PROBE: using threadprobe as /bin/login"; fi
 # KILLRACE=1 swaps in the kill-storm scheduler-race reproducer as /bin/login.
@@ -70,6 +74,14 @@ ENTRIES=(
   lib/libinstant.so:"$LIBINSTANT_SO"
 )
 [ -f "$TTF" ] && ENTRIES+=("bin/JetBrainsMono-Regular.ttf:$TTF")
+# Driver modules (PCnet is one now): the kernel loads /lib/drivers/*.idrv.
+for idrv in "$BUILD_DIR"/drivers/*.idrv; do
+  [ -f "$idrv" ] && ENTRIES+=("lib/drivers/$(basename "$idrv"):$idrv")
+done
+# Test modules (runner.c's test_modules loads them at run time).
+for idrv in "$BUILD_DIR"/drivers-test/*.idrv; do
+  [ -f "$idrv" ] && ENTRIES+=("lib/idrv-test/$(basename "$idrv"):$idrv")
+done
 # EXTRA_INITRD: more space-separated initrd/path:host/path entries.
 for entry in ${EXTRA_INITRD:-}; do ENTRIES+=("$entry"); done
 
@@ -96,6 +108,11 @@ if [ "${SKIP_DISK:-0}" != "1" ] || [ ! -f "$DISK" ]; then
   rm -f "$DISK"; truncate -s 64M "$DISK"
   printf "label: dos\nstart=2048, type=83\n" | sfdisk "$DISK" >/dev/null 2>&1
   SEED="$(mktemp -d)"; printf 'InstantOS ext4 in-OS test seed\n' > "$SEED/readme.txt"
+  # IDRV_ON_DISK=1: the test modules in the disk's /drivers, which the kernel
+  # reads at boot before /lib/drivers (runner.c's test_modules checks either way).
+  if [ "${IDRV_ON_DISK:-0}" = "1" ]; then
+    mkdir -p "$SEED/drivers"; cp "$BUILD_DIR"/drivers-test/*.idrv "$SEED/drivers/"
+  fi
   mke2fs -q -F -b 4096 -O "has_journal,extent,filetype,sparse_super,^metadata_csum,^64bit,^uninit_bg,^dir_index" \
     -E offset=1048576,lazy_itable_init=0 -d "$SEED" "$DISK" 15000
 fi

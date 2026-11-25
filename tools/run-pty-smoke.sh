@@ -90,6 +90,17 @@ xorriso -as mkisofs \
 
 rm -f "$LOG"
 set +e
+if [ "${QEMU_WIN:-0}" = 1 ]; then
+  # Windows' QEMU with WHPX (tools/lib/qemu-win.sh), stopped once the launcher is done.
+  . "$ROOT/tools/lib/qemu-win.sh"
+  : > "$LOG"
+  qemu_win_start "$OUT_DIR" -drive "file=$(winpath "$ISO"),media=cdrom" -vga std -m 1G \
+    -smp "${QEMU_SMP:-2}" -display "${QEMU_DISPLAY_WIN:-none}" -monitor none -serial "file:$(winpath "$LOG")" -no-shutdown -no-reboot
+  qemu_win_wait "$LOG" "${QEMU_TIMEOUT%s}" 'PTYTEST\] done'
+  sleep 1
+  qemu_win_stop "$OUT_DIR"
+  status=0
+else
 timeout "$QEMU_TIMEOUT" "$QEMU" \
   -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
   -drive "if=pflash,format=raw,file=$OVMF_VARS" \
@@ -103,6 +114,7 @@ timeout "$QEMU_TIMEOUT" "$QEMU" \
   -no-reboot \
   ${QEMU_EXTRA_ARGS:-}
 status=$?
+fi
 set -e
 
 if [ "$status" -ne 0 ] && [ "$status" -ne 124 ]; then

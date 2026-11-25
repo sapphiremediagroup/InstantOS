@@ -4,7 +4,10 @@
 # launcher-binutils.c into /work). Takes the tree tools/binutils-port/
 # build-binutils-cross.sh extracted and patched, and leaves out what the
 # in-OS configure disables (gdb, sim, gold, gprofng, libctf's users) and the
-# testsuites, so the initrd stays small.
+# big testsuites (gas 138 MB, ld 43 MB), so the initrd stays small. libiberty's,
+# libsframe's and binutils' stay: libiberty's configure creates
+# testsuite/Makefile, libsframe's Makefile names its testsuite's local.mk files,
+# and binutils' `all` builds testsuite/gentestdlls (3 MB).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -21,7 +24,9 @@ tar -C "$PORT_DIR" -czf "$OUT.tmp" \
   --exclude="$VER/gdb" --exclude="$VER/gdbserver" --exclude="$VER/gdbsupport" \
   --exclude="$VER/gnulib" --exclude="$VER/sim" --exclude="$VER/gold" \
   --exclude="$VER/gprofng" --exclude="$VER/readline" --exclude="$VER/libdecnumber" \
-  --exclude="$VER/libbacktrace" --exclude="*/testsuite" \
+  --exclude="$VER/libbacktrace" \
+  --exclude="$VER/gas/testsuite" --exclude="$VER/ld/testsuite" \
+  --exclude="$VER/libctf/testsuite" \
   "$VER"
 mv "$OUT.tmp" "$OUT"
 ls -la "$OUT"

@@ -10,15 +10,15 @@
 # Runtime .so's for the loader are shipped separately in the initrd's /lib/mlibc.
 set -euo pipefail
 
-HOSTED=/home/sky/gcc-port/gcc-hosted-install
-CROSS=/home/sky/gcc-port/gcc-install
-SYSROOT=/home/sky/gcc-port/instantos-sysroot
+HOSTED=${GCC_PORT_DIR:-$HOME/gcc-port}/gcc-hosted-install
+CROSS=${GCC_PORT_DIR:-$HOME/gcc-port}/gcc-install
+SYSROOT=${GCC_PORT_DIR:-$HOME/gcc-port}/instantos-sysroot
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BINUTILS_HOSTED="$REPO/build/binutils-hosted-root"
 MLIBC_GCC="$REPO/build/mlibc-root-gcc"
 TRIPLE=x86_64-unknown-instantos
 GVER=13.3.0
-ROOT="${GCCHOST_ROOT:-/home/sky/gcc-port/gcchost-root}"
+ROOT="${GCCHOST_ROOT:-${GCC_PORT_DIR:-$HOME/gcc-port}/gcchost-root}"
 
 rm -rf "$ROOT"
 mkdir -p "$ROOT/usr/bin" "$ROOT/usr/lib" "$ROOT/usr/include" \

@@ -108,38 +108,6 @@ void writeDec(uint64_t value) {
     Cereal::get().write(&buf[pos]);
 }
 
-// Busy-wait. Uses the calibrated TSC when the TSC-deadline timer is in use,
-// otherwise a PIT channel 2 one-shot (channel 0 drives the scheduler tick).
-void delayUs(uint64_t us) {
-    if (cycles_per_us != 0) {
-        const uint64_t start = rdtsc();
-        while (rdtsc() - start < us * cycles_per_us) {
-            asm volatile("pause");
-        }
-        return;
-    }
-
-    constexpr uint64_t kPitHz = 1193182;
-    constexpr uint64_t kMaxChunkUs = 50000;   // 16-bit count limit is ~54.9 ms
-    const uint8_t savedGate = inb(0x61);
-    while (us > 0) {
-        const uint64_t chunk = us > kMaxChunkUs ? kMaxChunkUs : us;
-        uint64_t count = (chunk * kPitHz) / 1000000ULL;
-        if (count == 0) count = 1;
-
-        // Gate on, speaker off; channel 2, lobyte/hibyte, mode 0 (one-shot).
-        outb(0x61, static_cast<uint8_t>((inb(0x61) & ~0x02) | 0x01));
-        outb(0x43, 0xB0);
-        outb(0x42, static_cast<uint8_t>(count & 0xFF));
-        outb(0x42, static_cast<uint8_t>((count >> 8) & 0xFF));
-        while ((inb(0x61) & 0x20) == 0) {   // OUT2 goes high at terminal count
-            asm volatile("pause");
-        }
-        us -= chunk;
-    }
-    outb(0x61, savedGate);
-}
-
 void buildTemporaryPageTables() {
     auto table = [](uint64_t index) {
         return reinterpret_cast<uint64_t*>(VMM::PhysToVirt(s_lowBase + index * PMM::PAGE_SIZE));
@@ -169,7 +137,7 @@ uint32_t measureLapicTicksPerTick() {
     lapic.write(LAPIC_TIMER, kLapicTimerMasked | VECTOR_AP_TIMER);
     lapic.setTimerDivide(kLapicDivideBy16);
     lapic.write(LAPIC_TIMER_INITCNT, 0xFFFFFFFFU);
-    delayUs(10000);
+    SMP::delayUs(10000);
     const uint32_t remaining = lapic.read(LAPIC_TIMER_CURCNT);
     lapic.write(LAPIC_TIMER_INITCNT, 0);
 
@@ -202,7 +170,7 @@ bool waitForAp(uint64_t timeoutUs) {
         if (__atomic_load_n(&s_apReady, __ATOMIC_ACQUIRE)) {
             return true;
         }
-        delayUs(100);
+        SMP::delayUs(100);
     }
     return __atomic_load_n(&s_apReady, __ATOMIC_ACQUIRE) != 0;
 }
@@ -212,7 +180,7 @@ bool waitForAp(uint64_t timeoutUs) {
 bool startAp(uint8_t lapicId, uint8_t vector) {
     LAPIC& lapic = LAPIC::get();
     lapic.sendInitIPI(lapicId);
-    delayUs(10000);
+    SMP::delayUs(10000);
     lapic.sendStartupIPI(lapicId, vector);
     if (waitForAp(200)) {
         return true;
@@ -282,6 +250,38 @@ extern "C" void smpApMain(PerCPUData* cpu) {
 }
 
 namespace SMP {
+
+// Busy-wait. Uses the calibrated TSC when the TSC-deadline timer is in use,
+// otherwise a PIT channel 2 one-shot (channel 0 drives the scheduler tick).
+void delayUs(uint64_t us) {
+    if (cycles_per_us != 0) {
+        const uint64_t start = rdtsc();
+        while (rdtsc() - start < us * cycles_per_us) {
+            asm volatile("pause");
+        }
+        return;
+    }
+
+    constexpr uint64_t kPitHz = 1193182;
+    constexpr uint64_t kMaxChunkUs = 50000;   // 16-bit count limit is ~54.9 ms
+    const uint8_t savedGate = inb(0x61);
+    while (us > 0) {
+        const uint64_t chunk = us > kMaxChunkUs ? kMaxChunkUs : us;
+        uint64_t count = (chunk * kPitHz) / 1000000ULL;
+        if (count == 0) count = 1;
+
+        // Gate on, speaker off; channel 2, lobyte/hibyte, mode 0 (one-shot).
+        outb(0x61, static_cast<uint8_t>((inb(0x61) & ~0x02) | 0x01));
+        outb(0x43, 0xB0);
+        outb(0x42, static_cast<uint8_t>(count & 0xFF));
+        outb(0x42, static_cast<uint8_t>((count >> 8) & 0xFF));
+        while ((inb(0x61) & 0x20) == 0) {   // OUT2 goes high at terminal count
+            asm volatile("pause");
+        }
+        us -= chunk;
+    }
+    outb(0x61, savedGate);
+}
 
 void reserveLowMemory() {
     s_lowBase = PMM::AllocFramesBelow(kLowPages, kLowLimit);

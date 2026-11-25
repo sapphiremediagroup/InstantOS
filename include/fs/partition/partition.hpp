@@ -63,7 +63,9 @@ bool gptIsPresent(BlockDevice* device);
 
 // The GPT partitions InstantOS mounts: type 9566fa50-7665-4f44-962e-113fd99cdc87
 // ("InstantOS data"), or a Windows "basic data" partition holding a FAT32
-// volume labelled INSTANTOS (Windows can make that one and keeps showing it).
+// volume labelled INSTANTOS (Windows can make that one and keeps showing it)
+// or an ext4 volume labelled InstantOS (an installed system whose partition
+// was retyped for Windows to show it).
 // A GPT disk is a real computer's disk, shared with other systems, so nothing
 // else on it is ever mounted.
 extern const uint8_t kGptInstantOSDataGuid[16];
@@ -72,9 +74,25 @@ enum class GptSearch {
     NoGpt,          // no valid GPT: an MBR or unpartitioned (test) image
     NotInstantOS,   // a GPT disk without an InstantOS data partition: leave it alone
     Found,
+    NotFound,       // gptFindPartitionByGuid: no partition with that GUID on this disk
 };
 
 // Looks for the first InstantOS partition (above) on a GPT disk and fills
 // *startByte / *lengthByte (bytes; 512-byte sectors). The caller probes it to
 // pick the filesystem driver.
 GptSearch gptFindInstantOSPartition(BlockDevice* device, uint64_t* startByte, uint64_t* lengthByte);
+
+// Whether a 128-byte GPT entry is an InstantOS partition by the rule above.
+bool gptEntryIsInstantOS(BlockDevice* device, const uint8_t* entry);
+
+// "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" (any case) as GPT stores a GUID (the
+// first three fields little-endian). False when it is not one.
+bool gptParseGuid(const char* text, uint8_t out[16]);
+
+// The partition whose unique GUID is `guid` (boot config root=), if it is an
+// InstantOS partition as gptFindInstantOSPartition defines one. Found fills
+// *startByte / *lengthByte; NotInstantOS when the GUID is there but the
+// partition is someone else's (it is then left alone); NotFound when no
+// partition here has it.
+GptSearch gptFindPartitionByGuid(BlockDevice* device, const uint8_t guid[16], uint64_t* startByte,
+                                 uint64_t* lengthByte);

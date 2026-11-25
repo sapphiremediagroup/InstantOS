@@ -59,11 +59,17 @@ static PageTable* alloc_zeroed_table() {
     // in the active address space. Fall back to a normal frame if no high frame
     // is available (small-memory configs / degraded operation).
     uint64_t frame = PMM::AllocFramesAbove(1, PMM::KERNEL_HIGH_ALLOC_MIN);
-    if (frame == 0) frame = PMM::AllocFrame();
+    if (frame == 0) {
+        frame = PMM::AllocFrame();
+        if (frame != 0 && frame < PMM::KERNEL_HIGH_ALLOC_MIN) {
+            __atomic_fetch_add(&VMM::lowPageTables, 1, __ATOMIC_RELAXED);
+        }
+    }
     if (frame == 0) return nullptr;
     PageTable* table = reinterpret_cast<PageTable*>(frame);
     if ((reinterpret_cast<uint64_t>(table) & (PAGE_SIZE - 1)) != 0) return nullptr;
     memzero(table, sizeof(PageTable));
+    __atomic_fetch_add(&VMM::liveTables, 1, __ATOMIC_RELAXED);
     return table;
 }
 
@@ -105,6 +111,7 @@ static void free_table(PageTable* table) {
         kfree(table);
     } else {
         PMM::FreeFrame(reinterpret_cast<uint64_t>(table));
+        __atomic_fetch_sub(&VMM::liveTables, 1, __ATOMIC_RELAXED);
     }
 }
 
@@ -350,16 +357,56 @@ void VMM::InvalidatePage(uint64_t addr) {
     asm volatile("invlpg (%0)" : : "r"(addr) : "memory");
 }
 
-void VMM::Initialize() {
-    s_pml4 = AllocTable();
-    if (!s_pml4) return;
+namespace {
+// The firmware's page tables live in EfiBootServicesData, which iboot hands the
+// PMM as free memory. Copying only the PML4 left every address space running
+// on the firmware's PDPT/PD/PT frames, so once memory filled up the PMM handed
+// one out and its new owner's data became the identity map (P7.1 under 5 GiB:
+// the heap's PT turned into file bytes during binutils' configure, and fork
+// then faulted on it). So the whole tree is copied into PMM frames, and the
+// firmware's table frames are reserved until the copy is done (for good: a
+// few dozen pages). OVMF write-protects its page-table pages (whole 2 MiB
+// entries); those frames are ordinary free RAM now, so the copy is writable.
+void reserveFirmwareTables(const PageTable* table, int level) {
+    PMM::ReserveRange(reinterpret_cast<uint64_t>(table), PAGE_SIZE);
+    if (level == 1) return;
+    for (int i = 0; i < 512; i++) {
+        const uint64_t e = table->entries[i];
+        if (!(e & Present) || (e & LargePage)) continue;
+        reserveFirmwareTables(reinterpret_cast<const PageTable*>(e & ADDR_MASK), level - 1);
+    }
+}
 
+PageTable* copyFirmwareTable(const PageTable* src, int level) {
+    PageTable* dst = alloc_zeroed_table();
+    if (!dst) return nullptr;
+    for (int i = 0; i < 512; i++) {
+        const uint64_t e = src->entries[i];
+        if (!(e & Present)) {
+            dst->entries[i] = e;
+            continue;
+        }
+        if (level == 1 || (e & LargePage)) {
+            dst->entries[i] = e | ReadWrite;
+            continue;
+        }
+        PageTable* child = copyFirmwareTable(
+            reinterpret_cast<const PageTable*>(e & ADDR_MASK), level - 1);
+        if (!child) return nullptr;
+        dst->entries[i] = reinterpret_cast<uint64_t>(child) | (e & ~ADDR_MASK) | ReadWrite;
+    }
+    return dst;
+}
+} // namespace
+
+void VMM::Initialize() {
     uint64_t cr3;
     asm volatile("mov %%cr3, %0" : "=r"(cr3));
     auto* oldPml4 = reinterpret_cast<PageTable*>(cr3 & ADDR_MASK);
 
-    for (int i = 0; i < 512; i++)
-        s_pml4->entries[i] = oldPml4->entries[i];
+    reserveFirmwareTables(oldPml4, 4);
+    s_pml4 = copyFirmwareTable(oldPml4, 4);
+    if (!s_pml4) return;
 
     asm volatile("mov %0, %%cr3" : : "r"(reinterpret_cast<uint64_t>(s_pml4)) : "memory");
 
@@ -459,28 +506,14 @@ void VMM::UnmapPage(uint64_t virtualAddr) {
     UnmapPageFrom(current_pml4(), virtualAddr);
 }
 
+// The same walk as VirtualToPhysicalIn, on the current tables. It used to
+// take every entry for a table pointer, so a 1 GiB or 2 MiB page (the
+// firmware's map of high memory) sent it reading at that page's frame: the
+// first BAR above 4 GiB handed to PCI::mapMemoryBar (virtio-net's, at 1 TiB
+// under QEMU's q35) faulted the kernel there.
 uint64_t VMM::VirtualToPhysical(uint64_t virtualAddr) {
     if (!s_initialized) return 0;
-
-    PageTable* pml4 = current_pml4();
-    if (!pml4) return 0;
-
-    uint64_t pml4i = PML4Index(virtualAddr);
-    if (!(pml4->entries[pml4i] & Present)) return 0;
-    auto* pdpt = reinterpret_cast<PageTable*>(pml4->entries[pml4i] & ADDR_MASK);
-
-    uint64_t pdpti = PDPTIndex(virtualAddr);
-    if (!(pdpt->entries[pdpti] & Present)) return 0;
-    auto* pd = reinterpret_cast<PageTable*>(pdpt->entries[pdpti] & ADDR_MASK);
-
-    uint64_t pdi = PDIndex(virtualAddr);
-    if (!(pd->entries[pdi] & Present)) return 0;
-    auto* pt = reinterpret_cast<PageTable*>(pd->entries[pdi] & ADDR_MASK);
-
-    uint64_t pti = PTIndex(virtualAddr);
-    if (!(pt->entries[pti] & Present)) return 0;
-
-    return (pt->entries[pti] & ADDR_MASK) | (virtualAddr & 0xFFF);
+    return VirtualToPhysicalIn(current_pml4(), virtualAddr);
 }
 
 bool VMM::IsMapped(uint64_t virtualAddr) {
@@ -583,11 +616,15 @@ void VMM::MapPageInto(PageTable* pml4, uint64_t virtualAddr, uint64_t physAddr, 
     // those bits must be promoted, otherwise the CPU treats the leaf as
     // supervisor/read-only and user accesses (and isValidUserPointer) fail.
     const uint64_t upperPromote = (flags & UserSuper) | (flags & ReadWrite);
+    // A table allocated here is private to this address space: its entry gets
+    // the private-table bit (1 << 9), or clone_table_if_needed() below took it
+    // for a kernel-shared table and copied it, leaking the original. That lost
+    // ~18 page-table frames per process (P7.1 ran out of memory).
 
     if (!(pml4->entries[pml4i] & Present)) {
         PageTable* pdpt = AllocTable();
         if (!pdpt) return;
-        pml4->entries[pml4i] = reinterpret_cast<uint64_t>(pdpt) | Present | ReadWrite | UserSuper;
+        pml4->entries[pml4i] = reinterpret_cast<uint64_t>(pdpt) | Present | ReadWrite | UserSuper | (1ULL << 9);
     } else {
         pml4->entries[pml4i] |= upperPromote;
     }
@@ -597,7 +634,7 @@ void VMM::MapPageInto(PageTable* pml4, uint64_t virtualAddr, uint64_t physAddr, 
     if (!(pdpt->entries[pdpti] & Present)) {
         PageTable* pd = AllocTable();
         if (!pd) return;
-        pdpt->entries[pdpti] = reinterpret_cast<uint64_t>(pd) | Present | ReadWrite | UserSuper;
+        pdpt->entries[pdpti] = reinterpret_cast<uint64_t>(pd) | Present | ReadWrite | UserSuper | (1ULL << 9);
     } else {
         pdpt->entries[pdpti] |= upperPromote;
     }
@@ -610,7 +647,7 @@ void VMM::MapPageInto(PageTable* pml4, uint64_t virtualAddr, uint64_t physAddr, 
     if (!(pd->entries[pdi] & Present)) {
         PageTable* pt = AllocTable();
         if (!pt) return;
-        pd->entries[pdi] = reinterpret_cast<uint64_t>(pt) | Present | ReadWrite | UserSuper;
+        pd->entries[pdi] = reinterpret_cast<uint64_t>(pt) | Present | ReadWrite | UserSuper | (1ULL << 9);
     } else {
         pd->entries[pdi] |= upperPromote;
     }

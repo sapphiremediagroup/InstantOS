@@ -1,0 +1,29 @@
+# /etc/ssl/openssl.cnf on InstantOS: the defaults of the library, and what
+# `openssl req` needs to ask for a subject.
+openssl_conf = openssl_init
+
+[openssl_init]
+providers = provider_sect
+ssl_conf = ssl_sect
+
+[provider_sect]
+default = default_sect
+
+[default_sect]
+activate = 1
+
+[ssl_sect]
+system_default = system_default_sect
+
+[system_default_sect]
+MinProtocol = TLSv1.2
+
+[req]
+default_bits = 2048
+distinguished_name = req_distinguished_name
+string_mask = utf8only
+
+[req_distinguished_name]
+countryName = Country Name (2 letter code)
+organizationName = Organization Name
+commonName = Common Name

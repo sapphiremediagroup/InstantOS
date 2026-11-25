@@ -108,6 +108,18 @@ VNode* FAT32FS::getRoot() {
     return rootNode;
 }
 
+// Each lookup or create makes a VNode and a FAT32Node (createNodeFromEntry)
+// that only it uses: free both once the VFS lets go of it, as ext4 does.
+void FAT32FS::releaseNode(VNode* node) {
+    if (!node || node == rootNode) {
+        return;
+    }
+    if (node->getData()) {
+        kfree(node->getData());
+    }
+    delete node;
+}
+
 uint64_t FAT32FS::clusterToSector(uint32_t cluster) {
     return dataStart + (cluster - 2) * bpb.sectorsPerCluster;
 }

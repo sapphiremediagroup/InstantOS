@@ -1,0 +1,3 @@
+#!/bin/sh
+# gunzip: gzip -d (the gzip port installs no wrapper scripts).
+exec gzip -d "$@"

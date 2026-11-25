@@ -5,7 +5,7 @@
 # a config.cache primes the gnulib/autoconf probes that cannot be run on a
 # non-Linux freestanding target.
 #
-# Usage:  build-gnu-tool.sh <gzip|sed|grep|tar>
+# Usage:  build-gnu-tool.sh <gzip|sed|grep|tar|awk|cmp|diff|m4|find|xargs>
 # Prereq: tools/build-mlibc.sh first.
 set -euo pipefail
 
@@ -24,6 +24,10 @@ case "$PKG" in
   cmp)  VER="diffutils-3.10"; URLBASE="diffutils"; BINPATHS="src/cmp"; XARGS=""; URL="${URL:-https://ftp.gnu.org/gnu/diffutils/${VER}.tar.xz}" ;;
   diff) VER="diffutils-3.10"; URLBASE="diffutils"; BINPATHS="src/diff"; XARGS=""; URL="${URL:-https://ftp.gnu.org/gnu/diffutils/${VER}.tar.xz}" ;;
   m4)   VER="m4-1.4.19"; URLBASE="m4";   BINPATHS="src/m4";      XARGS="" ;;
+  # gcc's bootstrap `compare` lists the stage objects with find; without it the
+  # list is empty and the comparison "succeeds" having compared nothing (P7.2).
+  find)  VER="findutils-4.9.0"; URLBASE="findutils"; BINPATHS="find/find"; XARGS=""; URL="${URL:-https://ftp.gnu.org/gnu/findutils/${VER}.tar.xz}" ;;
+  xargs) VER="findutils-4.9.0"; URLBASE="findutils"; BINPATHS="xargs/xargs"; XARGS=""; URL="${URL:-https://ftp.gnu.org/gnu/findutils/${VER}.tar.xz}" ;;
   *) echo "unknown package: $PKG" >&2; exit 2 ;;
 esac
 URL="${URL:-https://ftp.gnu.org/gnu/${URLBASE}/${VER}.tar.gz}"
@@ -63,7 +67,7 @@ ac_cv_func_mmap_fixed_mapped=yes
 gl_cv_func_mmap_anon=yes
 ac_cv_func_fork_works=yes
 ac_cv_func_vfork_works=yes
-ac_cv_func_strerror_r_char_p=no
+ac_cv_func_strerror_r_char_p=yes
 ac_cv_func_setvbuf_reversed=no
 gl_cv_func_getcwd_path_max=yes
 gl_cv_func_getcwd_abort_bug=no
@@ -77,6 +81,10 @@ gl_cv_func_symlink_works=yes
 gl_cv_func_rename_dest_works=yes
 gl_cv_func_rename_link_works=yes
 gl_cv_func_utimensat_works=yes
+# mlibc's fchmodat handles AT_SYMLINK_NOFOLLOW (EOPNOTSUPP on a link, as
+# Linux); gnulib's replacement needs O_PATH + /proc/self/fd, and tar failed on
+# every symlink with it.
+gl_cv_func_fchmodat_works=yes
 gl_cv_func_futimens_works=yes
 gl_cv_func_select_supports0=yes
 gl_cv_func_gettimeofday_clobber=no

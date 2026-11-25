@@ -19,8 +19,11 @@ constexpr uint32_t MSR_SFMASK = 0xC0000084;
 Syscall syscallInstance;
 
 extern "C" void saveSyscallState(uint64_t* stack);
-extern "C" void restoreSyscallState(uint64_t* stack, uint64_t result);
+extern "C" uint64_t restoreSyscallState(uint64_t* stack, uint64_t result);
 
+// Returns by sysretq, or by iretq when restoreSyscallState says the context is
+// a whole one (after sigreturn): sysret takes rip from rcx and rflags from
+// r11, so a program stopped anywhere by an interrupt would lose them.
 extern "C" __attribute__((naked)) void syscallEntry()
 {
     asm volatile (
@@ -70,6 +73,7 @@ extern "C" __attribute__((naked)) void syscallEntry()
         "call restoreSyscallState\n\t"
         "add rsp, 0x28\n\t"
         "mov rsp, rbp\n\t"
+        "test rax, rax\n\t"
 
         "pop r15\n\t"
         "pop r14\n\t"
@@ -86,10 +90,21 @@ extern "C" __attribute__((naked)) void syscallEntry()
         "pop rcx\n\t"
         "pop rbx\n\t"
         "pop rax\n\t"
+        "jnz 1f\n\t"   // the flags of the test above (pop changes none)
 
         "mov rsp, gs:[8]\n\t"
         "swapgs\n\t"
         "sysretq\n\t"
+
+        // iretq frame on the kernel stack the pops just emptied.
+        "1:\n\t"
+        "push 0x1b\n\t"
+        "push qword ptr gs:[8]\n\t"
+        "push qword ptr gs:[120]\n\t"
+        "push 0x23\n\t"
+        "push qword ptr gs:[112]\n\t"
+        "swapgs\n\t"
+        "iretq\n\t"
         ".att_syntax prefix\n\t"
     );
 }
@@ -126,7 +141,9 @@ void Syscall::initializeCpu() {
 
     wrmsr(MSR_LSTAR, reinterpret_cast<uint64_t>(&syscallEntry));
 
-    wrmsr(MSR_SFMASK, 0x200);
+    // Cleared on entry, as Linux does: IF, and TF, DF, IOPL, NT and AC, so the
+    // kernel's string copies never run backwards for a program that set DF.
+    wrmsr(MSR_SFMASK, 0x47700);
 }
 
 void Syscall::setKernelStack(uint64_t stack) {
@@ -403,6 +420,40 @@ uint64_t Syscall::handle(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
             return sys_kernel_log(arg1, arg2);
         case GpuTest:
             return sys_gpu_test(arg1, arg2, arg3);
+        case MemBench:
+            return sys_mem_bench(arg1, arg2, arg3);
+        case ModuleList:
+            return sys_module_list(arg1, arg2);
+        case ModuleLoad:
+            return sys_module_load(arg1);
+        case PartitionList:
+            return sys_partition_list(arg1, arg2);
+        case PartitionSetType:
+            return sys_partition_set_type(arg1, arg2);
+        case PartitionMount:
+            return sys_partition_mount(arg1, arg2, arg3);
+        case FutexWait:
+            return sys_futex_wait(arg1, arg2, arg3);
+        case FutexWake:
+            return sys_futex_wake(arg1, arg2);
+        case GetTgid:
+            return sys_gettgid();
+        case ThreadExitNotify:
+            return sys_thread_exit_notify(arg1);
+        case MemfdCreate:
+            return sys_memfd_create(arg1, arg2);
+        case Sigsuspend:
+            return sys_sigsuspend(arg1);
+        case Sigpending:
+            return sys_sigpending(arg1);
+        case Sigtimedwait:
+            return sys_sigtimedwait(arg1, arg2, arg3);
+        case Tgkill:
+            return sys_tgkill(arg1, arg2, arg3);
+        case GetRlimit:
+            return sys_getrlimit(arg1, arg2);
+        case SetRlimit:
+            return sys_setrlimit(arg1, arg2);
         case Reboot:
             return sys_reboot(arg1);
         case Display:
@@ -419,6 +470,8 @@ uint64_t Syscall::handle(uint64_t syscall_num, uint64_t arg1, uint64_t arg2, uin
             return sys_surface_wait_idle(arg1, arg2);
         case SurfaceExportBuffer:
             return sys_surface_export_buffer(arg1);
+        case StorageSync:
+            return sys_storage_sync(arg1);
         case ThreadCreate:
             return sys_thread_create(arg1, arg2, arg3);
         case ThreadClone:
@@ -582,6 +635,7 @@ bool storageMayRunUnlocked(uint64_t syscallNum) {
         case Readdir:
         case Readlink:
         case Fsync:
+        case StorageSync:
             return true;
         default:
             return false;
@@ -606,7 +660,8 @@ extern "C" uint64_t syscallHandler(uint64_t syscall_num, uint64_t arg1, uint64_t
     }
     Debug::endSyscallTrace(current);
 
-    if (current && static_cast<SyscallNumber>(syscall_num) != SyscallNumber::SigReturn) {
+    if (current) {
+        current->lastSyscall = syscall_num;
         current->getContext()->rax = result;
         if (current->hasValidUserState()) {
             current->handlePendingSignals();

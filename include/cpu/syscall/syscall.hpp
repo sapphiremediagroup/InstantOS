@@ -605,6 +605,72 @@ enum class SyscallNumber : uint64_t {
     SurfaceFromBuffer,
     SurfaceWaitIdle,
     SurfaceExportBuffer,   // 160 (compositor): (surface id) a GPU-buffer surface's dma-buf as a File handle
+    StorageSync,           // 161: (mode) commit the ext4 volumes' running transactions; mode 1: only those due
+    MemBench,              // 162 (root): (spec, size, reps) time one memcpy/memset/memset32/memcmp variant
+    ModuleList,            // 163: (ModuleInfo* buffer, capacity) the loaded driver modules; returns how many there are
+    ModuleLoad,            // 164 (root): (path) load an .idrv driver module for the devices it matches
+    PartitionList,         // 165: (PartitionRecord* buffer, capacity) every disk's GPT partitions; returns how many
+    PartitionSetType,      // 166 (root): (disk, index) give an InstantOS partition the InstantOS data GPT type
+    PartitionMount,        // 167 (root): (disk, index, path) mount an InstantOS partition's ext4 at path
+    FutexWait,             // 168: (u32* address, expected, timeout ns or kFutexNoTimeout) sleep until woken
+    FutexWake,             // 169: (u32* address, count) wake up to count waiters; returns how many
+    GetTgid,               // 170: the process's id (GetPID is the calling thread's)
+    ThreadExitNotify,      // 171: (u32* word) ThreadExit(0) that then stores 0 in word and wakes its waiters
+    MemfdCreate,           // 172: (name, flags) a file of shared memory without a name; a File handle
+    Sigsuspend,            // 173: (maskPtr) waits with that mask until a handler has run; -EINTR
+    Sigpending,            // 174: (setPtr) the pending signals that are blocked
+    Sigtimedwait,          // 175: (setPtr, siginfoPtr, timeoutNs; ~0 = none) takes a pending one of the set
+    Tgkill,                // 176: (tgid, tid, sig) to one thread (si_code SI_TKILL); tgid 0 = any
+    GetRlimit,             // 177: (resource, {cur, max}*) RLIMIT_NOFILE is kept; others unlimited
+    SetRlimit,             // 178: (resource, const {cur, max}*) RLIMIT_NOFILE checked and kept
+};
+
+// FutexWait's timeout: none.
+constexpr uint64_t kFutexNoTimeout = ~0ULL;
+
+// PartitionList's records: the GPT partitions of every disk (DiskRegistry).
+struct PartitionRecord {
+    uint32_t disk;          // the disk's number (AHCI port order), from 0
+    uint32_t index;         // the GPT entry, from 1 (/dev/disk<disk>p<index>)
+    uint64_t startByte;
+    uint64_t lengthByte;
+    uint8_t typeGuid[16];   // as GPT stores them
+    uint8_t uniqueGuid[16];
+    char name[40];          // the GPT name, ASCII
+    uint32_t flags;         // PartitionFlags
+    uint32_t reserved;
+};
+
+enum PartitionFlags : uint32_t {
+    PartitionInstantOS = 1u << 0,   // InstantOS's: /dev node, re-type and mount allowed
+    PartitionEsp = 1u << 1,         // the EFI system partition
+    PartitionMounted = 1u << 2,     // the root, or mounted by PartitionMount
+};
+
+
+// ModuleList's records (one per loaded .idrv driver module, docs/idrv.md).
+struct ModuleInfo {
+    char name[32];
+    char version[16];
+    char description[80];
+    char source[96];        // the file it was loaded from
+    uint64_t base;          // where its image runs
+    uint32_t imageSize;
+    uint32_t devices;       // PCI devices it took
+    uint32_t relocations;
+    uint32_t flags;         // ModuleInfoFlags
+};
+
+enum ModuleInfoFlags : uint32_t {
+    ModuleInitFailed = 1u << 0,   // init returned an error (it stays loaded)
+    ModuleAtBoot = 1u << 1,       // loaded by the boot scan, not ModuleLoad
+};
+
+
+// StorageSync's argument.
+enum class StorageSyncMode : uint64_t {
+    All = 0,    // everything now (sync(2))
+    Due = 1,    // only transactions at least Ext4FS::kCommitMs old (storage-manager's periodic call)
 };
 
 // SocketSendMsg/SocketRecvMsg (AF_UNIX only; other sockets: -EOPNOTSUPP):
@@ -679,6 +745,9 @@ enum MemoryProtection : uint64_t {
     MemoryProtRead = 1ULL << 0,
     MemoryProtWrite = 1ULL << 1,
     MemoryProtExecute = 1ULL << 2,
+    // No access (PROT_NONE): pages not there yet fault. Protection 0 means
+    // read and write, as it always has for native programs.
+    MemoryProtNone = 1ULL << 8,
 };
 
 enum SyscallErrno : int {
@@ -686,17 +755,21 @@ enum SyscallErrno : int {
     SysErrNoEntry = 2,
     SysErrNoProcess = 3,
     SysErrInterrupted = 4,
+    SysErrIO = 5,
     SysErrBadFile = 9,
     SysErrNoChild = 10,
     SysErrAgain = 11,
     SysErrNoMemory = 12,
     SysErrAccess = 13,
+    SysErrFault = 14,
+    SysErrBusy = 16,
     SysErrExists = 17,
     SysErrCrossDevice = 18,
     SysErrNoDevice = 19,
     SysErrNotDirectory = 20,
     SysErrIsDirectory = 21,
     SysErrInvalid = 22,
+    SysErrTooManyFiles = 24,
     SysErrNoSpace = 28,
     SysErrPipe = 29,
     SysErrBrokenPipe = 32,
@@ -929,7 +1002,25 @@ private:
     uint64_t sys_window_post_event(uint64_t window_id, uint64_t event_ptr);
     uint64_t sys_kernel_log(uint64_t buffer, uint64_t length);
     uint64_t sys_gpu_test(uint64_t command, uint64_t buffer, uint64_t length);
+    uint64_t sys_mem_bench(uint64_t spec, uint64_t size, uint64_t reps);
+    uint64_t sys_module_list(uint64_t buffer, uint64_t capacity);
+    uint64_t sys_module_load(uint64_t path);
+    uint64_t sys_partition_list(uint64_t buffer, uint64_t capacity);
+    uint64_t sys_partition_set_type(uint64_t disk, uint64_t index);
+    uint64_t sys_partition_mount(uint64_t disk, uint64_t index, uint64_t path);
+    uint64_t sys_futex_wait(uint64_t address, uint64_t expected, uint64_t timeoutNs);
+    uint64_t sys_futex_wake(uint64_t address, uint64_t count);
+    uint64_t sys_gettgid();
+    uint64_t sys_thread_exit_notify(uint64_t word);
+    uint64_t sys_memfd_create(uint64_t name, uint64_t flags);
+    uint64_t sys_sigsuspend(uint64_t maskPtr);
+    uint64_t sys_sigpending(uint64_t setPtr);
+    uint64_t sys_sigtimedwait(uint64_t setPtr, uint64_t infoPtr, uint64_t timeoutNs);
+    uint64_t sys_tgkill(uint64_t tgid, uint64_t tid, uint64_t sig);
+    uint64_t sys_getrlimit(uint64_t resource, uint64_t limitPtr);
+    uint64_t sys_setrlimit(uint64_t resource, uint64_t limitPtr);
     uint64_t sys_reboot(uint64_t mode);
+    uint64_t sys_storage_sync(uint64_t mode);
     uint64_t sys_display(uint64_t command, uint64_t arg);
     uint64_t sys_socketpair(uint64_t domain, uint64_t type, uint64_t protocol, uint64_t handlesOut);
     uint64_t sys_socket_sendmsg(uint64_t socket, uint64_t message, uint64_t flags);

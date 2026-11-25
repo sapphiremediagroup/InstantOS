@@ -50,6 +50,7 @@ Runs until killed; prints "host_server: ready" once every socket is listening.
 """
 import argparse
 import heapq
+import os
 import http.server
 import random
 import socket
@@ -113,11 +114,20 @@ PAGES = {"dir": None, "log": None}
 QMP = {"socket": None}
 
 
+def qmp_connect(path):
+    """QEMU's QMP: a Unix socket path, or tcp:HOST:PORT (Windows' QEMU)."""
+    if path.startswith("tcp:"):
+        host, port = path[4:].rsplit(":", 1)
+        return socket.create_connection((host, int(port)))
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.connect(path)
+    return sock
+
+
 def qmp_commands(path, commands):
     """Runs QMP commands (dicts) on a fresh connection; returns the replies."""
     import json
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    sock.connect(path)
+    sock = qmp_connect(path)
     reader = sock.makefile("r")
     reader.readline()   # greeting
     replies = []
@@ -583,8 +593,12 @@ def main():
     ap.add_argument("--pages", help="directory served at /ns/")
     ap.add_argument("--request-log", help="file that gets one line per GET")
     ap.add_argument("--link", type=int, help="first of the four UDP ports joining the guest's NIC to slirp")
-    ap.add_argument("--qmp", help="QEMU's QMP socket, for GET /linkflap")
+    ap.add_argument("--qmp", help="QEMU's QMP socket (or tcp:HOST:PORT), for GET /linkflap")
+    ap.add_argument("--pidfile", help="file to write this process's pid to")
     args = ap.parse_args()
+    if args.pidfile:
+        with open(args.pidfile, "w") as f:
+            f.write(str(os.getpid()))
 
     QMP["socket"] = args.qmp
     PAGES["dir"] = args.pages

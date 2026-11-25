@@ -53,12 +53,35 @@ struct ProcessContext {
 #define SIGTERM 15
 #define SIGCHLD 17
 
+#define SIGBUS 7
+#define SIGTRAP 5
+#define SA_SIGINFO 4
+#define SA_RESTORER 0x04000000
 #define SA_ONSTACK 0x08000000
 #define SA_RESTART 0x10000000
+#define SA_NODEFER 0x40000000
+#define SA_RESETHAND 0x80000000
 #define SS_ONSTACK 1
 #define SS_DISABLE 2
 
+// siginfo_t's si_code values (Linux).
+#define SI_USER 0
+#define SI_KERNEL 0x80
+#define SI_TKILL (-6)
+#define CLD_EXITED 1
+#define CLD_KILLED 2
+
 typedef void (*sighandler_t)(int);
+
+// What a pending signal's siginfo_t says (one per signal: a standard signal
+// sent again while pending keeps the first).
+struct SignalInfo {
+  int32_t code;      // si_code
+  int32_t pid;       // sender (SI_USER/SI_TKILL), the child (SIGCHLD)
+  uint32_t uid;
+  int32_t status;    // SIGCHLD: exit status or signal
+  uint64_t addr;     // fault address (SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGTRAP)
+};
 
 struct SignalHandler {
   sighandler_t handlers[NSIG];
@@ -69,11 +92,40 @@ struct SignalHandler {
   uint64_t blocked;
   uint64_t altStackSp;
   uint64_t altStackSize;
-  uint32_t altStackFlags;
+  uint32_t altStackFlags;   // SS_DISABLE or 0; on the stack or not is where rsp is
+  SignalInfo info[NSIG];
+  // sigsuspend: the mask to give back once a handler has run (its frame keeps
+  // it), or on the way out if none ran.
+  bool suspended = false;
+  uint64_t suspendSavedMask = 0;
 };
+
+// Linux ignores SIGCHLD, SIGCONT, SIGURG and SIGWINCH by default. Its default
+// for SIGSTOP, SIGTSTP, SIGTTIN and SIGTTOU is to stop the process, which this
+// kernel cannot do; ignoring them beats killing it (bash sends itself SIGTTIN
+// until it owns its terminal, and dies before its first prompt otherwise).
+inline bool signalIgnoredByDefault(int sig) {
+  switch (sig) {
+  case SIGCHLD:
+  case 18:   // SIGCONT
+  case 19:   // SIGSTOP
+  case 20:   // SIGTSTP
+  case 21:   // SIGTTIN
+  case 22:   // SIGTTOU
+  case 23:   // SIGURG
+  case 28:   // SIGWINCH
+    return true;
+  default:
+    return false;
+  }
+}
+
+struct InterruptFrame;
 
 class GDT;
 struct ProcessSharedState;
+// Address spaces (ProcessSharedState) alive (leak accounting, [mem]).
+inline int64_t g_liveSharedStates = 0;
 
 class Process;
 
@@ -83,6 +135,7 @@ struct ThreadObject {
   bool completed;
   int exitCode;
   Process *process;
+  uint32_t joiners = 0;   // asleep in ThreadJoin
 
   void retain() { __sync_add_and_fetch(&refCount, 1); }
   void release() {
@@ -92,13 +145,28 @@ struct ThreadObject {
   }
 };
 
+// A process's place on the futex queues (src/cpu/syscall/futex.cpp).
+struct FutexWaiter {
+  uint64_t space = 0;
+  uint64_t address = 0;
+  Process *next = nullptr;
+  bool queued = false;   // FutexWait sleeps until FutexWake clears it
+};
+void futexForget(Process *process);
+
 class Process {
 public:
   Process(uint32_t pid);
+  // A thread of sharedFrom's process. kNoUserStack: it brings its own stack
+  // (mlibc's), and the kernel makes none.
+  static constexpr uint64_t kNoUserStack = ~0ULL;
   Process(uint32_t pid, Process *sharedFrom, uint64_t stackSize);
   ~Process();
 
   uint32_t getPID() const { return pid; }
+  // The process's id: its main thread's pid. Threads have pids of their own,
+  // but children, wait and the parent are the process's.
+  uint32_t getGroupPID() const { return groupPID; }
   ProcessState getState() const { return state; }
   void setState(ProcessState s) { state = s; }
 
@@ -135,9 +203,12 @@ public:
 
   int getExitCode() const { return exitCode; }
   void setExitCode(int code) { exitCode = code; }
+  // The signal it died of (wait reports WIFSIGNALED), 0 if it exited.
+  int termSignal = 0;
 
   Process *next;
   Process *allNext;
+  FutexWaiter futex;
 
   bool hasValidUserState() const { return validUserState; }
   void setValidUserState(bool valid) { validUserState = valid; }
@@ -180,13 +251,42 @@ public:
   }
 
   SignalHandler *getSignalHandler() { return &signalHandler; }
-  void sendSignal(int sig);
+  // `info` null: sent by the kernel (SI_KERNEL).
+  void sendSignal(int sig, const SignalInfo* info = nullptr);
+  // A signal is pending and not blocked (no lock needed; a hint for the
+  // scheduler tick's shortcut).
+  bool signalMayBeDeliverable() const {
+    return (__atomic_load_n(&signalHandler.pending, __ATOMIC_RELAXED) &
+            ~__atomic_load_n(&signalHandler.blocked, __ATOMIC_RELAXED)) != 0;
+  }
+  // Set by sigreturn: the context to go back to is a whole one (an interrupt
+  // may have stopped it anywhere), so the syscall returns by iretq, not sysret
+  // (which loses rcx and r11).
+  bool fullUserRestore = false;
+  uint64_t lastSyscall = ~0ULL;   // for SA_RESTART
 
   // ITIMER_REAL (setitimer/alarm): SIGALRM at alarmDeadlineMs (0 = off),
   // then every alarmIntervalMs if nonzero. Checked by the boot CPU's tick.
   uint64_t alarmDeadlineMs = 0;
   uint64_t alarmIntervalMs = 0;
-  void handlePendingSignals();
+  // Acts on the pending signals before the return to user mode: runs a
+  // handler (a frame on the user stack, the context moved to the handler) or
+  // the default action. `atSyscallExit`: the context is that of a syscall
+  // returning (SA_RESTART applies; handlers without a restorer may run).
+  void handlePendingSignals(bool atSyscallExit = true);
+  // The same on the way out of an interrupt or exception taken in user mode.
+  // False if the process was terminated (the caller must not return to it).
+  bool deliverSignalsToFrame(InterruptFrame* frame);
+  // A fault in user mode (`signal` with `info`): true if a handler takes it
+  // (the frame now enters it); false if it must die (no handler, ignored or
+  // blocked: Linux's force_sig).
+  bool takeFaultSignal(InterruptFrame* frame, int signal, const SignalInfo& info);
+  // sigaction for the whole process: every thread shares the dispositions.
+  void setSignalAction(int sig, uint64_t handler, uint64_t mask, uint64_t flags, uint64_t restorer);
+  // sigreturn: the frame at the user's rsp back into the context.
+  bool restoreSignalFrame();
+  // Dies of `sig` as its default action would (the whole thread group).
+  void dieOfSignal(int sig);
   bool hasDeliverableSignal() const;
   bool killPending() const { return (signalHandler.pending & (1ULL << SIGKILL)) != 0; }
   // Acts on a pending SIGKILL only, for paths that cannot deliver a handler
@@ -194,9 +294,10 @@ public:
   bool terminateIfKilled();
   // Kills the process like SIGKILL but reports `code` as its exit status
   // (another thread called exit() or crashed).
-  void requestExit(int code) {
+  void requestExit(int code, int signal = 0) {
     exitRequested = true;
     exitCode = code;
+    termSignal = signal;
     sendSignal(SIGKILL);
   }
 
@@ -223,7 +324,12 @@ public:
                          uint64_t fileLength, bool shared);
   // Pages already mapped (kSharedFrame) that `object` owns: the region holds
   // a reference to it until munmap, exit or exec drops the region.
-  bool mmapAddObjectRegion(uint64_t start, uint64_t length, uint64_t prot, struct MappedObject* object);
+  // `offset` is where in the object the region starts.
+  bool mmapAddObjectRegion(uint64_t start, uint64_t length, uint64_t prot, struct MappedObject* object,
+                           uint64_t offset = 0);
+  // True where the address is in an object's region (shared between processes),
+  // after making sure its page is there.
+  bool mmapTouchShared(uint64_t addr);
   void mmapRemoveRange(uint64_t start, uint64_t length);
   bool mmapProtectRange(uint64_t start, uint64_t length, uint64_t prot);
   // Write back the present pages of any writable MAP_SHARED file region that
@@ -231,6 +337,7 @@ public:
   // flush). No-op for anonymous and read-only/private regions.
   void mmapSyncRange(uint64_t start, uint64_t length);
   bool mmapRegionCovers(uint64_t addr) const;   // an accessible region contains addr?
+  uint64_t mmapRegionCount() const;             // leak hunting (exec.cpp [mem] dump)
   bool handleDemandFault(uint64_t faultAddr);   // populate a lazily-reserved page
   bool mmapCloneRegionsFrom(const Process* parent);
 
@@ -273,10 +380,20 @@ public:
   // exec and fetches it at entry; the buffer is a plain Process member so it
   // survives replaceImageFrom(). fetch validates each entry against the live
   // handle table so CLOEXEC-closed fds are dropped.
-  static constexpr int kFdStashMax = 256;
+  // Up to RLIMIT_NOFILE's ceiling; the buffer is made to measure at stash time.
+  static constexpr int kFdStashMax = 65536;
   uint64_t *getFdStash() { return fdStash; }
   int getFdStashCount() const { return fdStashCount; }
   void setFdStashCount(int count) { fdStashCount = count; }
+  // A stash buffer of `count` entries (the old one goes); nullptr if out of memory.
+  uint64_t *makeFdStash(int count);
+  void dropFdStash();
+
+  // RLIMIT_NOFILE, kept with the handle table (shared by threads, copied to
+  // fork and spawn children, kept across exec).
+  void getNofileLimit(uint64_t *soft, uint64_t *hard) const;
+  void setNofileLimit(uint64_t soft, uint64_t hard);
+  int openHandleCount() const;
 
   // fork() support: deep-copy the parent's user address space into this
   // (freshly created) process, and arrange for this process to resume in
@@ -332,6 +449,7 @@ private:
   uint32_t uid;
   uint32_t gid;
   uint32_t pid;
+  uint32_t groupPID;
   uint32_t parentPID;
   int exitCode;
   ProcessState state;
@@ -362,6 +480,7 @@ private:
   Debug::SyscallTrace syscallTrace;
   ThreadObject *threadObject;
   // P3.2: libc fd-table snapshot preserved across exec (see getFdStash()).
-  uint64_t fdStash[kFdStashMax];
+  uint64_t *fdStash = nullptr;
+  int fdStashCapacity = 0;
   int fdStashCount = -1;
 };

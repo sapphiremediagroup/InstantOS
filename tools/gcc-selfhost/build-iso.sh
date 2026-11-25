@@ -18,7 +18,7 @@ BUILD_DIR="${BUILD_DIR:-$ROOT/build}"
 OUT_DIR="${OUT_DIR:-$BUILD_DIR/gcc-selfhost}"
 CC="${CC:-clang}"
 LD="${LD:-ld.lld}"
-CROSS="/home/sky/gcc-port/gcc-install"
+CROSS="${GCC_PORT_DIR:-$HOME/gcc-port}/gcc-install"
 MLIBC_GCC="$BUILD_DIR/mlibc-root-gcc"
 GS_DIR="$ROOT/tools/gcc-selfhost"
 

@@ -11,10 +11,10 @@
 # target=instantos, same GCC 13.3.0) at install-assembly time (P6.4).
 set -euo pipefail
 
-GCC_SRC="${GCC_SRC:-/home/sky/gcc-port/gcc-13.3.0}"
-BUILD="${GCC_HOSTED_BUILD:-/home/sky/gcc-port/build-hosted}"
-PREFIX="${GCC_HOSTED_PREFIX:-/home/sky/gcc-port/gcc-hosted-install}"
-CROSS_BIN="/home/sky/gcc-port/gcc-install/bin"
+GCC_SRC="${GCC_SRC:-${GCC_PORT_DIR:-$HOME/gcc-port}/gcc-13.3.0}"
+BUILD="${GCC_HOSTED_BUILD:-${GCC_PORT_DIR:-$HOME/gcc-port}/build-hosted}"
+PREFIX="${GCC_HOSTED_PREFIX:-${GCC_PORT_DIR:-$HOME/gcc-port}/gcc-hosted-install}"
+CROSS_BIN="${GCC_PORT_DIR:-$HOME/gcc-port}/gcc-install/bin"
 BINUTILS_CROSS="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/build/binutils-cross/bin"
 
 # The cross compiler (host compiler) + cross binutils (host & target tools).

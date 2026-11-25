@@ -56,9 +56,63 @@ InitrdFS::InitrdFS(void* data, size_t size, const char* prefix)
 }
 
 InitrdFS::~InitrdFS() {
+    if (fileNodes) {
+        for (uint32_t i = 0; header && i < header->fileCount; i++) {
+            delete fileNodes[i];
+        }
+        delete[] fileNodes;
+    }
+    while (directories) {
+        CachedDirectory* next = directories->next;
+        delete[] static_cast<char*>(directories->node->getData());
+        delete directories->node;
+        delete directories;
+        directories = next;
+    }
     if (rootNode) {
         delete rootNode;
     }
+}
+
+VNode* InitrdFS::fileNode(uint32_t index) {
+    if (!fileNodes) {
+        fileNodes = new VNode*[header->fileCount];
+        if (!fileNodes) {
+            return nullptr;
+        }
+        for (uint32_t i = 0; i < header->fileCount; i++) {
+            fileNodes[i] = nullptr;
+        }
+    }
+    if (!fileNodes[index]) {
+        VNode* node = new VNode(this, index + 1, FileType::Regular);
+        if (!node) {
+            return nullptr;
+        }
+        node->ops = &ops;
+        fileNodes[index] = node;
+    }
+    return fileNodes[index];
+}
+
+// `prefix` is a new[] string; the cache takes it, or frees it when a node for
+// that directory is already cached.
+VNode* InitrdFS::directoryNode(const char* prefix) {
+    for (CachedDirectory* d = directories; d; d = d->next) {
+        if (strcmp(static_cast<const char*>(d->node->getData()), prefix) == 0) {
+            delete[] prefix;
+            return d->node;
+        }
+    }
+    VNode* node = createDirectoryNode(this, prefix);
+    CachedDirectory* entry = node ? new CachedDirectory{directories, node} : nullptr;
+    if (!entry) {
+        delete node;
+        delete[] prefix;
+        return nullptr;
+    }
+    directories = entry;
+    return node;
 }
 
 int InitrdFS::mount(const char* path) {
@@ -270,12 +324,10 @@ VNode* InitrdFS::nodeLookup(VNode* node, const char* name) {
                 strcpy(childPrefix + prefixLength + 1, name);
             }
 
-            return createDirectoryNode(fs, childPrefix);
+            return fs->directoryNode(childPrefix);
         }
 
-        VNode* fileNode = new VNode(fs, i + 1, FileType::Regular);
-        fileNode->ops = &fs->ops;
-        return fileNode;
+        return fs->fileNode(i);
     }
     
     return nullptr;

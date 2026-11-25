@@ -39,6 +39,41 @@ if [ ! -d "$SRC/libcxx" ] || [ ! -d "$SRC/libc" ]; then
   rm -f "$WORK/llvm.tar.xz"
 fi
 
+# std::atomic's wait/notify (and the semaphores, latches and barriers made of it)
+# sleep on kernel futexes (<instantos/futex.h>) instead of polling: 32-bit words.
+python3 - "$SRC/libcxx" <<'PY'
+import sys
+def fix(path, old, new):
+    s = open(path).read()
+    if new in s:
+        return
+    assert s.count(old) == 1, path
+    open(path, "w").write(s.replace(old, new))
+fix(sys.argv[1] + "/include/__atomic/contention_t.h",
+    "#if defined(__linux__) || (defined(_AIX) && !defined(__64BIT__))",
+    "#if 1 // InstantOS: 32-bit futexes")
+p = sys.argv[1] + "/src/atomic.cpp"
+fix(p, "// Baseline needs no new headers\n", "#  include <instantos/futex.h> // InstantOS\n")
+fix(p, """static void
+__libcpp_platform_wait_on_address(__cxx_atomic_contention_t const volatile* __ptr, __cxx_contention_t __val) {
+  __libcpp_thread_poll_with_backoff(
+      [=]() -> bool { return !__cxx_nonatomic_compare_equal(__cxx_atomic_load(__ptr, memory_order_relaxed), __val); },
+      __libcpp_timed_backoff_policy());
+}
+
+static void __libcpp_platform_wake_by_address(__cxx_atomic_contention_t const volatile*, bool) {}
+""", """static void
+__libcpp_platform_wait_on_address(__cxx_atomic_contention_t const volatile* __ptr, __cxx_contention_t __val) {
+  instantos_futex_wait(reinterpret_cast<const volatile uint32_t*>(__ptr), static_cast<uint32_t>(__val), nullptr);
+}
+
+static void __libcpp_platform_wake_by_address(__cxx_atomic_contention_t const volatile* __ptr, bool __notify_one) {
+  instantos_futex_wake(reinterpret_cast<const volatile uint32_t*>(__ptr), __notify_one ? 1 : INT_MAX);
+}
+""")
+PY
+# (mlibc has no __cxa_thread_atexit_impl, which the compile-only check cannot see:
+# libc++abi runs the destructors of thread_local objects itself.)
 FLAGS="-nostdlibinc -isystem $MLIBC_ROOT/include -D_GNU_SOURCE -fPIC -fno-stack-protector"
 rm -rf "$OBJ"
 cmake -G Ninja -S "$SRC/runtimes" -B "$OBJ" \
@@ -56,6 +91,7 @@ cmake -G Ninja -S "$SRC/runtimes" -B "$OBJ" \
   -DLIBCXX_HERMETIC_STATIC_LIBRARY=ON -DLIBCXXABI_HERMETIC_STATIC_LIBRARY=ON -DLIBUNWIND_HIDE_SYMBOLS=ON \
   -DLIBCXX_CXX_ABI=libcxxabi -DLIBCXXABI_USE_LLVM_UNWINDER=ON -DLIBCXXABI_ENABLE_STATIC_UNWINDER=ON \
   -DLIBCXX_HAS_PTHREAD_API=ON -DLIBCXXABI_HAS_PTHREAD_API=ON -DLIBUNWIND_ENABLE_THREADS=ON \
+  -DLIBCXXABI_HAS_CXA_THREAD_ATEXIT_IMPL=OFF \
   -DLIBCXX_ENABLE_LOCALIZATION=OFF -DLIBCXX_ENABLE_WIDE_CHARACTERS=OFF \
   -DLIBCXX_ENABLE_FILESYSTEM=OFF -DLIBCXX_ENABLE_RANDOM_DEVICE=ON -DLIBCXX_ENABLE_TIME_ZONE_DATABASE=OFF \
   -DLIBCXX_ENABLE_MONOTONIC_CLOCK=ON \

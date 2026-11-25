@@ -210,6 +210,10 @@ uint64_t  PMM::s_allocCursor = 1;
 // the PMM cannot rely on the BKL.
 static IrqSpinlock s_pmmLock("pmm");
 
+// The non-PIE user-image window in frames (see PMM::AllocFrame).
+constexpr uint64_t kWindowFirst = 0x400000ULL / PMM::PAGE_SIZE;
+constexpr uint64_t kWindowEnd = PMM::KERNEL_HIGH_ALLOC_MIN / PMM::PAGE_SIZE;
+
 // ── Bit-manipulation helpers ──────────────────────────────────────────────
 void PMM::SetFrame(uint64_t frame) {
     s_bitmap[frame / 64] |= (1ULL << (frame % 64));
@@ -461,19 +465,41 @@ uint64_t PMM::AllocFrame() {
     IrqSpinlockGuard guard(s_pmmLock);
     if (!s_initialized) return 0;
 
-    // Next-fit: resume scanning from the cursor, then wrap to the front so
-    // frames freed below the cursor are still reused.
-    uint64_t frame = FindFirstFree(s_allocCursor);
-    if (frame == 0 && s_allocCursor > 1) {
-        frame = FindFirstFree(1);
+    // Single frames (mostly user pages) fill the non-PIE window
+    // [0x400000, KERNEL_HIGH_ALLOC_MIN) first: user pages there do no harm,
+    // and keeping them out of the memory above leaves its runs whole for the
+    // kernel heap, which must not fall back into the window (the kernel reaches
+    // the heap through the identity map, which a low ET_EXEC image shadows).
+    // Next-fit was scattering single pages over all of RAM until, hours into a
+    // build, no 128 KiB run was left above and heap arenas landed in the window.
+    static uint64_t s_windowCursor = kWindowFirst;
+    uint64_t frame = FindFirstFree(s_windowCursor);
+    if (frame == 0 || frame >= kWindowEnd) {
+        frame = FindFirstFree(kWindowFirst);
     }
-    if (frame == 0) return 0;
+    if (frame != 0 && frame < kWindowEnd) {
+        s_windowCursor = frame + 1;
+        if (s_windowCursor >= kWindowEnd) s_windowCursor = kWindowFirst;
+    } else {
+        // Window full: next-fit above it, then anything (below 0x400000).
+        if (s_allocCursor < kWindowEnd) s_allocCursor = kWindowEnd;
+        frame = FindFirstFree(s_allocCursor);
+        if (frame == 0 && s_allocCursor > kWindowEnd) {
+            frame = FindFirstFree(kWindowEnd);
+        }
+        if (frame == 0) {
+            frame = FindFirstFree(1);
+        }
+        if (frame == 0) return 0;
+        if (frame >= kWindowEnd) {
+            s_allocCursor = frame + 1;
+            if (s_allocCursor >= s_totalFrames) s_allocCursor = kWindowEnd;
+        }
+    }
 
     SetFrame(frame);
     s_refcount[frame] = 1;
     s_usedFrames++;
-    s_allocCursor = frame + 1;
-    if (s_allocCursor >= s_totalFrames) s_allocCursor = 1;
     return frame * PAGE_SIZE;
 }
 

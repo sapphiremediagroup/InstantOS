@@ -1,0 +1,66 @@
+diff --git a/options/ansi/generic/file-io.cpp b/options/ansi/generic/file-io.cpp
+index 81e65c17..051a5daf 100644
+--- a/options/ansi/generic/file-io.cpp
++++ b/options/ansi/generic/file-io.cpp
+@@ -408,6 +408,15 @@ int abstract_file::_save_pos() {
+ 		off_t new_offset;
+ 		auto seek_offset = (off_t(__offset) - off_t(__io_offset));
+ 		if (int e = io_seek(seek_offset, SEEK_CUR, &new_offset); e) {
++			// A stream first classified file_like can have its fd replaced by a
++			// non-seekable one (e.g. a shell dup2()'ing a pipe onto a redirected,
++			// block-buffered stdout during command substitution). The fd is now a
++			// pipe: reclassify rather than fatally erroring the stream, so a plain
++			// sequential write keeps working (matches the fd's real nature).
++			if (e == ESPIPE) {
++				_type = stream_type::pipe_like;
++				return 0;
++			}
+ 			__status_bits |= __MLIBC_ERROR_BIT;
+ 			if(!mlibc::processIsExiting.load(std::memory_order_relaxed))
+ 				mlibc::infoLogger() << "hit io_seek() error " << e << frg::endlog;
+diff --git a/options/ansi/generic/stdlib.cpp b/options/ansi/generic/stdlib.cpp
+index 967d7595..67114cd7 100644
+--- a/options/ansi/generic/stdlib.cpp
++++ b/options/ansi/generic/stdlib.cpp
+@@ -377,16 +377,18 @@ void qsort_r(void *base, size_t count, size_t size,
+ 	// Sort the range [begin, end).
+ 	// TODO: If we are doing more than C * log_2(n) iterations for some C,
+ 	//       fall back to a guaranteed O(log n) implementation.
+-	auto quick_sort = [&] (this auto self, size_t begin, size_t end) {
++	// NB: originally a C++23 "deducing this" recursive lambda; GCC 13 lacks
++	// explicit object parameters, so recurse via an explicit self argument.
++	auto quick_sort = [&] (auto&& self, size_t begin, size_t end) -> void {
+ 		__ensure(begin <= end);
+ 		if (end - begin <= 1)
+ 			return;
+ 		auto pivot = partition(begin, end);
+-		self(begin, pivot);
+-		self(pivot + 1, end);
++		self(self, begin, pivot);
++		self(self, pivot + 1, end);
+ 	};
+ 
+-	quick_sort(0, count);
++	quick_sort(quick_sort, 0, count);
+ }
+ 
+ int abs(int num) {
+diff --git a/options/posix/generic/dirent.cpp b/options/posix/generic/dirent.cpp
+index 91a426ea..2c7d60bb 100644
+--- a/options/posix/generic/dirent.cpp
++++ b/options/posix/generic/dirent.cpp
+@@ -73,8 +73,12 @@ DIR *opendir(const char *path) {
+ struct dirent *readdir(DIR *dir) {
+ 	__ensure(dir->__ent_next <= dir->__ent_limit);
+ 	if(dir->__ent_next == dir->__ent_limit) {
+-		if(int e = mlibc::sysdep_or_enosys<ReadEntries>(dir->__handle, dir->__ent_buffer, 2048, &dir->__ent_limit); e)
+-			__ensure(!"mlibc::sys_read_entries() failed");
++		if(int e = mlibc::sysdep_or_enosys<ReadEntries>(dir->__handle, dir->__ent_buffer, 2048, &dir->__ent_limit); e) {
++			// POSIX: readdir returns NULL and sets errno on error (rather than
++			// aborting the whole process, which a failed __ensure would do).
++			errno = e;
++			return nullptr;
++		}
+ 		dir->__ent_next = 0;
+ 		if(!dir->__ent_limit)
+ 			return nullptr;

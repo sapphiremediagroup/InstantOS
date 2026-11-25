@@ -2,7 +2,7 @@
 # P5.5: build the entire InstantOS userland with the GCC cross-toolchain (the
 # kernel stays clang -- it is an EFI/PE image GCC cannot target; that is Phase 7).
 # Prerequisites already built on WSL: build/binutils-cross, the GCC cross at
-# /home/sky/gcc-port/gcc-install, and the clang cmake build (kernel + tcc-sysroot).
+# ${GCC_PORT_DIR:-$HOME/gcc-port}/gcc-install, and the clang cmake build (kernel + tcc-sysroot).
 #
 # Produces:
 #   build/mlibc-root-gcc     GCC-built mlibc (libc.so, ld-instantos.so, ...)

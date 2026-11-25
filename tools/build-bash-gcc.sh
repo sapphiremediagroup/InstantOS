@@ -10,7 +10,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export PATH="$ROOT/build/binutils-cross/bin:$PATH"
 
-GCC="${GCC:-/home/sky/gcc-port/gcc-install/bin/x86_64-unknown-instantos-gcc}"
+GCC="${GCC:-${GCC_PORT_DIR:-$HOME/gcc-port}/gcc-install/bin/x86_64-unknown-instantos-gcc}"
 MLIBC_ROOT="${MLIBC_ROOT:-$ROOT/build/mlibc-root-gcc}"
 GCC_INC="$("$GCC" -print-file-name=include)"
 

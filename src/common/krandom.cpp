@@ -17,7 +17,7 @@
 //     state (forward secrecy), and we periodically fold in fresh hardware
 //     entropy so the generator self-heals.
 //
-// This is the entropy source behind getentropy()/getrandom(), which mbedTLS
+// This is the entropy source behind getentropy()/getrandom(), which OpenSSL
 // (and therefore TLS key/nonce generation) depends on.
 
 namespace {

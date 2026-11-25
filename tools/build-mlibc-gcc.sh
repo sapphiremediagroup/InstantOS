@@ -10,7 +10,9 @@ export PATH="$ROOT/build/binutils-cross/bin:$PATH"
 # Meson cross files take absolute paths only: point the checked-in one's tool
 # paths at this checkout (it was written for a repo at /home/sky/projects).
 mkdir -p "$ROOT/build"
-sed "s#/home/sky/projects/InstantOS#$ROOT#g" "$ROOT/tools/mlibc/instantos-x86_64-gcc.ini" \
+sed -e "s#/home/sky/projects/InstantOS#$ROOT#g" \
+    -e "s#/home/sky/gcc-port#${GCC_PORT_DIR:-$HOME/gcc-port}#g" \
+    "$ROOT/tools/mlibc/instantos-x86_64-gcc.ini" \
   > "$ROOT/build/instantos-x86_64-gcc.ini"
 export MLIBC_CROSS_FILE="$ROOT/build/instantos-x86_64-gcc.ini"
 export MLIBC_BUILD_DIR="${MLIBC_BUILD_DIR:-$ROOT/build/mlibc-build-gcc}"

@@ -30,6 +30,10 @@ void sendReschedule(PerCPUData* cpu);
 // CPUs that are up, including the boot CPU.
 uint32_t onlineCount();
 
+// Busy-wait that works with interrupts off (the uptime may then stand still:
+// without a TSC clock it counts the boot CPU's ticks).
+void delayUs(uint64_t us);
+
 // PerCPUData of CPU `index`, or nullptr.
 PerCPUData* cpu(uint32_t index);
 

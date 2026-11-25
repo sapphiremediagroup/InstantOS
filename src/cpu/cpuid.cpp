@@ -578,6 +578,45 @@ static void reportBadXstate(const char* op, const void* state) {
     Console::get().drawText(" (skipped)\n");
 }
 
+uint32_t CPU::extendedStateSize() {
+    static uint32_t size = 0;
+    if (size == 0) {
+        uint32_t bytes = 512;
+        if (features.xsaveEnabled) {
+            uint32_t eax, ebx, ecx, edx;
+            __cpuid_count(0x0D, 0, eax, ebx, ecx, edx);
+            if (ebx >= 576 && ebx <= 4096) bytes = ebx;
+        }
+        size = bytes;
+    }
+    return size;
+}
+
+void CPU::sanitizeExtendedState(void* state) {
+    auto* bytes = static_cast<uint8_t*>(state);
+    uint32_t mxcsr;
+    uint32_t mask;
+    memcpy(&mxcsr, bytes + 24, 4);
+    // MXCSR_MASK of this CPU (what FXSAVE stores; 0 means 0xFFBF).
+    static uint32_t cpuMask = 0;
+    if (cpuMask == 0) {
+        alignas(64) static uint8_t probe[512];
+        asm volatile("fxsave %0" : "=m"(probe));
+        memcpy(&mask, probe + 28, 4);
+        cpuMask = mask ? mask : 0xFFBF;
+    }
+    mxcsr &= cpuMask;
+    memcpy(bytes + 24, &mxcsr, 4);
+    memcpy(bytes + 28, &cpuMask, 4);
+    if (features.xsaveEnabled) {
+        uint64_t xstateBv;
+        memcpy(&xstateBv, bytes + 512, 8);
+        xstateBv &= features.xsaveMask;
+        memcpy(bytes + 512, &xstateBv, 8);
+        memset(bytes + 520, 0, 56);   // XCOMP_BV (standard form) and reserved
+    }
+}
+
 void CPU::saveExtendedState(void* state) {
     if (!state) {
         return;

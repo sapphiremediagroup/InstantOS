@@ -14,73 +14,7 @@
 // Children write stdout/stderr to /dev/console (-> framebuffer + serial). Progress
 // via GCCSELF_* serial markers (syscall 88). GCCSELF_BINUTILS_OK == P7.1 green.
 
-typedef unsigned long u64;
-typedef long i64;
-
-static u64 sc1(u64 n, u64 a){u64 r;register u64 rax asm("rax")=n;register u64 rbx asm("rbx")=a;asm volatile("syscall":"=a"(r):"a"(rax),"r"(rbx):"rcx","r11","memory");return r;}
-static u64 sc2(u64 n,u64 a,u64 b){u64 r;register u64 rax asm("rax")=n;register u64 rbx asm("rbx")=a;register u64 r10 asm("r10")=b;asm volatile("syscall":"=a"(r):"a"(rax),"r"(rbx),"r"(r10):"rcx","r11","memory");return r;}
-static u64 sc3(u64 n,u64 a,u64 b,u64 c){u64 r;register u64 rax asm("rax")=n;register u64 rbx asm("rbx")=a;register u64 r10 asm("r10")=b;register u64 rdx asm("rdx")=c;asm volatile("syscall":"=a"(r):"a"(rax),"r"(rbx),"r"(r10),"r"(rdx):"rcx","r11","memory");return r;}
-
-enum {
-    SYS_EXIT=2, SYS_WRITE=3, SYS_READ=4, SYS_OPEN=5, SYS_CLOSE=6,
-    SYS_WAIT=10, SYS_SLEEP=15, SYS_MKDIR=32, SYS_UNLINK=34, SYS_DUP2=37, SYS_SPAWN=40, SYS_SERIAL=88,
-};
-enum { O_RDONLY=0, O_WRONLY=1, O_RDWR=2, O_CREAT=0100, O_TRUNC=01000 };
-
-static unsigned slen(const char* s){unsigned n=0;while(s[n])n++;return n;}
-static void serial(const char* s){sc2(SYS_SERIAL,(u64)s,slen(s));}
-static void serial_n(const char* s,u64 n){sc2(SYS_SERIAL,(u64)s,n);}
-static void put_dec(i64 v){char b[24];int i=23;b[23]=0;if(v==0){serial("0");return;}int neg=0;u64 u=(u64)v;if(v<0){neg=1;u=(u64)(-v);}while(u){b[--i]=(char)('0'+u%10);u/=10;}if(neg)b[--i]='-';serial(&b[i]);}
-static void put_hex(u64 v){char b[19];b[0]='0';b[1]='x';for(int i=0;i<16;i++){int nib=(int)((v>>((15-i)*4))&0xf);b[2+i]=(char)(nib<10?'0'+nib:'a'+nib-10);}b[18]=0;serial(b);}
-static u64 rd16(const unsigned char* b){return (u64)b[0]|((u64)b[1]<<8);}
-static u64 rd32(const unsigned char* b){return (u64)b[0]|((u64)b[1]<<8)|((u64)b[2]<<16)|((u64)b[3]<<24);}
-static u64 rd64(const unsigned char* b){u64 v=0;for(int i=0;i<8;i++)v|=((u64)b[i])<<(8*i);return v;}
-
-
-// Bind /dev/console (a real, dup-able char device) to stdin/stdout/stderr.
-// autoconf configure dups all three (`exec 6>&1`, `exec 7<&0`); the bare implicit
-// kernel console has no backing handle and cannot be duplicated. /dev/console
-// writes to the framebuffer console + serial and reads as EOF; being a char
-// device it is line-buffered (no block-buffered-file seek-on-flush issues).
-static void setup_stdio(void){
-    // Open /dev/console once read-write and install it as stdin/stdout/stderr, so
-    // all three carry both READ and WRITE rights (autoconf dup()s and both reads
-    // and writes them). read() returns EOF; write() -> console + serial.
-    i64 fd=(i64)sc3(SYS_OPEN,(u64)"/dev/console",O_RDWR,0);
-    if(fd<0) return;
-    sc2(SYS_DUP2,(u64)fd,0);
-    sc2(SYS_DUP2,(u64)fd,1);
-    sc2(SYS_DUP2,(u64)fd,2);
-    if(fd!=0 && fd!=1 && fd!=2) sc1(SYS_CLOSE,(u64)fd);
-}
-static int file_exists(const char* path){
-    i64 fd=(i64)sc3(SYS_OPEN,(u64)path,O_RDONLY,0);
-    if(fd<0) return 0; sc1(SYS_CLOSE,(u64)fd); return 1;
-}
-static i64 spawn_wait(const char* path, const char* const* argv, const char* const* envp){
-    u64 pid=sc3(SYS_SPAWN,(u64)path,(u64)argv,(u64)envp);
-    if((i64)pid<0||pid==(u64)-1) return -1;
-    int status=0;
-    sc3(SYS_WAIT,pid,(u64)&status,0);
-    return (i64)(int)status;
-}
-static i64 exit_code(i64 status){ return (status>>8)&0xFF; }
-static int is_elf(const char* path){
-    i64 fd=(i64)sc3(SYS_OPEN,(u64)path,O_RDONLY,0);
-    if(fd<0) return 0;
-    char m[4]={0};
-    i64 n=(i64)sc3(SYS_READ,(u64)fd,(u64)m,4);
-    sc1(SYS_CLOSE,(u64)fd);
-    return n==4 && m[0]==0x7f && m[1]=='E' && m[2]=='L' && m[3]=='F';
-}
-static void dump_file(const char* path){
-    serial("\n---DUMP "); serial(path); serial("---\n");
-    i64 fd=(i64)sc3(SYS_OPEN,(u64)path,O_RDONLY,0);
-    if(fd<0){ serial("(open failed)\n"); return; }
-    char buf[2048]; i64 n; while((n=(i64)sc3(SYS_READ,(u64)fd,(u64)buf,sizeof(buf)))>0) serial_n(buf,(u64)n);
-    sc1(SYS_CLOSE,(u64)fd);
-    serial("\n---ENDDUMP---\n");
-}
+#include "launcher-common.h"
 
 
 // gcc + as/ar/ranlib on the ext4 (/usr/bin); the GNU userland ports on the
@@ -177,9 +111,75 @@ static void repro_exec(void){
     sc1(SYS_EXIT,0);
 }
 
+// --- cc1 crash probe (LAUNCHER_CFLAGS=-DREPRO_CC1=1) -------------------------
+// During make, cc1 crashed now and then reading a small bad pointer (0x78xx) in
+// unrelated code. This compiles zlib's 15 files all at once, 40 rounds, so the
+// crash (if it is load- or churn-related) shows up in minutes, not hours.
+#ifndef REPRO_CC1
+#define REPRO_CC1 0
+#endif
+static const char* const ARGV_CC1_STRESS[] = {"sh","-c",
+    "gzip -dc /bin/binutils-insrc.tar.gz | tar -x -C /work binutils-2.42/zlib && "
+    "cd /work/binutils-2.42/zlib && fails=0 && i=0 && "
+    "while [ $i -lt ${ROUNDS:-40} ]; do i=$((i+1)); "
+    "for f in adler32 compress crc32 deflate gzclose gzlib gzread gzwrite infback "
+    "inffast inflate inftrees trees uncompr zutil; do "
+    "( gcc -O2 -DHAVE_UNISTD_H -c $f.c -o /work/tmp/$f.o || echo CC1STRESS_FAIL round=$i file=$f ) & "
+    "done; wait; echo CC1STRESS_ROUND=$i; done",0};
+
+// --- leak probe (LAUNCHER_CFLAGS=-DREPRO_LEAK=1) ------------------------------
+// P7.1 ran out of memory: ~360 KB of RAM (~58 KB of kernel heap) lost per exec.
+// Each phase runs one kind of process churn; the kernel's "[mem] execs=" line
+// (every 256 execs) shows which one leaks.
+#ifndef REPRO_LEAK
+#define REPRO_LEAK 0
+#endif
+static const char* const ARGV_TRUE[] = {"/bin/true",0};
+static const char* const ARGV_LEAK_SH[] = {"sh","-c",
+    "i=0; while [ $i -lt 1024 ]; do /bin/true; i=$((i+1)); done",0};
+static const char* const ARGV_LEAK_PIPE[] = {"sh","-c",
+    "i=0; while [ $i -lt 512 ]; do /bin/true | /bin/true; i=$((i+1)); done",0};
+static const char* const ARGV_LEAK_SUBSHELL[] = {"sh","-c",
+    "i=0; while [ $i -lt 1024 ]; do x=$(echo a); i=$((i+1)); done",0};
+static const char* const ARGV_LEAK_GCC[] = {"sh","-c",
+    "echo 'int f(int x){return x+1;}' > /work/tmp/l.c; i=0; "
+    "while [ $i -lt 200 ]; do gcc -c /work/tmp/l.c -o /work/tmp/l.o; i=$((i+1)); done",0};
+static void repro_leak(void){
+    sc3(SYS_MKDIR,(u64)"/work",0755,0);
+    sc3(SYS_MKDIR,(u64)"/work/tmp",0755,0);
+    serial("[LEAK] phase spawn: /bin/true x1024 from the launcher\n");
+    for(int i=0;i<1024;i++) spawn_wait("/bin/true", ARGV_TRUE, ENVP);
+    serial("[LEAK] phase sh: fork+exec /bin/true x1024\n");
+    spawn_wait("/bin/sh", ARGV_LEAK_SH, ENVP);
+    serial("[LEAK] phase pipe: /bin/true | /bin/true x512\n");
+    spawn_wait("/bin/sh", ARGV_LEAK_PIPE, ENVP);
+    serial("[LEAK] phase subshell: $(echo) x1024 (fork, no exec)\n");
+    spawn_wait("/bin/sh", ARGV_LEAK_SUBSHELL, ENVP);
+    serial("[LEAK] phase gcc: gcc -c x200\n");
+    spawn_wait("/bin/sh", ARGV_LEAK_GCC, ENVP);
+    serial("[LEAK] phase spawn again: /bin/true x1024\n");
+    for(int i=0;i<1024;i++) spawn_wait("/bin/true", ARGV_TRUE, ENVP);
+    serial("LEAK_DONE\nGCCSELF_DONE\n");
+    sc1(SYS_EXIT,0);
+}
+
 void _start(void){
     serial("\n[GCCSELF] start: in-OS gcc rebuilds binutils (P7.1)\n");
     setup_stdio();
+#if REPRO_LEAK
+    repro_leak();
+#endif
+#if REPRO_CC1
+    sc3(SYS_MKDIR,(u64)"/work",0755,0);
+    sc3(SYS_MKDIR,(u64)"/work/tmp",0755,0);
+    serial("[GCCSELF] cc1 stress: zlib x15 in parallel, 40 rounds\n");
+    {
+        i64 src = spawn_wait("/bin/sh", ARGV_CC1_STRESS, ENVP);
+        serial("CC1STRESS_RC="); put_dec(src); serial("\n");
+    }
+    serial("GCCSELF_DONE\n");
+    sc1(SYS_EXIT,0);
+#endif
 #if REPRO_EXEC
     repro_exec();
 #endif
@@ -199,8 +199,10 @@ void _start(void){
     serial("[GCCSELF] configure (native instantos; sh+sed+grep+awk+gcc probes)\n");
     rc = spawn_wait("/bin/sh", ARGV_CONFIGURE, ENVP);
     serial("GCCSELF_BU_CONFIGURE_RC="); put_dec(rc); serial("\n");
-    int cfg_ok = file_exists("/work/bu-build/Makefile") && file_exists("/work/bu-build/gas/Makefile")
-              && file_exists("/work/bu-build/ld/Makefile");
+    // The top level configures only itself; gas/, ld/, bfd/... are configured
+    // by make (all-gas -> configure-gas), so their Makefiles do not exist yet.
+    int cfg_ok = exit_code(rc) == 0 && file_exists("/work/bu-build/Makefile")
+              && file_exists("/work/bu-build/config.status");
     serial(cfg_ok ? "GCCSELF_BU_CONFIGURE_OK\n" : "GCCSELF_BU_CONFIGURE_FAIL\n");
     if(!cfg_ok) dump_file("/work/bu-build/config.log");
 

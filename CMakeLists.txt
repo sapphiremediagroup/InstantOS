@@ -93,6 +93,67 @@ ExternalProject_Add(mkInitrd_proj
 
 set(MKINITRD_EXE ${CMAKE_BINARY_DIR}/mkInitrd_build/mkInitrd)
 
+ExternalProject_Add(mkidrv_proj
+    SOURCE_DIR  ${CMAKE_SOURCE_DIR}/tools/mkidrv
+    BINARY_DIR  ${CMAKE_BINARY_DIR}/mkidrv_build
+    CMAKE_ARGS  -DCMAKE_BUILD_TYPE=MinSizeRel
+    BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR>
+    INSTALL_COMMAND ""
+    BUILD_ALWAYS ON
+    BUILD_BYPRODUCTS ${CMAKE_BINARY_DIR}/mkidrv_build/mkidrv
+)
+set(MKIDRV_EXE ${CMAKE_BINARY_DIR}/mkidrv_build/mkidrv)
+set(IDRV_INITRD_ENTRIES)
+set(IDRV_INITRD_DEPENDS)
+add_custom_target(idrv_modules)   # every module (test images build this)
+
+function(add_idrv_module name)
+    set(sources ${ARGN})
+    set(test_only OFF)
+    list(GET sources 0 first)
+    if(first STREQUAL "TEST")
+        set(test_only ON)
+        list(REMOVE_AT sources 0)
+    endif()
+    set(dll ${name}_idrv_dll)
+    add_executable(${dll} ${sources} ${CMAKE_SOURCE_DIR}/modules/sdk/idrv_runtime.cpp)
+    target_include_directories(${dll} PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/modules/sdk)
+    target_compile_options(${dll} PRIVATE
+        ${BASE_CXX_FLAGS} ${UEFI_CXX_FLAGS} ${SIZE_CXX_FLAGS}
+        -mno-stack-arg-probe -DIDRV_BUILDING_MODULE=1)
+    target_link_options(${dll} PRIVATE
+        ${EFI_LINK_OPTIONS} ${SIZE_LINK_OPTIONS}
+        -Wl,/dll -Wl,/noentry -Wl,/base:0x180000000)
+    set_target_properties(${dll} PROPERTIES OUTPUT_NAME ${name} SUFFIX ".dll")
+    if(test_only)
+        set(out_dir ${CMAKE_BINARY_DIR}/drivers-test)
+    else()
+        set(out_dir ${CMAKE_BINARY_DIR}/drivers)
+    endif()
+    set(out ${out_dir}/${name}.idrv)
+    add_custom_command(
+        OUTPUT ${out}
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${out_dir}
+        COMMAND ${MKIDRV_EXE} $<TARGET_FILE:${dll}> ${out}
+        DEPENDS ${dll} mkidrv_proj
+        VERBATIM
+    )
+    add_custom_target(${name}_idrv ALL DEPENDS ${out})
+    add_dependencies(idrv_modules ${name}_idrv)
+    if(NOT test_only)
+        set(IDRV_INITRD_ENTRIES ${IDRV_INITRD_ENTRIES} lib/drivers/${name}.idrv:${out} PARENT_SCOPE)
+        set(IDRV_INITRD_DEPENDS ${IDRV_INITRD_DEPENDS} ${out} PARENT_SCOPE)
+    endif()
+endfunction()
+
+add_idrv_module(pcnet modules/pcnet/pcnet.cpp)
+add_idrv_module(rtl8139 modules/rtl8139/rtl8139.cpp)
+add_idrv_module(vmxnet3 modules/vmxnet3/vmxnet3.cpp)
+add_idrv_module(virtio-net modules/virtio-net/virtio_net.cpp)
+add_idrv_module(e1000 modules/e1000/e1000.cpp)
+add_idrv_module(rtl8169 modules/rtl8169/rtl8169.cpp)
+add_idrv_module(idrvtest TEST modules/idrvtest/idrvtest.cpp)
+
 set(INITRD_IMG ${CMAKE_BINARY_DIR}/initrd.img)
 
 set(TCC_INITRD_ENTRIES)
@@ -170,8 +231,11 @@ set(BASH_INITRD_DEPENDS "")
 set(INSTANTOS_BASH_BINARY "${CMAKE_BINARY_DIR}/bash")
 set(INSTANTOS_MLIBC_LIB_DIR "${CMAKE_BINARY_DIR}/mlibc-root/lib")
 if(EXISTS "${INSTANTOS_BASH_BINARY}" AND EXISTS "${INSTANTOS_MLIBC_LIB_DIR}/libc.so")
+    # bash is also /bin/sh (the initrd has no links): make, shell scripts and
+    # configure scripts run /bin/sh (tools/make-dev-disk.sh's toolchain).
     list(APPEND BASH_INITRD_ENTRIES
         bin/bash:${INSTANTOS_BASH_BINARY}
+        bin/sh:${INSTANTOS_BASH_BINARY}
         lib/mlibc/ld-instantos.so:${INSTANTOS_MLIBC_LIB_DIR}/ld-instantos.so
         lib/mlibc/libc.so:${INSTANTOS_MLIBC_LIB_DIR}/libc.so
         lib/mlibc/libdl.so:${INSTANTOS_MLIBC_LIB_DIR}/libdl.so
@@ -215,7 +279,7 @@ if(INSTANTOS_COMPOSITOR_MLIBC AND EXISTS "${INSTANTOS_MLIBC_LIB_DIR}/libc.so" AN
     list(APPEND COMPOSITOR_MLIBC_DEPENDS ${INSTANTOS_COMPOSITOR_BINARY})
 endif()
 
-# Network tools (ping, nslookup/host, netcfg, sntp, dmesg) are mlibc programs, built here
+# Network and system tools (ping, nslookup/host, netcfg, sntp, dmesg, lsmod, modload) are mlibc programs, built here
 # whenever the mlibc runtime is; curl comes from tools/build-curl.sh and is
 # bundled when present.
 set(NET_TOOLS_INITRD_ENTRIES "")
@@ -228,7 +292,7 @@ if(EXISTS "${INSTANTOS_MLIBC_LIB_DIR}/libc.so" AND EXISTS "${INSTANTOS_MLIBC_LIB
     set(NET_TOOLS_LDFLAGS --target=x86_64-unknown-elf -pie -nostdlib -fuse-ld=lld
         -L${INSTANTOS_MLIBC_LIB_DIR} -Wl,--dynamic-linker,/lib/mlibc/ld-instantos.so -Wl,-rpath,/lib/mlibc
         ${INSTANTOS_MLIBC_LIB_DIR}/crt1.o)
-    foreach(tool ping nslookup netcfg sntp dmesg unix-test)
+    foreach(tool ping nslookup netcfg sntp dmesg unix-test lsmod modload instant-install)
         add_custom_command(
             OUTPUT ${NET_TOOLS_DIR}/${tool}
             COMMAND ${CMAKE_COMMAND} -E make_directory ${NET_TOOLS_DIR}
@@ -242,6 +306,54 @@ if(EXISTS "${INSTANTOS_MLIBC_LIB_DIR}/libc.so" AND EXISTS "${INSTANTOS_MLIBC_LIB
         list(APPEND NET_TOOLS_DEPENDS ${NET_TOOLS_DIR}/${tool})
     endforeach()
     list(APPEND NET_TOOLS_INITRD_ENTRIES bin/host:${NET_TOOLS_DIR}/nslookup)
+    # mke2fs and e2fsck (tools/build-e2fsprogs.sh), for instant-install.
+    if(EXISTS "${CMAKE_BINARY_DIR}/e2fsprogs/mke2fs")
+        list(APPEND NET_TOOLS_INITRD_ENTRIES
+            bin/mke2fs:${CMAKE_BINARY_DIR}/e2fsprogs/mke2fs
+            bin/e2fsck:${CMAKE_BINARY_DIR}/e2fsprogs/e2fsck
+            lib/e2fsprogs/mke2fs.conf:${CMAKE_SOURCE_DIR}/tools/e2fsprogs/mke2fs.conf)
+        list(APPEND NET_TOOLS_DEPENDS ${CMAKE_BINARY_DIR}/e2fsprogs/mke2fs ${CMAKE_BINARY_DIR}/e2fsprogs/e2fsck)
+    endif()
+    # The GNU userland (tools/build-coreutils.sh, tools/build-gnu-tool.sh): cat,
+    # ls, cp, ..., tar and gzip (a toolchain tarball unpacks with them), make
+    # and the text tools, about 13 MB. Each is bundled when it was built.
+    file(GLOB GNU_COREUTILS CONFIGURE_DEPENDS ${CMAKE_BINARY_DIR}/coreutils/*)
+    foreach(gnu_tool ${GNU_COREUTILS})
+        get_filename_component(gnu_name ${gnu_tool} NAME)
+        list(APPEND NET_TOOLS_INITRD_ENTRIES bin/${gnu_name}:${gnu_tool})
+        list(APPEND NET_TOOLS_DEPENDS ${gnu_tool})
+    endforeach()
+    foreach(gnu_name tar gzip make sed grep awk diff cmp m4)
+        if(EXISTS "${CMAKE_BINARY_DIR}/${gnu_name}")
+            list(APPEND NET_TOOLS_INITRD_ENTRIES bin/${gnu_name}:${CMAKE_BINARY_DIR}/${gnu_name})
+            list(APPEND NET_TOOLS_DEPENDS ${CMAKE_BINARY_DIR}/${gnu_name})
+        endif()
+    endforeach()
+    if(EXISTS "${CMAKE_BINARY_DIR}/awk")
+        list(APPEND NET_TOOLS_INITRD_ENTRIES bin/gawk:${CMAKE_BINARY_DIR}/awk)
+    endif()
+    if(EXISTS "${CMAKE_BINARY_DIR}/gzip")
+        list(APPEND NET_TOOLS_INITRD_ENTRIES bin/gunzip:${CMAKE_SOURCE_DIR}/tools/gnu-scripts/gunzip)
+    endif()
+    if(EXISTS "${CMAKE_BINARY_DIR}/grep")
+        list(APPEND NET_TOOLS_INITRD_ENTRIES
+            bin/egrep:${CMAKE_SOURCE_DIR}/tools/gcc-selfhost/egrep
+            bin/fgrep:${CMAKE_SOURCE_DIR}/tools/gcc-selfhost/fgrep)
+    endif()
+    # OpenSSL (tools/build-openssl.sh): its libraries where mlibc's loader
+    # looks, the openssl command, and its configuration in /etc/ssl (OPENSSLDIR;
+    # cert.pem, its default CA file, goes with the CA bundle below).
+    if(EXISTS "${CMAKE_BINARY_DIR}/openssl/libcrypto.so.3")
+        foreach(ssl_lib libcrypto.so.3 libssl.so.3)
+            list(APPEND NET_TOOLS_INITRD_ENTRIES lib/mlibc/${ssl_lib}:${CMAKE_BINARY_DIR}/openssl/${ssl_lib})
+            list(APPEND NET_TOOLS_DEPENDS ${CMAKE_BINARY_DIR}/openssl/${ssl_lib})
+        endforeach()
+        list(APPEND NET_TOOLS_INITRD_ENTRIES
+            bin/openssl:${CMAKE_BINARY_DIR}/openssl/openssl
+            ssl/openssl.cnf:${CMAKE_SOURCE_DIR}/tools/openssl-smoke/openssl.cnf)
+        list(APPEND NET_TOOLS_DEPENDS ${CMAKE_BINARY_DIR}/openssl/openssl
+            ${CMAKE_SOURCE_DIR}/tools/openssl-smoke/openssl.cnf)
+    endif()
     if(EXISTS "${CMAKE_BINARY_DIR}/curl/curl")
         list(APPEND NET_TOOLS_INITRD_ENTRIES bin/curl:${CMAKE_BINARY_DIR}/curl/curl)
         list(APPEND NET_TOOLS_DEPENDS ${CMAKE_BINARY_DIR}/curl/curl)
@@ -352,6 +464,7 @@ endif()
 set(INSTANTOS_CACERT "${CMAKE_BINARY_DIR}/cacert/cacert.pem")
 if(EXISTS "${INSTANTOS_CACERT}")
     list(APPEND NETSURF_INITRD_ENTRIES "ssl/certs/ca-certificates.crt:${INSTANTOS_CACERT}")
+    list(APPEND NETSURF_INITRD_ENTRIES "ssl/cert.pem:${INSTANTOS_CACERT}")   # OpenSSL's default
     list(APPEND NETSURF_INITRD_DEPENDS "${INSTANTOS_CACERT}")
     message(STATUS "Bundling CA certificate bundle into initrd (/etc/ssl/certs/ca-certificates.crt)")
 else()
@@ -370,9 +483,11 @@ endforeach()
 # Every initrd entry. Also written to build/initrd-entries.txt, one per line,
 # so test images (tools/run-netsurf-suite.sh) can start from the real system.
 set(INSTANTOS_INITRD_ENTRIES
+        ${IDRV_INITRD_ENTRIES}
         bin/input-manager:${CMAKE_BINARY_DIR}/input-manager
         bin/cube:${CMAKE_BINARY_DIR}/cube
         bin/ui-demo:${CMAKE_BINARY_DIR}/ui-demo
+        bin/notepad:${CMAKE_BINARY_DIR}/notepad
         bin/graphics-compositor:${INSTANTOS_COMPOSITOR_BINARY}
         bin/storage-manager:${CMAKE_BINARY_DIR}/storage-manager
         bin/log-saver:${CMAKE_BINARY_DIR}/log-saver
@@ -422,12 +537,12 @@ add_custom_command(
     COMMAND ${MKINITRD_EXE}
         ${INITRD_IMG}
         ${INSTANTOS_INITRD_ENTRIES}
-    DEPENDS mkInitrd_proj INSTANTOS.EFI cube ui-demo input-manager graphics-compositor storage-manager log-saver gpu-test reboot process-manager network-manager font-manager session-manager login background-switcher file-browser terminal net-smoke ld-instantos ilibcxx ${TCC_INITRD_DEPENDS} ${CMAKE_SOURCE_DIR}/assets/fonts/JetBrainsMono-Regular.ttf ${CMAKE_SOURCE_DIR}/assets/fonts/StackSansNotch-Bold.ttf ${CMAKE_SOURCE_DIR}/assets/fonts/StackSansNotch-SemiBold.ttf ${CMAKE_SOURCE_DIR}/assets/fonts/StackSansNotch-Regular.ttf ${CMAKE_SOURCE_DIR}/assets/fonts/StackSansNotch-ExtraLight.ttf ${CMAKE_SOURCE_DIR}/assets/fonts/StackSansText-Regular.ttf ${CMAKE_SOURCE_DIR}/assets/fonts/StackSansText-Medium.ttf ${CMAKE_SOURCE_DIR}/assets/fonts/StackSansText-SemiBold.ttf ${CMAKE_SOURCE_DIR}/assets/cursors/default.png ${CMAKE_SOURCE_DIR}/assets/images/InstantOS_sapph.png ${CMAKE_SOURCE_DIR}/assets/backgrounds/instantos_1.png ${CMAKE_SOURCE_DIR}/assets/backgrounds/instantos_1_mono.png ${CMAKE_SOURCE_DIR}/assets/backgrounds/instantos_2.png ${CMAKE_SOURCE_DIR}/assets/backgrounds/instantos_2_mono.png ${CMAKE_SOURCE_DIR}/assets/backgrounds/instantos_3_color.png ${CMAKE_SOURCE_DIR}/assets/backgrounds/instantos_3_mono.png ${BASH_INITRD_DEPENDS} ${NET_TOOLS_DEPENDS} ${NETSURF_INITRD_DEPENDS} ${INSTANTOS_ICON_FILES} ${COMPOSITOR_MLIBC_DEPENDS}
+    DEPENDS mkInitrd_proj INSTANTOS.EFI cube ui-demo notepad input-manager graphics-compositor storage-manager log-saver gpu-test reboot process-manager network-manager font-manager session-manager login background-switcher file-browser terminal net-smoke ld-instantos ilibcxx ${TCC_INITRD_DEPENDS} ${CMAKE_SOURCE_DIR}/assets/fonts/JetBrainsMono-Regular.ttf ${CMAKE_SOURCE_DIR}/assets/fonts/StackSansNotch-Bold.ttf ${CMAKE_SOURCE_DIR}/assets/fonts/StackSansNotch-SemiBold.ttf ${CMAKE_SOURCE_DIR}/assets/fonts/StackSansNotch-Regular.ttf ${CMAKE_SOURCE_DIR}/assets/fonts/StackSansNotch-ExtraLight.ttf ${CMAKE_SOURCE_DIR}/assets/fonts/StackSansText-Regular.ttf ${CMAKE_SOURCE_DIR}/assets/fonts/StackSansText-Medium.ttf ${CMAKE_SOURCE_DIR}/assets/fonts/StackSansText-SemiBold.ttf ${CMAKE_SOURCE_DIR}/assets/cursors/default.png ${CMAKE_SOURCE_DIR}/assets/images/InstantOS_sapph.png ${CMAKE_SOURCE_DIR}/assets/backgrounds/instantos_1.png ${CMAKE_SOURCE_DIR}/assets/backgrounds/instantos_1_mono.png ${CMAKE_SOURCE_DIR}/assets/backgrounds/instantos_2.png ${CMAKE_SOURCE_DIR}/assets/backgrounds/instantos_2_mono.png ${CMAKE_SOURCE_DIR}/assets/backgrounds/instantos_3_color.png ${CMAKE_SOURCE_DIR}/assets/backgrounds/instantos_3_mono.png ${BASH_INITRD_DEPENDS} ${NET_TOOLS_DEPENDS} ${NETSURF_INITRD_DEPENDS} ${INSTANTOS_ICON_FILES} ${COMPOSITOR_MLIBC_DEPENDS} ${IDRV_INITRD_DEPENDS}
     VERBATIM
 )
 
 add_custom_target(make_initrd ALL DEPENDS ${INITRD_IMG})
-add_dependencies(make_initrd INSTANTOS.EFI input-manager graphics-compositor storage-manager log-saver gpu-test reboot process-manager network-manager font-manager session-manager login background-switcher file-browser terminal cube ui-demo net-smoke ld-instantos ilibcxx)
+add_dependencies(make_initrd INSTANTOS.EFI input-manager graphics-compositor storage-manager log-saver gpu-test reboot process-manager network-manager font-manager session-manager login background-switcher file-browser terminal cube ui-demo notepad net-smoke ld-instantos ilibcxx)
 
 add_subdirectory(outside/iboot)
 

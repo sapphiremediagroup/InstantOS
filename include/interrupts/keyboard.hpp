@@ -143,20 +143,22 @@ public:
             return;
         }
 
-        drainController(false);
-        while (hasPendingControllerData()) {
-            if (!drainController(false)) {
-                break;
-            }
-        }
-
-        while (Cereal::get().hasInput()) {
-            if (!injectChar(Cereal::get().read())) {
-                break;
-            }
-        }
-
         const uint64_t now = time_get_uptime_ms();
+        // The ports are polled every 8 ms at most (PS/2 also interrupts; the
+        // serial console only has this). It ran on every tick: three port reads
+        // each, and under a hypervisor every one is a VM exit (hundreds of
+        // microseconds nested), with the boot CPU's tick waiting on them.
+        if (now - lastPortPollMs >= kPortPollMs || now < lastPortPollMs) {
+            lastPortPollMs = now;
+            drainController(false);   // reads until the status shows nothing more
+
+            while (Cereal::get().hasInput()) {
+                if (!injectChar(Cereal::get().read())) {
+                    break;
+                }
+            }
+        }
+
         repeatTick(now);
         if (ps2LedState != LedState::Idle && now >= ps2LedDeadlineMs) {
             // No ACK: give up on this update; after three, on the lights.
@@ -784,6 +786,8 @@ private:
     uint8_t ps2LedsInFlight = 0;
     uint8_t ps2LedFailures = 0;
     uint64_t ps2LedDeadlineMs = 0;
+    static constexpr uint64_t kPortPollMs = 8;
+    uint64_t lastPortPollMs = 0;   // when servicePendingInput last read the ports
     uint16_t repeatKey = KeyNone;
     uint64_t nextRepeatMs = 0;
     bool extendedPrefix;

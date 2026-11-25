@@ -93,6 +93,11 @@ mke2fs -q -F -b 4096 -I 128 -O "extent,filetype,sparse_super,$WRITE_OFF" \
   -E lazy_itable_init=0 "$OUT/ext4fuzz.img" 16384
 mke2fs -q -F -b 4096 -t ext4 -E lazy_itable_init=0 "$OUT/ext4fuzzc.img" 16384
 
+# Journaled fuzz target in the InstantOS disk format (4 KiB blocks, a simple
+# unchecksummed JBD2 journal, as tools/os-testsuite and gcchost make them):
+# exercises the driver's batched transactions.
+mke2fs -q -F -b 4096 -O "has_journal,extent,filetype,sparse_super,^metadata_csum,^64bit,^uninit_bg,^dir_index"   -E lazy_itable_init=0 "$OUT/ext4fuzzj.img" 16384
+
 # HTree write target: a copy of the full-featured default image (which has the
 # 600-entry HTree `many/` directory). The driver converts HTree dirs to linear
 # on write; e2fsck must accept the result.

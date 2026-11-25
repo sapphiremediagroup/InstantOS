@@ -1,8 +1,5 @@
 #include <drivers/net/net_device.hpp>
-#include <drivers/virtio/virtio_net.hpp>
-#include <drivers/net/rtl8139.hpp>
-#include <drivers/net/e1000.hpp>
-#include <drivers/net/rtl8169.hpp>
+#include <drivers/net/usb_net.hpp>
 
 namespace {
 NetDevice* gDevices[NetDeviceRegistry::MAX_DEVICES] = {};
@@ -21,10 +18,10 @@ void ensureDriversRegistered() {
         return;
     }
     gDriversRegistered = true;
-    NetDeviceRegistry::registerDevice(&VirtIONetDriver::get());
-    NetDeviceRegistry::registerDevice(&E1000Driver::get());
-    NetDeviceRegistry::registerDevice(&RTL8169Driver::get());
-    NetDeviceRegistry::registerDevice(&RTL8139Driver::get());
+    // The PCI NICs are modules (modules/<name>, /lib/drivers/<name>.idrv:
+    // virtio-net, e1000, rtl8169, vmxnet3, rtl8139, pcnet); they register
+    // through the driver API. USB Ethernet stays here until there is a USB API.
+    NetDeviceRegistry::registerDevice(&UsbNetDriver::get());
 }
 }
 

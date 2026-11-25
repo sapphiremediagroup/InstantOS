@@ -190,6 +190,7 @@ private:
     HBACmdHeader* commandList;
     void* fisBuffer;
     HBACmdTbl* commandTables[32];
+    bool needsIdleCheck = true;   // check PxTFD for BSY/DRQ before the next command
 
     static constexpr int kMaxActivePorts = 32;
     static AHCIPort* activePorts[kMaxActivePorts];
@@ -197,6 +198,7 @@ private:
 
     void startCmd();
     void stopCmd();
+    bool issue(int slot, uint8_t cmd, uint64_t lba, uint32_t count);
     bool waitForCompletion(int slot, uint8_t cmd, uint64_t lba, uint32_t count);
     void recoverFromError();
     int findCmdSlot();

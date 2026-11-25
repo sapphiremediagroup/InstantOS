@@ -43,8 +43,13 @@ bool time_init() {
         }
     }
     if (!time_tick_is_tsc_deadline()) {
-        Console::get().drawText(tsc_enable_clocksource() ? "[TIME] PIT tick, TSC clock\n"
-                                                         : "[TIME] PIT tick and clock\n");
+        if (tsc_enable_clocksource()) {
+            Console::get().drawText("[TIME] PIT tick, TSC clock at ");
+            Console::get().drawNumber(static_cast<int64_t>(tsc_frequency / 1000ULL));
+            Console::get().drawText(" kHz\n");
+        } else {
+            Console::get().drawText("[TIME] PIT tick and clock\n");
+        }
     }
 
     rtc_time rtc = {};

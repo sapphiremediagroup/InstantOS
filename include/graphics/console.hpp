@@ -130,6 +130,16 @@ public:
     void drawRawUnlocked(const char* str);
     void setFramebufferOutputEnabled(bool enabled) { framebufferOutputEnabled = enabled; }
     iFramebuffer* getFramebuffer() { return framebuffer; }
+    // For a kernel exception's report: when this CPU faulted while holding the
+    // console lock, its report would wait for that lock forever, so the lock
+    // is let go and the report goes to the serial port and the log only (the
+    // fault may have been in the drawing code). Returns whether it was held.
+    bool releaseLockHeldByThisCpu() {
+        if (!writeLock.heldByThisCpu()) return false;
+        writeLock.unlock();
+        framebufferOutputEnabled = false;
+        return true;
+    }
 
     template<typename... Args>
     void log(const char* format, Args... args) {
